@@ -1,0 +1,7 @@
+# One term per line, matched case-insensitively as a substring. Blank lines and lines starting with # are ignored.
+# These are PLACEHOLDERS so the check can be tested. Never put a real employer name, handle, host or
+# identifier in this file. Real terms go in a local file outside the repository: set SHIT_EXTRA_TERMS to its
+# path and the test reads it too (the file is never read into a report or a log).
+example-employer-placeholder
+example-hostname-placeholder
+N0CALL-REAL-PLACEHOLDER
