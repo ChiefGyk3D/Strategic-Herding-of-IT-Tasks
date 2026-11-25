@@ -1,0 +1,42 @@
+# CI for Strategic-Herding-of-IT-Tasks. The jobs live in ChiefGyk3D/git-your-ship-together; this file
+# says only what is specific to this repository. The repo holds docs only for now: when it gains
+# shell scripts or Python, add a bash-ci or python-ci caller and list its job in the gate's needs.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * 1'   # weekly, so new advisories surface between commits
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  security:
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/security.yml@9e0d7b2e7e8530e2b1bb200ecb4fbf6de021881f # v1.38.0
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+      id-token: write
+    with:
+      advanced-security: "false"        # private repository on a personal account: no code scanning
+      gitleaks-upload-sarif: false      # code scanning is unavailable, so the SARIF upload would fail
+      codeql-languages: actions         # no Python in this repository yet
+      pip-audit-requirements: ""        # no requirements file
+      egress-policy: block
+
+  gate:
+    if: always()
+    needs: [security]
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/ci-gate.yml@9e0d7b2e7e8530e2b1bb200ecb4fbf6de021881f # v1.38.0
+    permissions: {}
+    with:
+      needs-json: '{"security": "${{ needs.security.result }}"}'

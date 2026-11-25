@@ -1,0 +1,26 @@
+# Secrets and key material
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Raw corpus and local evidence never enter this repository
+transcripts/
+*.vtt
+.pe/
+
+# Python and tooling
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
