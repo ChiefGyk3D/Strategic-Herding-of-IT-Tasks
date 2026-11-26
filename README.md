@@ -9,3 +9,7 @@ Private and pre-release. Nothing here is stable, the layout will change, and the
 ## Contributing
 
 Open an issue describing the change before sending a pull request, and link that issue from the pull request. Every change goes through a pull request; the `CI green` check must pass. Report security problems privately as described in [SECURITY.md](SECURITY.md).
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
