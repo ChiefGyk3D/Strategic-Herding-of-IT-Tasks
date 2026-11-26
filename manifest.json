@@ -1,0 +1,57 @@
+{
+  "adapters": [
+    "claude",
+    "copilot",
+    "codex"
+  ],
+  "files": {
+    ".agents/skills/pack-gha-security-dast/SKILL.md": "2178b2a2f453d413865a70dc96bdae5d502fcb44535dfcf7eb62d2dcdfa7dc73",
+    ".agents/skills/pack-implementer-self-check/SKILL.md": "9080ed434c0279f8ddb3c11ef2f69856ded339da437c1aed4913e59e60f9d663",
+    ".agents/skills/pack-org-operating-model/SKILL.md": "bde9c6d2e58fde78f077b474074e94e22be6e5487af20d808017ac2d52f19873",
+    ".agents/skills/pack-python-untrusted-input/SKILL.md": "91b89c1ba89aa89cca56fb148ac5038d64b00731c5141b9f9d6a0f4808cf520b",
+    ".agents/skills/pack-review-protocol/SKILL.md": "73f2b0648d2fea3899ee8e3153a4a06175603a40211947d78d7087ddcc93ca04",
+    ".agents/skills/pack-threat-model/SKILL.md": "e1e5d1c39a133b56e832c830ed2c3758105aebf20abf024f43aa2f6466c2b668",
+    ".claude/agents/implementer.md": "905acfac01164acb61ab5f8cfa98616d50f19eb9d792ce2c4f569eca7e5bf282",
+    ".claude/agents/planner.md": "4a07ef7867a931cbe922eb4adf87cb2b355a644a252c60fc4582482637c99bdb",
+    ".claude/agents/researcher.md": "9ec71ef404c59eeb18f10954e3244bc6fecf8bab37c83700a2887f1c36c0902c",
+    ".claude/agents/reviewer.md": "c1b3de247a44ad33f6d5ed84e21988c860800d6439e08baf726e29d752dc8a26",
+    ".claude/skills/pack-gha-security-dast/SKILL.md": "2178b2a2f453d413865a70dc96bdae5d502fcb44535dfcf7eb62d2dcdfa7dc73",
+    ".claude/skills/pack-implementer-self-check/SKILL.md": "9080ed434c0279f8ddb3c11ef2f69856ded339da437c1aed4913e59e60f9d663",
+    ".claude/skills/pack-org-operating-model/SKILL.md": "bde9c6d2e58fde78f077b474074e94e22be6e5487af20d808017ac2d52f19873",
+    ".claude/skills/pack-python-untrusted-input/SKILL.md": "91b89c1ba89aa89cca56fb148ac5038d64b00731c5141b9f9d6a0f4808cf520b",
+    ".claude/skills/pack-review-protocol/SKILL.md": "73f2b0648d2fea3899ee8e3153a4a06175603a40211947d78d7087ddcc93ca04",
+    ".claude/skills/pack-threat-model/SKILL.md": "e1e5d1c39a133b56e832c830ed2c3758105aebf20abf024f43aa2f6466c2b668",
+    ".codex/agents/implementer.toml": "8da3eb5e8eddbf68611e8130b928a56dd5187ac2a073251066daacd2222e3932",
+    ".codex/agents/planner.toml": "5a5ab2130d1bff11017159a173429d85f09d7ed7b33f1dd29ac2e947fe6757b1",
+    ".codex/agents/researcher.toml": "a2c0eaac146781ba8b64fce09c3dbd3da4dde747b4929ead403bc3691b9382b2",
+    ".codex/agents/reviewer.toml": "40f05b0652b37cce26b4c9121b28438b7555aa89a8246ffb284de04819fa2b00",
+    ".github/agents/implementer.agent.md": "e3293e92217d1ec305d2fd4ea56981bea7ebfe8a43e2fceef219796e4aac0699",
+    ".github/agents/planner.agent.md": "be075f7a8f6c81ec7418939ad0f1c9406182906317ead6151cc9c57cb4996a3a",
+    ".github/agents/researcher.agent.md": "c8f86e9fcc9fe6d9eee90bb611e91c0b6e3b4de79360bd86b6a95f9ca73e73d4",
+    ".github/agents/reviewer.agent.md": "42beed8822782d6c21a1b6cbc442fe17e22abe944faf43f6830daba097efd1f6",
+    "prompts/implementer.md": "0f0e5e487ab2c2898ef7a9a0131d2bdb2d284f20d5839776f7e9365295234e75",
+    "prompts/planner.md": "41d7be1bc340c39442d6d6a45c7caeedb3bee7d6ce449bebbe928142df3ce97c",
+    "prompts/researcher.md": "d9fc09fde8b86116217677409fa4faa7127a0a0764fc29a3aa379b6c6b8c4198",
+    "prompts/reviewer.md": "e2b6d94366ca787178381cf0e365e49ba13944d1e126c5134da83f8d19a35c3b"
+  },
+  "packs": [
+    "review-protocol",
+    "implementer-self-check",
+    "threat-model",
+    "python-untrusted-input",
+    "gha-security-dast",
+    "org-operating-model"
+  ],
+  "roles": [
+    "implementer",
+    "reviewer",
+    "researcher",
+    "planner"
+  ],
+  "schema": 1,
+  "source": {
+    "commit": "c20a9bdee5da039f74fa0267759de1bec03dc6a2",
+    "release": "0.4.0",
+    "repository": "https://github.com/ChiefGyk3D/department-of-internal-arguments"
+  }
+}
