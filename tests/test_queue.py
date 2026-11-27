@@ -18,6 +18,7 @@ from unittest import mock
 from _bootstrap import ROOT, make_git_dir
 
 from shit import commands
+from shit import dependencies as dep
 from shit import queue as q
 from shit import queue_records as qr
 from shit import task as task_mod
@@ -279,33 +280,80 @@ class Readiness(QueueCase):
 
 
 class GraphOperations(QueueCase):
+    def shard(self, task_id):
+        return json.loads((self.shit / "deps" / f"{task_id}.json").read_text())
+
+    def forge_graph(self, shards, *, actor="human"):
+        """Write shard files and append a matching, correctly chained graph_changed entry (an attacker who can rechain)."""
+        entries = [json.loads(line) for line in self.queue_lines()]
+        digests = []
+        for task_id, needs in shards.items():
+            data = dep.dump_shard(task_id, [{"needs_id": n, "type": t} for n, t in needs])
+            (self.shit / "deps" / f"{task_id}.json").write_bytes(data)
+            digests.append({"task_id": task_id, "sha256": hashlib.sha256(data).hexdigest()})
+        first = min(shards)
+        entries.append({"schema": "queue-entry", "schema_version": 1, "id": f"queue-{len(entries) + 1:04d}",
+                        "task_id": first, "timestamp": entries[-1]["timestamp"], "actor": actor,
+                        "kind": "graph_changed", "shards": sorted(digests, key=lambda d: d["task_id"]),
+                        "message": "Queue entry recorded."})
+        self.rewrite_queue([json.dumps(e, separators=(",", ":")).encode() for e in entries])
+
     def test_cycles_unknown_and_duplicate(self):  # Q-DEP-03, Q-DEP-05, Q-DEP-06
         for tid in ("a", "b", "c"):
             self.task(tid)
         q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
         q.add_edge(self.proj, "c", "b", "draft", "wrapper", now=self.tick())
-        before = (self.shit / "dependencies.json").read_bytes()
+        before = self.snap()
         self.assertEqual(self.code(q.add_edge, self.proj, "a", "a", "draft", "human", now=self.tick()), 3)
         self.assertEqual(self.code(q.add_edge, self.proj, "a", "c", "apply", "human", now=self.tick()), 3)
         self.assertEqual(self.code(q.add_edge, self.proj, "a", "ghost", "draft", "human", now=self.tick()), 9)
         self.assertEqual(self.code(q.add_edge, self.proj, "b", "a", "draft", "human", now=self.tick()), 3)
+        self.assertEqual(self.snap(), before)  # every refusal leaves every byte unchanged
         q.add_edge(self.proj, "b", "a", "review", "human", now=self.tick())
-        self.assertNotEqual((self.shit / "dependencies.json").read_bytes(), before)
-        self.assertEqual(len(json.loads((self.shit / "dependencies.json").read_text())["edges"]), 3)
+        self.assertEqual(len(self.shard("b")["needs"]), 2)
+        self.assertEqual(sorted(os.listdir(self.shit / "deps")), ["b.json", "c.json"])  # one shard per dependent
 
-    def test_failed_add_leaves_graph_bytes_unchanged(self):
+    def test_every_graph_change_is_a_chain_entry(self):
         self.task("a")
         self.task("b")
         q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
-        before = (self.shit / "dependencies.json").read_bytes()
-        self.assertEqual(self.code(q.add_edge, self.proj, "a", "b", "draft", "human", now=self.tick()), 3)
-        self.assertEqual((self.shit / "dependencies.json").read_bytes(), before)
+        last = json.loads(self.queue_lines()[-1])
+        data = (self.shit / "deps" / "b.json").read_bytes()
+        self.assertEqual((last["kind"], last["shards"]), ("graph_changed", [
+            {"task_id": "b", "sha256": hashlib.sha256(data).hexdigest()}]))
+        q.remove_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        self.assertFalse((self.shit / "deps" / "b.json").exists())  # the last edge removes the shard
+        self.assertEqual(json.loads(self.queue_lines()[-1])["shards"], [{"task_id": "b", "sha256": "0" * 64}])
+        self.assertEqual(self.status()["b"]["state"], "ready")
+
+    def test_add_edges_writes_every_shard_in_one_commit(self):
+        for tid in ("a", "b", "c"):
+            self.task(tid)
+        q.add_edges(self.proj, [("b", "a", "draft"), ("c", "a", "draft"), ("c", "b", "apply")], "human",
+                    now=self.tick())
+        last = json.loads(self.queue_lines()[-1])
+        self.assertEqual([d["task_id"] for d in last["shards"]], ["b", "c"])
+        self.assertEqual(sorted(os.listdir(self.shit / "deps")), ["b.json", "c.json"])
+        before = self.snap()
+        # the second edge closes a cycle: nothing from the batch may be written
+        self.assertEqual(self.code(q.add_edges, self.proj, [("a", "c", "decision"), ("a", "b", "review")], "human",
+                                   now=self.tick()), 3)
+        self.assertEqual(self.snap(), before)
+
+    def test_graph_survives_restart(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        self.proj.close()
+        self.proj = Project.open(self.repo)
+        self.assertEqual(self.status()["b"]["state"], "waiting")
 
     def test_model_actor_cannot_change_the_graph(self):  # Q-DEP-07
         self.task("a")
         self.task("b")
         before = self.snap()
         self.assertEqual(self.code(q.add_edge, self.proj, "b", "a", "draft", "model", now=self.tick()), 10)
+        self.assertEqual(self.code(q.add_edges, self.proj, [("b", "a", "draft")], "model", now=self.tick()), 10)
         self.assertEqual(self.code(q.remove_edge, self.proj, "b", "a", "draft", "model", now=self.tick()), 10)
         self.assertEqual(self.snap(), before)
 
@@ -316,34 +364,245 @@ class GraphOperations(QueueCase):
         self.claim("b")
         self.assertEqual(self.code(q.remove_edge, self.proj, "b", "a", "apply", "human", now=self.tick()), 4)
 
-    def test_hand_edited_cycle_fails_closed(self):  # Q-DEP-04, TM-18
+    def test_chain_proven_cycle_fails_closed(self):  # Q-DEP-04, TM-18: even a rechained cycle is refused
         self.task("a")
         self.task("b")
-        edges = [{"task_id": "a", "needs_id": "b", "type": "draft"}, {"task_id": "b", "needs_id": "a", "type": "draft"}]
-        (self.shit / "dependencies.json").write_text(json.dumps(
-            {"schema": "dependency-graph", "schema_version": 1, "edges": edges}))
+        self.forge_graph({"a": [("b", "draft")], "b": [("a", "draft")]})
         before = self.snap()
         self.assertEqual(self.code(self.claim, "a"), 8)
         self.assertEqual(self.code(self.status), 8)
         self.assertEqual(self.snap(), before)
 
-    def test_hand_edited_dangling_edge_and_garbage_fail_closed(self):  # Q-DEP-04
+    def test_chain_proven_self_edge_and_dangling_edge_fail_closed(self):
         self.task("a")
-        edge = [{"task_id": "a", "needs_id": "ghost", "type": "draft"}]
-        graph = (self.shit / "dependencies.json")
-        graph.write_text(json.dumps({"schema": "dependency-graph", "schema_version": 1, "edges": edge}))
-        self.assertEqual(self.code(self.claim, "a"), 8)
-        graph.write_text("{not json")
-        self.assertEqual(self.code(self.claim, "a"), 8)
-        graph.write_text('{"schema":"dependency-graph","schema":"dependency-graph","schema_version":1,"edges":[]}')
-        self.assertEqual(self.code(self.claim, "a"), 8)
+        self.forge_graph({"a": [("a", "draft")]})
+        self.assertEqual(self.code(self.status), 8)
+        self.forge_graph({"a": [("ghost", "draft")]})
+        self.assertEqual(self.code(self.status), 8)
 
-    def test_symlinked_graph_is_refused(self):
+    def test_shard_deleted_fails_closed(self):
         self.task("a")
-        outside = self.repo / "g.json"
-        outside.write_text('{"schema":"dependency-graph","schema_version":1,"edges":[]}')
-        os.symlink(outside, self.shit / "dependencies.json")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        (self.shit / "deps" / "b.json").unlink()
+        before = self.snap()
+        self.assertEqual(self.code(self.claim, "a"), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_shard_edited_fails_closed(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        path = self.shit / "deps" / "b.json"
+        edited = json.loads(path.read_text())
+        edited["needs"] = []  # an attacker drops the edge so the task becomes ready
+        path.write_text(json.dumps(edited))
+        self.assertEqual(self.code(self.status), 8)
+        path.write_text(path.read_text().replace('"draft"', '"apply"'))
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_shard_added_without_a_chain_entry_fails_closed(self):
+        self.task("a")
+        self.task("b")
+        (self.shit / "deps" / "b.json").write_bytes(dep.dump_shard("b", [{"needs_id": "a", "type": "draft"}]))
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_two_shards_disagreeing_on_one_edge_fail_closed(self):
+        # an edge lives in exactly one shard; a copy under another task's name must not be believed
+        for tid in ("a", "b", "c"):
+            self.task(tid)
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        copy = (self.shit / "deps" / "b.json").read_bytes()
+        (self.shit / "deps" / "c.json").write_bytes(copy)  # c.json now says it belongs to b
+        self.assertEqual(self.code(self.status), 8)  # no chain entry for c
+        entries = [json.loads(line) for line in self.queue_lines()]
+        entries.append({"schema": "queue-entry", "schema_version": 1, "id": f"queue-{len(entries) + 1:04d}",
+                        "task_id": "c", "timestamp": entries[-1]["timestamp"], "actor": "human",
+                        "kind": "graph_changed", "message": "Queue entry recorded.",
+                        "shards": [{"task_id": "c", "sha256": hashlib.sha256(copy).hexdigest()}]})
+        self.rewrite_queue([json.dumps(e, separators=(",", ":")).encode() for e in entries])
+        self.assertEqual(self.code(self.status), 8)  # even rechained: the record id disagrees with the file name
+
+    def test_malformed_graph_changed_entries_are_refused(self):
+        self.task("a")
+        self.task("b")
+        digests = {}
+        for tid in ("a", "b"):  # real, empty shards, so only the entry's own shape can make a case fail
+            data = dep.dump_shard(tid, [])
+            (self.shit / "deps" / f"{tid}.json").write_bytes(data)
+            digests[tid] = hashlib.sha256(data).hexdigest()
+        digest = digests["a"]
+        both = [{"task_id": "a", "sha256": digests["a"]}, {"task_id": "b", "sha256": digests["b"]}]
+        base = {"schema": "queue-entry", "schema_version": 1, "id": "queue-0003", "task_id": "a",
+                "timestamp": at(self.clock), "actor": "human", "kind": "graph_changed", "message": "m"}
+        original = self.queue_lines()
+        good = {**base, "shards": both}
+        self.rewrite_queue([*original, json.dumps(good, separators=(",", ":")).encode()])
+        self.assertEqual(self.status(now=at(self.clock + 1))["a"]["state"], "ready")  # the well-formed entry is accepted: the cases bite
+        original = self.queue_lines()
+        base["id"] = "queue-0004"
+        cases = {
+            "duplicate shard ids": {**base, "shards": [both[0]] * 2},
+            "unsorted": {**base, "shards": both[::-1]},
+            "entry task is not the first shard": {**base, "task_id": "b", "shards": both},
+            "empty": {**base, "shards": []},
+            "bad digest": {**base, "shards": [{"task_id": "a", "sha256": "zz"}]},
+            "state_after present": {**base, "state_after": "ready", "shards": [{"task_id": "a", "sha256": digest}]},
+            "model actor": {**base, "actor": "model", "shards": [{"task_id": "a", "sha256": digest}]},
+            "extra shard key": {**base, "shards": [{"task_id": "a", "sha256": digest, "x": 1}]},
+        }
+        for name, entry in cases.items():
+            self.rewrite_queue([*original, json.dumps(entry, separators=(",", ":")).encode()])
+            self.assertEqual(self.code(self.status), 8, name)
+
+    def test_oversize_and_garbage_shards_fail_closed(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        path = self.shit / "deps" / "b.json"
+        good = path.read_bytes()
+        for bad in (b" " * 70000, b"{not json", b'{"schema":"dependency-shard","schema":"dependency-shard"}',
+                    b'{"a":[[[[[[[[[1]]]]]]]]]}'):
+            path.write_bytes(bad)
+            self.assertEqual(self.code(self.status), 8, bad[:20])
+        path.write_bytes(good)
+        self.assertEqual(self.status()["b"]["state"], "waiting")  # the restored shard is accepted: the cases bite
+
+    def test_oversize_shard_with_a_rechained_digest_is_still_refused(self):
+        with mock.patch.object(dep, "MAX_NEEDS_PER_TASK", 2):
+            for tid in ("a", "b", "c", "d"):
+                self.task(tid)
+            obj = {"schema": "dependency-shard", "schema_version": 1, "task_id": "d",
+                   "needs": [{"needs_id": n, "type": "draft"} for n in ("a", "b", "c")]}
+            data = json.dumps(obj).encode()
+            (self.shit / "deps" / "d.json").write_bytes(data)
+            entries = [json.loads(line) for line in self.queue_lines()]
+            entries.append({"schema": "queue-entry", "schema_version": 1, "id": f"queue-{len(entries) + 1:04d}",
+                            "task_id": "d", "timestamp": entries[-1]["timestamp"], "actor": "human",
+                            "kind": "graph_changed", "message": "Queue entry recorded.",
+                            "shards": [{"task_id": "d", "sha256": hashlib.sha256(data).hexdigest()}]})
+            self.rewrite_queue([json.dumps(e, separators=(",", ":")).encode() for e in entries])
+            self.assertEqual(self.code(self.status), 8)  # three real prerequisites, one over the cap
+        self.assertEqual(self.status()["d"]["state"], "waiting")  # the same shard is fine under the real cap
+
+    def test_legacy_single_file_graph_fails_closed(self):
+        self.task("a")
+        (self.shit / "dependencies.json").write_text('{"schema":"dependency-graph","schema_version":1,"edges":[]}')
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_symlinked_shard_and_directory_are_refused(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        target = self.repo / "g.json"
+        target.write_bytes((self.shit / "deps" / "b.json").read_bytes())
+        (self.shit / "deps" / "b.json").unlink()
+        os.symlink(target, self.shit / "deps" / "b.json")
         self.assertEqual(self.code(self.status), 5)
+        (self.shit / "deps" / "b.json").unlink()
+        (self.shit / "deps").rmdir()
+        os.symlink(self.repo, self.shit / "deps")
+        self.assertEqual(self.code(self.status), 5)
+
+    def test_stray_and_stale_files_in_deps(self):
+        self.task("a")
+        (self.shit / "deps" / "Not A Slug.txt").write_text("x")
+        self.assertEqual(self.code(self.status), 8)
+        (self.shit / "deps" / "Not A Slug.txt").unlink()
+        (self.shit / "deps" / ".tmp-abc").write_text("x")  # a crash leftover: cleaned, not an error
+        self.status()
+        self.assertEqual(os.listdir(self.shit / "deps"), [])
+
+    def test_total_task_cap_is_enforced_on_enqueue(self):
+        with mock.patch.object(dep, "MAX_TASKS", 2):
+            self.task("a")
+            self.task("b")
+            task_mod.create_task(self.proj, task_id="c", title="T", summary="S", owner="human", actor="human",
+                                 now=self.tick())
+            self.assertEqual(self.code(q.enqueue, self.proj, "c", "human", now=self.tick()), 7)
+
+    def test_per_task_edge_cap_is_enforced_by_the_queue(self):
+        with mock.patch.object(dep, "MAX_NEEDS_PER_TASK", 2):
+            for tid in ("a", "b", "c", "d"):
+                self.task(tid)
+            q.add_edge(self.proj, "d", "a", "draft", "human", now=self.tick())
+            q.add_edge(self.proj, "d", "b", "draft", "human", now=self.tick())
+            before = self.snap()
+            self.assertEqual(self.code(q.add_edge, self.proj, "d", "c", "draft", "human", now=self.tick()), 7)
+            self.assertEqual(self.snap(), before)
+
+
+class GraphCrash(QueueCase):
+    STAGES = ("pending-written", "lease-applied", "lifecycle-applied", "shards-applied", "entry-appended",
+              "chain-appended", "pending-removed")
+
+    class Crash(Exception):
+        pass
+
+    def scenario(self, case, additions):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve() / "repo"
+            repo.mkdir()
+            make_git_dir(repo / ".git")
+            proj = Project.init(repo)
+            try:
+                for n, tid in enumerate(("a", "b", "c"), start=1):
+                    task_mod.create_task(proj, task_id=tid, title="T", summary="S", owner="human", actor="human",
+                                         now=at(n))
+                    q.enqueue(proj, tid, "human", now=at(n + 10))
+
+                def crash(stage):
+                    if stage == case:
+                        raise GraphCrash.Crash
+
+                if case is None:
+                    q.add_edges(proj, additions, "human", now=at(50))
+                else:
+                    with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(GraphCrash.Crash):
+                        q.add_edges(proj, additions, "human", now=at(50))
+                q.status(proj, now=at(60))
+                q.status(proj, now=at(60))
+                return {str(p.relative_to(repo / ".shit")): p.read_bytes() for p in sorted((repo / ".shit").rglob("*"))
+                        if p.is_file() and p.name not in ("lock",)}
+            finally:
+                proj.close()
+
+    def test_multi_shard_graph_change_recovers_from_a_crash_at_every_stage(self):  # Q-REC-01, TM-24
+        additions = [("b", "a", "draft"), ("c", "a", "draft"), ("c", "b", "apply")]
+        expected = self.scenario(None, additions)
+        self.assertEqual(sorted(k for k in expected if k.startswith("deps/")), ["deps/b.json", "deps/c.json"])
+        for stage in self.STAGES:
+            with self.subTest(stage=stage):
+                self.assertEqual(self.scenario(stage, additions), expected)
+
+    def test_a_torn_shard_set_without_its_pending_record_fails_closed(self):
+        # one shard written, no chain entry and no pending record: tampering, not a crash
+        self.task("a")
+        self.task("b")
+        self.task("c")
+        q.add_edges(self.proj, [("b", "a", "draft"), ("c", "a", "draft")], "human", now=self.tick())
+        (self.shit / "deps" / "c.json").unlink()
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_pending_with_a_shard_that_does_not_match_its_entry_fails_closed(self):
+        self.task("a")
+        self.task("b")
+
+        def crash(stage):
+            if stage == "pending-written":
+                raise GraphCrash.Crash
+
+        with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(GraphCrash.Crash):
+            q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        path = self.shit / "queue-pending.json"
+        doc = json.loads(path.read_text())
+        doc["shards"][0]["content"] = doc["shards"][0]["content"].replace('"draft"', '"apply"')
+        path.write_text(json.dumps(doc))
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertFalse((self.shit / "deps" / "b.json").exists())  # nothing from the forged pending was applied
+        self.assertNotIn("queue-pending.json", {k.split("/")[-1] for k in self.snap()})
+        self.assertNotEqual(before, {})
 
 
 class Claims(QueueCase):

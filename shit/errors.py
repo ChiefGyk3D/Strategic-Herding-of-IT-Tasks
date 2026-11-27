@@ -27,7 +27,7 @@ INPUT_LIMIT = 7
 FAILED_CLOSED = 8
 PRECONDITION = 9
 HUMAN_APPROVAL = 10
-# PROPOSED, not yet approved (docs/queue-spec.md OQ-1): the number and name may change.
+# Approved by the owner on 2026-11-27 (docs/queue-spec.md, OQ-1).
 LEASE_REFUSED = 12
 
 

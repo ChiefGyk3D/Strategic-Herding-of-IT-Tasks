@@ -69,7 +69,11 @@ KINDS = {
     "reopened": (set(), set(), ("human",), ("ready", "waiting")),
     "done": (set(), set(), HW, ("done",)),
     "orphan_removed": (set(), {"lease_id"}, W, STATES),
+    # A change to the dependency graph. It carries no queue state: a task need not be enqueued to have edges.
+    "graph_changed": ({"shards"}, set(), HW, ()),
 }
+ABSENT = "0" * 64  # the digest recorded for a shard that was deleted
+MAX_SHARDS_PER_ENTRY = 32
 
 CONFIG_RANGES = {
     "lease_ttl_seconds": (60, 86400),
@@ -114,13 +118,19 @@ def validate_entry(obj):
     if not isinstance(kind, str) or kind not in KINDS:
         raise reject()
     required, optional, actors, states = KINDS[kind]
-    records._keys(obj, _COMMON - {"message"} | required, optional | {"message"})
+    base = _COMMON - {"message"}
+    if kind == "graph_changed":
+        base = base - {"state_after"}
+    records._keys(obj, base | required, optional | {"message"})
     records._version(obj, "queue-entry")
     records._slug(obj, "id")
     records._slug(obj, "task_id")
     records._stamp(obj, "timestamp")
     records._choice(obj, "actor", actors)
-    records._choice(obj, "state_after", states)
+    if kind == "graph_changed":
+        _validate_shards(obj)
+    else:
+        records._choice(obj, "state_after", states)
     if "message" in obj:
         records._text(obj, "message", MAX_MESSAGE)
     if "lease_id" in obj and (not isinstance(obj["lease_id"], str) or not LEASE_ID.fullmatch(obj["lease_id"])):
@@ -143,6 +153,32 @@ def validate_entry(obj):
         if f"hold-{obj['hold_kind']}" != obj["state_after"]:
             raise reject()
     return obj
+
+
+def _validate_shards(obj):
+    shards = obj["shards"]
+    if not isinstance(shards, list) or not 1 <= len(shards) <= MAX_SHARDS_PER_ENTRY:
+        raise reject()
+    ids = []
+    for item in shards:
+        if not isinstance(item, dict):
+            raise reject()
+        records._keys(item, {"task_id", "sha256"}, set())
+        ids.append(records._slug(item, "task_id"))
+        if not isinstance(item["sha256"], str) or not HEX64.fullmatch(item["sha256"]):
+            raise reject()
+    if ids != sorted(set(ids)) or obj["task_id"] != ids[0]:
+        raise reject()
+
+
+def graph_digests(entries):
+    """{dependent task id: sha256 of its shard, or ABSENT} as proven by the chain, latest entry wins."""
+    out = {}
+    for entry in entries:
+        if entry["kind"] == "graph_changed":
+            for item in entry["shards"]:
+                out[item["task_id"]] = item["sha256"]
+    return out
 
 
 def load_entry(data):
@@ -294,6 +330,8 @@ def replay(entries):
         if entry["id"] != f"queue-{number:04d}" or entry["timestamp"] < previous:
             raise reject()
         previous = entry["timestamp"]
+        if entry["kind"] == "graph_changed":
+            continue  # graph changes carry no queue state; `graph_digests` reads them
         task_id = entry["task_id"]
         task = tasks.get(task_id)
         if entry["kind"] == "enqueued":

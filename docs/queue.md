@@ -6,44 +6,54 @@
 
 | Module | Content |
 |---|---|
-| `shit/dependencies.py` | `dependency-graph` validation, cycle detection (iterative), missing-node detection, add and remove edge, readiness helpers. Pure functions. |
+| `shit/dependencies.py` | Shard validation and bytes, in-memory graph validation, cycle detection (iterative), missing-node detection, add (single and batch) and remove edge, readiness helpers. Pure functions. |
 | `shit/queue_records.py` | `queue-entry` and `lease` validation, the transition table, per-kind field rules, configuration ranges and `replay`, which rebuilds every task's queue state from the log and rejects impossible sequences. |
-| `shit/queue.py` | Storage and operations: `enqueue`, `add_edge`, `remove_edge`, `claim`, `start`, `renew`, `release`, `submit`, `fail`, `hold`, `reopen`, `complete`, `reclaim`, `status`, `render_view`. |
+| `shit/queue.py` | Storage and operations: `enqueue`, `add_edge`, `add_edges`, `remove_edge`, `claim`, `start`, `renew`, `release`, `submit`, `fail`, `hold`, `reopen`, `complete`, `reclaim`, `status`, `render_view`. |
 | `shit/project.py` | Two confined helpers: `list_dir` and `create_exclusive` (create-if-absent by temp file and hard link, never follows a symlink). |
 | `shit/task.py` | `_transition_locked` split out of `transition` so a queue commit can run a lifecycle step under the lock it already holds; `create_task` refuses an id that appears in the event log (Q-RES-01). |
 
-Files under `.shit`: `queue.jsonl` with the sidecar `queue.chain`, `dependencies.json`, `leases/<task-id>.json`, `queue-pending.json` (the commit point, present only during a mutation) and the generated `QUEUE.md`.
+Files under `.shit`: `queue.jsonl` with the sidecar `queue.chain`, `deps/<task-id>.json` (one dependency shard per dependent task), `leases/<task-id>.json`, `queue-pending.json` (the commit point, present only during a mutation) and the generated `QUEUE.md`.
 
 Every operation takes the store lock, finishes an interrupted commit, loads and verifies everything (chain, replay, graph, lifecycle agreement), runs maintenance (orphan leases, missing lease files, expiry, waiting to ready) and then does its own step. A queue state that cannot be verified is exit code 8 and nothing is written.
 
 ## Decisions recorded by the owner (2026-11-27)
 
+- OQ-1: exit code 12 `lease_refused` is approved (`errors.LEASE_REFUSED`, `docs/exit-codes.md`).
 - OQ-2: queue facts stay in `queue.jsonl`; the event log stays at version 1. Implemented as specified.
-- OQ-6: an `apply` edge opens when the prerequisite's `apply_finished` is recorded. Implemented in the claim check: a claim of step `apply` is refused (exit code 4) while any `apply` prerequisite has no `apply_finished` entry. Nothing in issue 17 writes `apply_started` or `apply_finished` (apply slots belong to the apply-serialization work), so such a claim stays refused until that work lands. That fails safe.
-- OQ-3: bounded wrapper-only retry is allowed in principle. The lifecycle amendment is drafted in `docs/lifecycle.md` ("Proposed amendment", not in force) and needs review. The retry itself is not implemented: it needs the amendment first, and the current code keeps `running` plus expired lease ending in `failed` (Q-LEASE-06) and `failed` to `ready` human-only (Q-RET-02). Stub: the transition table in `queue_records.ALLOWED` and the `expired` handling in `queue._expire` are the two places to change.
+- OQ-3: a bounded wrapper-only automatic retry is allowed in principle. The lifecycle amendment is drafted in `docs/lifecycle.md` ("Proposed amendment", not in force) and needs review. The retry is not implemented: it needs the amendment first, and the code keeps a running task with an expired lease ending in `failed` (Q-LEASE-06) and `failed` to `ready` human-only (Q-RET-02). Stub points: `queue_records.ALLOWED` and `queue._expire`.
+- OQ-4: kept as built. `start` records open to running with actor `wrapper` when the worker asks, including a by-hand start by a human worker.
+- OQ-5: sharded per task now. See "Dependency shards" below.
+- OQ-6: an `apply` edge opens after the prerequisite's `apply_finished` is recorded. A claim of step `apply` is refused (exit code 4) while any `apply` prerequisite has no `apply_finished` entry. Nothing in issue 17 writes `apply_started` or `apply_finished`, so such a claim stays refused until the apply-slot work lands. That fails safe.
+- OQ-7: the wrapper computes `base_sha256` at claim time of the draft step. **STUB, issue 18 (apply slots):** nothing is computed or stored yet; a marked comment in `queue.claim` shows where. Not part of issue 17.
+- OQ-8: per-worker credentials are wanted. Not built here; designed in `docs/design/lease-credentials.md` for a separate implementation issue. Until then the lease id is a bearer token (TM-17 residual risk).
+- OQ-9: no priority field. Apply admission will order by `(created_at, id)` only (issue 18); the spec is updated.
 
-## Open questions still undecided, and how each touches the code
+## Dependency shards (OQ-5)
+
+The graph is stored as one `dependency-shard` record per dependent task, `deps/<task-id>.json`, listing the tasks it needs. Each edge lives in exactly one shard.
+
+- Caps: 200 `needs` per task (`dependencies.MAX_NEEDS_PER_TASK`, about 12 KB at the cap, far under the 65,536-byte record limit) and 2,000 queued tasks and shards in total (`dependencies.MAX_TASKS`). A breach is exit code 7 (adding an edge, or enqueueing past the total). Both are constants in one module; raising them is a code change plus a test.
+- Chain proof: every graph change appends one `graph_changed` entry carrying the SHA-256 of each shard it wrote (64 zeros for a deleted one). The loader requires the shard files to equal the chain's set exactly and each file's digest to match.
+- Fail closed (exit code 8, nothing written): a shard deleted, edited or added without a chain entry; a record whose `task_id` differs from its file name (two shards disagreeing about an edge); an oversize or malformed shard even when its digest was rechained; a cycle, self edge or dangling edge; a stray file name; a leftover `dependencies.json` from the single-file layout (never released, so there is nothing to migrate).
+- Atomicity: the commit point `queue-pending.json` lists every shard to write or delete with its exact content and the entry that records their digests. Recovery checks content against digests before writing anything, then applies idempotently. `add_edges` changes several shards in one commit or none.
+- A shard is written with an atomic replace. Edge add and remove stay human or wrapper only, and a task with a live lease cannot lose an edge.
+
+## Accepted gaps (owner accepted these on 2026-11-27)
+
+The spec text now matches the code.
+
+1. There is no log kind for ready to waiting. Only waiting to ready is written. The effective state is recomputed from files on every operation, so a claim of a re-closed task is refused and `status` reports `waiting`.
+2. Release from `running` is exit code 4 (the table has no `running` to `ready`). The spec's worked example is corrected: a second claim on a task whose lease is live, whatever the step, is refused (Q-CLAIM-04).
+3. `claimed` and `renewed` entries carry an optional `expires_at`, so the chain proves the lease file in full (Q-LEASE-10).
+4. `orphan_removed` is written only for a task that is in the queue.
+5. A hold leaves only through a human `reopen`. The table's hold to running (wrapper resume) is not implemented.
+6. Deleting `queue.jsonl`, `queue.chain` and the shards together is undetectable without signing. It is listed under residual risks in `docs/threat-model.md`.
+
+## Still open
 
 | Question | Effect on this implementation |
 |---|---|
-| OQ-1 exit code for a refused lease | Code 12 and the name `lease_refused` are used as the spec proposes, in one constant (`errors.LEASE_REFUSED`) and one row in `docs/exit-codes.md` marked PROPOSED. If the number changes, change that constant, the row and the tests that assert 12. |
-| OQ-4 `running` entered by hand | `start` records `open` to `running` with actor `wrapper` when the worker asks, exactly as the spec's reading. If the lifecycle text changes, only `queue.start` changes. |
-| OQ-5 graph size | One `dependencies.json` limited to 65,536 bytes. Over the limit `dump_graph` fails with exit code 7 (tested). Sharding would change `_load_graph` and the two write sites. |
-| OQ-7 `base_sha256` source | Not implemented (belongs to apply serialization). No field exists for it. |
-| OQ-8 lease secrecy | Bearer token in a file; compared in constant time. The chain proves every lease field, so a hand-edited lease file (for example a longer expiry) is exit code 8. Per-worker credentials would change `_check_presented`. |
-| OQ-9 priority | No `priority` field exists. Nothing in issue 17 orders by priority (that is apply admission, Q-SER-04). |
-
-## Spec gaps found while implementing (not decided here)
-
-These are for a human to settle; the code takes the least risky reading and says so.
-
-1. **No log kind for ready to waiting.** Q-DEP-09 and the transition table allow `ready` to `waiting`, but Q-LOG-01 has no kind for it. The code does not persist that step. A stored `ready` task whose gate re-closes is reported as `waiting` by `status` and refused by `claim` (the effective state is recomputed from files every time, Q-DEP-08). Only waiting to ready is written (`ready` entry). This keeps Q-ST-01 true for the stored state and makes the stored state lag the effective one in that one direction.
-2. **Release from `running`.** The table has no `running` to `ready`, and the lifecycle forbids `running` to `open`, yet Q-MET-01 lists `released` as a way out of `running` and Q-HET-02 lists release in a human worker's path. `release` is accepted only while `dispatched`; from `running` it is exit code 4.
-3. **Review step while a lease is live.** The worked example has a third worker claim a `review` step of a task that is already `running` under another lease, but Q-CLAIM-04 allows one live lease per task. The code follows Q-CLAIM-04: a second claim is exit code 4.
-4. **Lease expiry is not in the queue-entry field list.** The spec's entry fields have no expiry, so a lease file's `expires_at` could not be checked against the chain. `claimed` and `renewed` entries carry an extra optional `expires_at` so the chain proves the lease file in full (Q-LEASE-10). This adds a field to a record type that has no earlier version.
-5. **`orphan_removed` for a task that is not in the queue.** The entry would have no queue state to carry, so the file is removed without an entry.
-6. **Hold to running.** The table lists `hold-*` to `running` (wrapper resumes). A running task needs a live lease and a resume has no claim, so it is not implemented; a hold leaves only through a human `reopen`.
-7. **Whole-queue deletion.** Q-RES-02 asks for detection of a restored older copy. A queue prefix that disagrees with the lifecycle state, a truncated or edited chain and a broken file are all exit code 8 (tested). Deleting `queue.jsonl` and `queue.chain` together leaves nothing to compare, so a task that was never enqueued in that copy is just not queued. Detecting that needs the signing the threat model already lists as a residual risk.
+| OQ-10 shared filesystems | Locking relies on advisory `flock` on a local filesystem. Unsupported on network or synced folders until tested. |
 
 ## Deferred to later work (named in the spec, not part of issue 17)
 
@@ -65,11 +75,11 @@ These are for a human to settle; the code takes the least risky reading and says
 | TM-15 | `test_simultaneous_claims_single_winner` (set `SHIT_RACE_TRIALS=200` for the spec's full count), `test_simultaneous_claims_from_two_processes`, `test_precreated_lease_refuses_claim` |
 | TM-16 | `test_clock_backward_fails_closed`, `test_forward_clock_jump_does_not_double_claim`, `test_claim_rejects_extra_fields_and_worker_supplied_values` |
 | TM-17 | `test_forged_lease_refused`, `test_hand_written_lease_file_grants_nothing`, `test_tampered_live_lease_file_fails_closed` |
-| TM-18 | `tests/test_dependencies.py`, `test_cycles_unknown_and_duplicate`, `test_hand_edited_cycle_fails_closed`, `test_model_actor_cannot_change_the_graph` |
+| TM-18 | `tests/test_dependencies.py`, `test_cycles_unknown_and_duplicate`, `test_chain_proven_cycle_fails_closed`, `test_shard_deleted_fails_closed`, `test_shard_edited_fails_closed`, `test_shard_added_without_a_chain_entry`, `test_two_shards_disagreeing_on_one_edge_fail_closed`, `test_model_actor_cannot_change_the_graph` |
 | TM-19 | `test_complete_requires_the_close_rules_and_is_terminal`, `test_closed_id_not_reusable`, `test_restored_older_queue_fails_closed` |
 | TM-20 | `test_stale_generation_submit_refused` |
 | TM-22 | `test_queue_md_is_a_view_only`, `test_readiness_is_recomputed_from_files_after_deleting_every_derived_file` |
 | TM-23 | `test_renewal_bounds_enforced`, `test_total_length_bound` |
-| TM-24 | `test_queue_crash_matrix_recovers_consistently`, `test_crash_inside_the_nested_lifecycle_transition_recovers`, `test_orphan_lease_removed` |
+| TM-24 | `test_queue_crash_matrix_recovers_consistently`, `test_crash_inside_the_nested_lifecycle_transition_recovers`, `test_orphan_lease_removed`, `test_multi_shard_graph_change_recovers_from_a_crash_at_every_stage` |
 
 TM-21 (apply serialization) is not covered here.

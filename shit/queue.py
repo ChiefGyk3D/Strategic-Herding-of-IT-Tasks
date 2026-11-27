@@ -3,7 +3,7 @@
 State lives in plain files under the confined `.shit` root:
 
 - `queue.jsonl` and `queue.chain`: append-only `queue-entry` records with a sidecar SHA-256 hash chain, like the event log.
-- `dependencies.json`: the typed `dependency-graph` record.
+- `deps/<task-id>.json`: one `dependency-shard` record per dependent task; the chain (`graph_changed` entries) proves each shard's digest.
 - `leases/<task-id>.json`: one `lease` record per live lease, trusted only if the chain proves it.
 - `queue-pending.json`: the commit point of one queue mutation (lease file, lifecycle transition, entry, chain).
 - `QUEUE.md`: a generated view. It is written after each mutation and never read.
@@ -31,6 +31,7 @@ from .errors import (
     FAILED_CLOSED,
     HUMAN_APPROVAL,
     ILLEGAL_TRANSITION,
+    INPUT_LIMIT,
     LEASE_REFUSED,
     PRECONDITION,
     REJECTED,
@@ -43,7 +44,8 @@ from .log import GENESIS, EventLog, chain_hash
 
 QUEUE = "queue.jsonl"
 CHAIN = "queue.chain"
-GRAPH = "dependencies.json"
+DEPS = "deps"
+LEGACY_GRAPH = "dependencies.json"  # the pre-shard single file: never written, refused when present
 PENDING = "queue-pending.json"
 VIEW = "QUEUE.md"
 LEASES = "leases"
@@ -52,7 +54,7 @@ LOCK_TIMEOUT = 60.0  # seconds; a busy queue is slower than a single task comman
 PENDING_LIMIT = 4 * records.MAX_RECORD_BYTES
 STAMP = "%Y-%m-%dT%H:%M:%SZ"
 MESSAGE = "Queue entry recorded."
-PENDING_KEYS = {"index", "entry_line", "chain_line", "lease", "lease_replaces", "remove_lease", "lifecycle"}
+PENDING_KEYS = {"index", "entry_line", "chain_line", "lease", "lease_replaces", "remove_lease", "lifecycle", "shards"}
 LIFE_KEYS = {"task_id", "from", "to", "actor", "reason", "at", "blocked_reason", "blocking_item"}
 
 State = namedtuple("State", "entries lines chain tasks graph")
@@ -114,11 +116,43 @@ def _task_exists(project, task_id):
     return project.exists(task_mod._task_path(task_id))
 
 
-def _load_graph(project):
-    if not project.exists(GRAPH):
-        return dep.empty_graph()
-    graph = dep.load_graph(project.read(GRAPH, limit=records.MAX_RECORD_BYTES))
-    edges = graph["edges"]
+def _read_shard(project, task_id):
+    try:
+        return project.read(f"{DEPS}/{task_id}.json", limit=records.MAX_RECORD_BYTES)
+    except ShitError as exc:
+        if exc.code == INPUT_LIMIT:
+            raise ShitError(REJECTED) from None  # an oversize shard is tampering: fail closed
+        raise
+
+
+def _load_graph(project, entries):
+    """Assemble the graph from its shards, each proven by the chain, then check cycles and dangling edges."""
+    proven = {t: d for t, d in qr.graph_digests(entries).items() if d != qr.ABSENT}
+    if project.exists(LEGACY_GRAPH):
+        raise ShitError(REJECTED)
+    present = set()
+    for name in project.list_dir(DEPS):
+        if name.startswith(".tmp-"):
+            continue  # a crash leftover; maintenance removes it
+        task_id = name[:-5] if name.endswith(".json") else ""
+        if not records.SLUG.fullmatch(task_id):
+            raise ShitError(REJECTED)
+        present.add(task_id)
+    if present != set(proven) or len(present) > dep.MAX_TASKS:
+        raise ShitError(REJECTED)  # a shard without a chain entry, or a proven shard that is gone
+    edges = []
+    for task_id in sorted(present):
+        data = _read_shard(project, task_id)
+        if _sha(data) != proven[task_id]:
+            raise ShitError(REJECTED)
+        try:
+            shard = dep.load_shard(data, task_id)
+        except ShitError as exc:
+            if exc.code == INPUT_LIMIT:
+                raise ShitError(REJECTED) from None
+            raise
+        edges.extend(dep.edges_of(task_id, shard["needs"]))
+    graph = dep.validate_graph({**dep.empty_graph(), "edges": edges})
     if dep.find_cycle(edges):
         raise ShitError(REJECTED)
     ends = {end for edge in edges for end in (edge["task_id"], edge["needs_id"])}
@@ -144,7 +178,7 @@ def _load(project, log):
     def run():
         entries, lines, chain = _load_log(project, log)
         tasks = qr.replay(entries)
-        graph = _load_graph(project)
+        graph = _load_graph(project, entries)
         _check_agreement(project, tasks)
         return State(entries, lines, chain, tasks, graph)
 
@@ -235,7 +269,43 @@ def _read_pending(project, log):
         for key in ("blocked_reason", "blocking_item"):
             if life[key] is not None and not isinstance(life[key], str):
                 raise ShitError(REJECTED)
+    _check_pending_shards(doc["shards"], entry)
     return doc, line, entry
+
+
+def _check_pending_shards(shards, entry):
+    """The shards a pending commit would write must match, byte for byte, the digests its entry will record."""
+    if not isinstance(shards, list) or (entry["kind"] == "graph_changed") != bool(shards):
+        raise ShitError(REJECTED)
+    if not shards:
+        return
+    proven = {item["task_id"]: item["sha256"] for item in entry["shards"]}
+    seen = []
+    for item in shards:
+        if not isinstance(item, dict) or set(item) != {"task_id", "content"}:
+            raise ShitError(REJECTED)
+        task_id, content = _task_id(item["task_id"]), item["content"]
+        seen.append(task_id)
+        if content is None:
+            digest = qr.ABSENT
+        elif isinstance(content, str) and content.isascii():
+            digest = _sha(content.encode("ascii"))
+            dep.load_shard(content.encode("ascii"), task_id)
+        else:
+            raise ShitError(REJECTED)
+        if proven.get(task_id) != digest:
+            raise ShitError(REJECTED)
+    if sorted(seen) != sorted(proven) or len(set(seen)) != len(seen):
+        raise ShitError(REJECTED)
+
+
+def _apply_shards(project, shards):
+    for item in shards:
+        path = f"{DEPS}/{item['task_id']}.json"
+        if item["content"] is None:
+            project.remove(path)
+        else:
+            project.write_atomic(path, item["content"].encode("ascii"))
 
 
 def _apply_lease(project, doc, entry):
@@ -290,6 +360,8 @@ def _apply_pending(project, log, doc, line):
     _checkpoint("lease-applied")
     _apply_lifecycle(project, log, doc["lifecycle"])
     _checkpoint("lifecycle-applied")
+    _apply_shards(project, doc["shards"])
+    _checkpoint("shards-applied")
     index = doc["index"]
     _append_one(project, QUEUE, log._lines(QUEUE), index, line)
     _checkpoint("entry-appended")
@@ -331,7 +403,7 @@ def _recover(project, log):
     _load(project, log)
 
 
-def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, lifecycle=None):
+def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, lifecycle=None, shards=()):
     """Validate one queue entry against the replayed log, then apply it with its lease and lifecycle effects."""
     state = ctx.load()
     number = len(state.entries) + 1
@@ -343,7 +415,9 @@ def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, 
         _plan_lifecycle(ctx, lifecycle)
     previous = GENESIS if not state.chain else state.chain[-1].decode("ascii")
     doc = {"index": len(state.entries), "entry_line": line.decode("ascii"), "chain_line": chain_hash(previous, line),
-           "lease": lease, "lease_replaces": lease_replaces, "remove_lease": remove_lease, "lifecycle": lifecycle}
+           "lease": lease, "lease_replaces": lease_replaces, "remove_lease": remove_lease, "lifecycle": lifecycle,
+           "shards": list(shards)}
+    _check_pending_shards(doc["shards"], entry)
     ctx.project.write_atomic(PENDING, json.dumps(doc, ensure_ascii=True).encode("ascii"), limit=PENDING_LIMIT)
     _checkpoint("pending-written")
     ctx.invalidate()
@@ -423,6 +497,10 @@ def _maintain(ctx):
 def _maintain_once(ctx):
     state = ctx.load()
     _check_clock(ctx, state)
+    for name in ctx.project.list_dir(DEPS):
+        if name.startswith(".tmp-"):
+            ctx.project.remove(f"{DEPS}/{name}")
+            return True
     for name in ctx.project.list_dir(LEASES):
         if name.startswith(".tmp-"):
             ctx.project.remove(f"{LEASES}/{name}")
@@ -463,8 +541,9 @@ def _operate(project, now, config, body):
 
     def run():
         with project.locked(LOCK_TIMEOUT):
-            _recover(project, log)
             project.ensure_dir(LEASES)
+            project.ensure_dir(DEPS)
+            _recover(project, log)
             ctx = _Ctx(project, log, now, config)
             state = ctx.load()
             _check_clock(ctx, state)
@@ -548,21 +627,41 @@ def _task_id(value):
     return value
 
 
-def add_edge(project, task_id, needs_id, kind, actor, *, now=None, config=None):
-    """Add a typed edge. Only `human` or `wrapper` may change the graph (Q-DEP-07); a cycle is exit code 3."""
+def _graph_commit(ctx, state, graph, actor):
+    """Write the shards that differ between the loaded graph and `graph`, with one chain entry covering them all."""
+    old, new = dep.group_by_task(state.graph["edges"]), dep.group_by_task(graph["edges"])
+    changed = sorted(t for t in {*old, *new} if old.get(t) != new.get(t))
+    shards, proof = [], []
+    for task_id in changed:
+        if task_id in new:
+            data = dep.dump_shard(task_id, new[task_id])
+            shards.append({"task_id": task_id, "content": data.decode("ascii")})
+            proof.append({"task_id": task_id, "sha256": _sha(data)})
+        else:
+            shards.append({"task_id": task_id, "content": None})
+            proof.append({"task_id": task_id, "sha256": qr.ABSENT})
+    _commit(ctx, {"task_id": changed[0], "actor": actor, "kind": "graph_changed", "shards": proof}, shards=shards)
+
+
+def add_edges(project, additions, actor, *, now=None, config=None):
+    """Add typed edges `(task_id, needs_id, type)` in one commit, or none. Only `human` or `wrapper` may change the
+    graph (Q-DEP-07). A cycle or duplicate is exit code 3, an unknown task 9, a cap breach 7."""
     _human_or_wrapper(actor)
 
     def body(ctx):
         state = ctx.load()
-        known = {end for end in (task_id, needs_id) if isinstance(end, str) and records.SLUG.fullmatch(end)
+        ends = {end for edge in additions for end in edge[:2]}
+        known = {end for end in ends if isinstance(end, str) and records.SLUG.fullmatch(end)
                  and _task_exists(project, end)}
-        graph = dep.add_edge(state.graph, task_id, needs_id, kind, known)
-        project.write_atomic(GRAPH, dep.dump_graph(graph))
-        ctx.invalidate()
-        ctx.mutated = True
+        graph = dep.add_edges(state.graph, additions, known)
+        _graph_commit(ctx, state, graph, actor)
         return graph
 
     return _operate(project, now, config, body)
+
+
+def add_edge(project, task_id, needs_id, kind, actor, *, now=None, config=None):
+    return add_edges(project, [(task_id, needs_id, kind)], actor, now=now, config=config)
 
 
 def remove_edge(project, task_id, needs_id, kind, actor, *, now=None, config=None):
@@ -574,9 +673,7 @@ def remove_edge(project, task_id, needs_id, kind, actor, *, now=None, config=Non
         graph = dep.remove_edge(state.graph, task_id, needs_id, kind)
         if queued is not None and queued["lease"] is not None:
             raise ShitError(ILLEGAL_TRANSITION)
-        project.write_atomic(GRAPH, dep.dump_graph(graph))
-        ctx.invalidate()
-        ctx.mutated = True
+        _graph_commit(ctx, state, graph, actor)
         return graph
 
     return _operate(project, now, config, body)
@@ -589,8 +686,11 @@ def enqueue(project, task_id, actor, *, now=None, config=None):
 
     def body(ctx):
         state = ctx.load()
-        if task_id in state.tasks or any(e["task_id"] == task_id for e in state.entries):
+        if task_id in state.tasks or any(e["task_id"] == task_id and e["kind"] != "graph_changed"
+                                         for e in state.entries):
             raise ShitError(REJECTED)
+        if len(state.tasks) >= dep.MAX_TASKS:
+            raise ShitError(INPUT_LIMIT)  # the documented cap on queued tasks
         current = records.load_task(project.read(task_mod._task_path(task_id)))
         if current["state"] != "open":
             raise ShitError(ILLEGAL_TRANSITION)
@@ -629,6 +729,9 @@ def claim(project, request, *, now=None, config=None):
             raise ShitError(ILLEGAL_TRANSITION)
         if queued["not_before"] is not None and ctx.now < queued["not_before"]:
             raise ShitError(ILLEGAL_TRANSITION)
+        # STUB (issue 18, OQ-7): for a `draft` step the wrapper will compute `base_sha256` of each declared target
+        # here, at claim time, and record it for the later apply step. Nothing is computed or stored yet.
+        # Ordering among competing apply steps will use (created_at, task id) only: there is no priority (OQ-9).
         if step == "apply":
             for pre in dep.apply_prerequisites(state.graph["edges"], task_id):
                 if not state.tasks.get(pre, {}).get("apply_finished"):

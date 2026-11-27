@@ -25,9 +25,8 @@ class Base(unittest.TestCase):
 
 
 class Shape(Base):
-    def test_empty_graph_round_trips(self):
-        data = dep.dump_graph(dep.empty_graph())
-        self.assertEqual(dep.load_graph(data), dep.empty_graph())
+    def test_empty_graph_is_valid(self):
+        self.assertEqual(dep.validate_graph(dep.empty_graph()), dep.empty_graph())
 
     def test_unknown_key_and_version_rejected(self):
         g = graph()
@@ -45,20 +44,70 @@ class Shape(Base):
         self.assertEqual(self.code(dep.validate_graph, graph(edge("a", "b"), edge("a", "b"))), 3)
         dep.validate_graph(graph(edge("a", "b", "draft"), edge("a", "b", "apply")))
 
-    def test_duplicate_json_key_and_depth_and_size(self):
-        self.assertEqual(self.code(dep.load_graph, b'{"schema":"x","schema":"dependency-graph"}'), 3)
-        self.assertEqual(self.code(dep.load_graph, b'{"a":[[[[[[[[[1]]]]]]]]]}'), 7)
-        big = graph(*[edge(f"t{i}", f"p{i}") for i in range(3000)])
-        self.assertEqual(self.code(dep.dump_graph, big), 7)
-        self.assertEqual(self.code(dep.load_graph, json.dumps(big).encode()), 7)
-
     def test_hostile_characters_in_ids_rejected(self):
         for ident in ("a\u202eb", "a\x00b", "a b", "a\u200bb", "x" * 65):
             self.assertEqual(self.code(dep.validate_graph, graph(edge(ident, "b"))), 3)
 
-    def test_cycle_is_detected_in_a_loaded_file(self):
-        data = json.dumps(graph(edge("a", "b"), edge("b", "a"))).encode()
-        self.assertTrue(dep.find_cycle(dep.load_graph(data)["edges"]))
+
+
+def shard_bytes(task, *needs):
+    return dep.dump_shard(task, [{"needs_id": n, "type": t} for n, t in needs])
+
+
+class Shards(Base):
+    def test_round_trip_is_deterministic_and_sorted(self):
+        data = shard_bytes("a", ("z", "draft"), ("b", "apply"), ("b", "draft"))
+        self.assertEqual(data, shard_bytes("a", ("b", "draft"), ("z", "draft"), ("b", "apply")))
+        got = dep.load_shard(data, "a")
+        self.assertEqual([(n["needs_id"], n["type"]) for n in got["needs"]],
+                         [("b", "apply"), ("b", "draft"), ("z", "draft")])
+
+    def test_file_name_and_record_must_agree(self):
+        self.assertEqual(self.code(dep.load_shard, shard_bytes("a", ("b", "draft")), "c"), 3)
+
+    def test_unknown_keys_version_duplicates_and_bad_ids_rejected(self):
+        good = json.loads(shard_bytes("a", ("b", "draft")))
+        for bad in ({**good, "extra": 1}, {**good, "schema_version": 2}, {**good, "schema": "task"},
+                    {**good, "needs": "b"}, {**good, "needs": [{"needs_id": "b"}]},
+                    {**good, "needs": [{"needs_id": "B", "type": "draft"}]},
+                    {**good, "needs": [{"needs_id": "b", "type": "other"}]},
+                    {**good, "needs": [{"needs_id": "b", "type": "draft"}] * 2},
+                    {**good, "needs": [{"needs_id": "b", "type": "draft", "x": 1}]}):
+            self.assertEqual(self.code(dep.load_shard, json.dumps(bad).encode(), "a"), 3, bad)
+
+    def test_duplicate_json_key_depth_and_size(self):
+        self.assertEqual(self.code(dep.load_shard, b'{"schema":"x","schema":"dependency-shard"}', "a"), 3)
+        self.assertEqual(self.code(dep.load_shard, b'{"a":[[[[[[[[[1]]]]]]]]]}', "a"), 7)
+        self.assertEqual(self.code(dep.load_shard, b" " * 70000, "a"), 7)
+
+    def test_per_task_cap(self):
+        many = [{"needs_id": f"p{i}", "type": "draft"} for i in range(dep.MAX_NEEDS_PER_TASK + 1)]
+        self.assertEqual(self.code(dep.dump_shard, "a", many), 7)
+        within = many[:dep.MAX_NEEDS_PER_TASK]
+        self.assertLess(len(dep.dump_shard("a", within)), 65536)  # a full shard stays under the record limit
+
+    def test_add_edge_enforces_the_per_task_cap(self):
+        known = {"a"} | {f"p{i}" for i in range(dep.MAX_NEEDS_PER_TASK + 1)}
+        g = dep.empty_graph()
+        for i in range(dep.MAX_NEEDS_PER_TASK):
+            g = dep.add_edge(g, "a", f"p{i}", "draft", known)
+        self.assertEqual(self.code(dep.add_edge, g, "a", f"p{dep.MAX_NEEDS_PER_TASK}", "draft", known), 7)
+
+    def test_edges_group_into_shards_and_back(self):
+        edges = [edge("a", "b"), edge("a", "c", "apply"), edge("d", "a")]
+        shards = dep.group_by_task(edges)
+        self.assertEqual(sorted(shards), ["a", "d"])
+        again = [e for t in sorted(shards) for e in dep.edges_of(t, shards[t])]
+        self.assertEqual(sorted(map(json.dumps, again)), sorted(map(json.dumps, edges)))
+
+    def test_add_edges_is_all_or_nothing(self):
+        known = {"a", "b", "c"}
+        g = dep.add_edge(dep.empty_graph(), "b", "a", "draft", known)
+        out = dep.add_edges(g, [("c", "b", "draft"), ("a", "c", "draft")][:1], known)
+        self.assertEqual(len(out["edges"]), 2)
+        before = json.dumps(g)
+        self.assertEqual(self.code(dep.add_edges, g, [("c", "b", "draft"), ("a", "c", "draft")], known), 3)
+        self.assertEqual(json.dumps(g), before)
 
 
 class Cycles(Base):

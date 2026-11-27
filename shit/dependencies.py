@@ -48,16 +48,73 @@ def validate_graph(obj):
     return obj
 
 
-def load_graph(data):
-    return validate_graph(records.parse(data))
+# -- per-task shards ---------------------------------------------------------
+#
+# The graph is stored as one `dependency-shard` record per dependent task (`deps/<task-id>.json`) that
+# lists the tasks it needs. Each edge lives in exactly one shard. A shard is capped at MAX_NEEDS_PER_TASK
+# edges (well under the 65,536-byte record limit) and the graph at MAX_TASKS shards.
+
+MAX_NEEDS_PER_TASK = 200
+MAX_TASKS = 2000
+SHARD_KEYS = {"schema", "schema_version", "task_id", "needs"}
+NEED_KEYS = {"needs_id", "type"}
 
 
-def dump_graph(obj):
-    validate_graph(obj)
+def _sorted_needs(needs):
+    return sorted(needs, key=lambda n: (n["needs_id"], n["type"]))
+
+
+def validate_shard(obj, task_id):
+    """Check one shard: strict keys, the id equals `task_id` (the file name), slugs, known types, no duplicate."""
+    if not isinstance(obj, dict):
+        raise ShitError(REJECTED)
+    records._keys(obj, SHARD_KEYS, set())
+    records._version(obj, "dependency-shard")
+    if records._slug(obj, "task_id") != task_id:
+        raise ShitError(REJECTED)
+    needs = obj["needs"]
+    if not isinstance(needs, list):
+        raise ShitError(REJECTED)
+    if len(needs) > MAX_NEEDS_PER_TASK:
+        raise ShitError(INPUT_LIMIT)
+    seen = set()
+    for item in needs:
+        if not isinstance(item, dict):
+            raise ShitError(REJECTED)
+        records._keys(item, NEED_KEYS, set())
+        records._slug(item, "needs_id")
+        records._choice(item, "type", TYPES)
+        key = (item["needs_id"], item["type"])
+        if key in seen:
+            raise ShitError(REJECTED)
+        seen.add(key)
+    return obj
+
+
+def load_shard(data, task_id):
+    return validate_shard(records.parse(data), task_id)
+
+
+def dump_shard(task_id, needs):
+    """Deterministic bytes for a shard: needs sorted, ASCII-escaped. Over the per-task cap is exit code 7."""
+    obj = {"schema": "dependency-shard", "schema_version": 1, "task_id": task_id, "needs": _sorted_needs(needs)}
+    validate_shard(obj, task_id)
     data = (json.dumps(obj, indent=2, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
     if len(data) > records.MAX_RECORD_BYTES:
         raise ShitError(INPUT_LIMIT)
     return data
+
+
+def group_by_task(edges):
+    """{dependent task id: [{needs_id, type}, ...]} for the edges."""
+    out = {}
+    for e in edges:
+        out.setdefault(e["task_id"], []).append({"needs_id": e["needs_id"], "type": e["type"]})
+    return {task: _sorted_needs(needs) for task, needs in out.items()}
+
+
+def edges_of(task_id, needs):
+    return [{"task_id": task_id, "needs_id": n["needs_id"], "type": n["type"]} for n in needs]
 
 
 def find_cycle(edges):
@@ -91,16 +148,29 @@ def _endpoints(task_id, needs_id, kind):
     return probe
 
 
-def add_edge(graph, task_id, needs_id, kind, known):
-    """Return a new graph with the edge added, or raise: 3 for a bad, duplicate or cycle-closing edge, 9 for an unknown task."""
-    edge = _endpoints(task_id, needs_id, kind)
-    if task_id not in known or needs_id not in known:
-        raise ShitError(PRECONDITION)
-    edges = [*graph["edges"], edge]
+def add_edges(graph, additions, known):
+    """Return a new graph with every `(task_id, needs_id, type)` added, or raise and change nothing.
+
+    3 for a bad, duplicate or cycle-closing edge, 9 for an unknown task, 7 past the per-task or total cap.
+    """
+    edges = list(graph["edges"])
+    for task_id, needs_id, kind in additions:
+        edge = _endpoints(task_id, needs_id, kind)
+        if task_id not in known or needs_id not in known:
+            raise ShitError(PRECONDITION)
+        edges.append(edge)
     out = validate_graph({**graph, "edges": edges})
+    grouped = group_by_task(edges)
+    if len(grouped) > MAX_TASKS or any(len(n) > MAX_NEEDS_PER_TASK for n in grouped.values()):
+        raise ShitError(INPUT_LIMIT)
     if find_cycle(edges):
         raise ShitError(REJECTED)
     return out
+
+
+def add_edge(graph, task_id, needs_id, kind, known):
+    """Return a new graph with the edge added (see `add_edges` for the errors)."""
+    return add_edges(graph, [(task_id, needs_id, kind)], known)
 
 
 def remove_edge(graph, task_id, needs_id, kind):

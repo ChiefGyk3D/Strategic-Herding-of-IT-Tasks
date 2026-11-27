@@ -19,7 +19,7 @@ Rule IDs have the form `Q-<AREA>-<NN>`. Each rule is one testable statement. Hos
 
 | Path under `.shit` | Content | Writer |
 |---|---|---|
-| `dependencies.json` | One `dependency-graph` record (below). | wrapper, under lock |
+| `deps/<task-id>.json` | One `dependency-shard` record per dependent task (below). Present only while the task has edges. | wrapper, under lock |
 | `queue.jsonl` | Append-only JSON Lines `queue-entry` records, hash-chained like the event log. | wrapper, under lock |
 | `leases/<task-id>.json` | One `lease` record. Present only while a lease is live or being reclaimed. | wrapper, under lock |
 | `apply/<sha256-of-target>.json` | One `apply-slot` record. Present only while an apply step holds that target. | wrapper, under lock |
@@ -27,13 +27,13 @@ Rule IDs have the form `Q-<AREA>-<NN>`. Each rule is one testable statement. Hos
 
 All files follow the common rules in `docs/schemas.md` (UTF-8, duplicate-key rejection, unknown-key rejection, 65,536-byte limit, depth 8, `Z` timestamps, slugs). The new record types below start at `schema_version` 1. They do not change any existing record, so no existing schema version changes (see open question OQ-2 for the event log).
 
-### dependency-graph record
+### dependency-shard record
 
-`schema` `dependency-graph`, `schema_version` 1, `edges`: array of objects with `task_id` (slug, the dependent), `needs_id` (slug, the prerequisite) and `type` (`draft`, `apply`, `review` or `decision`). The 65,536-byte limit bounds the graph at roughly 500 edges (OQ-5).
+The graph is sharded per dependent task (owner decision on OQ-5, 2026-11-27). `schema` `dependency-shard`, `schema_version` 1, `task_id` (slug, the dependent; it must equal the file name), `needs`: array of objects with `needs_id` (slug, the prerequisite) and `type` (`draft`, `apply`, `review` or `decision`). Each edge lives in exactly one shard. A shard holds at most 200 `needs` (`MAX_NEEDS_PER_TASK`, far below the 65,536-byte record limit) and at most 2,000 tasks are queued or have shards (`MAX_TASKS`); a breach is exit code 7. A change to the graph writes every affected shard and one `graph_changed` queue entry that records the SHA-256 of each written shard (a deleted shard records 64 zeros), so the chain proves the graph. A shard file with no chain entry, a missing or edited shard, a record id that differs from its file name, an oversize shard, a leftover single-file `dependencies.json`, a cycle or a dangling edge makes every queue operation exit code 8.
 
 ### queue-entry record
 
-Common fields as in `docs/schemas.md` (`schema` `queue-entry`, `schema_version`, `id`, `task_id`, `timestamp`, `actor`), plus `kind` (see Q-LOG-01), `state_after` (a queue state), optional `lease_id`, `generation`, `worker`, `step`, `hold_kind`, `not_before`, `attempt`, `message` (at most 500 characters, fixed or sanitized text), and a chain field computed as for the event log. Fields not allowed for a given `kind` are rejected.
+Common fields as in `docs/schemas.md` (`schema` `queue-entry`, `schema_version`, `id`, `task_id`, `timestamp`, `actor`), plus `kind` (see Q-LOG-01), `state_after` (a queue state), optional `lease_id`, `generation`, `worker`, `step`, `hold_kind`, `not_before`, `attempt`, `message` (at most 500 characters, fixed or sanitized text), and a chain field computed as for the event log. Fields not allowed for a given `kind` are rejected. `claimed` and `renewed` entries also carry `expires_at` so the chain proves the lease file in full (Q-LEASE-10); this field is part of the record as built. A `graph_changed` entry carries no `state_after` but a `shards` array of `task_id` and `sha256` pairs, sorted by task id, and its `task_id` is the first of them.
 
 ### lease record
 
@@ -82,12 +82,12 @@ Rules:
 - **Q-DEP-01.** A task is `waiting` while any edge of type `draft`, `review` or `decision` is unmet. The task enters `ready` in the same locked operation that satisfies the last unmet edge. Test: build a three-task chain, finish prerequisites in order, assert each dependent becomes `ready` only then.
 - **Q-DEP-02.** An `apply` edge never holds a task in `waiting`. A task whose only unmet edges are `apply` edges is `ready` and may claim `draft` and `review` steps. Test: a task with one unmet `apply` edge is `ready`, can claim step `draft`, and is refused step `apply` (Q-SER-03).
 - **Q-DEP-03.** The graph must be acyclic over all edge types combined. A self edge is a cycle. Adding an edge that closes a cycle is refused with exit code 3 and changes nothing. Test: self edge, two-node cycle, and a long-chain cycle all refused; graph bytes unchanged.
-- **Q-DEP-04.** Cycle and missing-node checks also run on every load. A loaded graph containing a cycle or a dangling edge makes every queue operation return exit code 8 (fail closed) and writes nothing. Test: hand-edit a cycle into `dependencies.json`; claim returns 8.
+- **Q-DEP-04.** Cycle and missing-node checks also run on every load. A loaded graph containing a cycle or a dangling edge makes every queue operation return exit code 8 (fail closed) and writes nothing. Test: forge a cycle into the shards with a matching chain entry; claim returns 8.
 - **Q-DEP-05.** An edge naming a task that has no task record is refused on add with exit code 9. Test: add an edge to an unknown id.
 - **Q-DEP-06.** Edge endpoints must be existing task ids, validated as slugs. Duplicate edges (same `task_id`, `needs_id`, `type`) are rejected with exit code 3. Two edges with different types between the same pair are allowed. Test: duplicate rejected; mixed types accepted.
 - **Q-DEP-07.** Edges are added or removed only by the `human` or `wrapper` actor. Removing an edge from a task that already has a live lease is refused with exit code 4. A `model` actor may propose an edge as a decision record but cannot change the graph. Test: model actor add refused with exit code 10.
 - **Q-DEP-08.** Readiness is a pure function of the graph, the task records, the lifecycle states, the recorded reports, reviews and decisions, and the leases. It is recomputed from files at each operation, never cached across operations. Test: delete every derived file including `QUEUE.md`; readiness is unchanged.
-- **Q-DEP-09.** A prerequisite that leaves its satisfied milestone (for example a review verdict superseded by a later non-pass human review, or a task reopened) re-closes the gate. A dependent that is `waiting` or `ready` and holds no lease moves back to `waiting`. A dependent already holding a lease keeps running; its next submit for review is refused with exit code 9 until the gate is satisfied again. Test: supersede a pass review; dependent returns to `waiting`.
+- **Q-DEP-09.** A prerequisite that leaves its satisfied milestone (for example a review verdict superseded by a later non-pass human review, or a task reopened) re-closes the gate. A dependent that is `waiting` or `ready` and holds no lease moves back to `waiting`. A dependent already holding a lease keeps running; its next submit for review is refused with exit code 9 until the gate is satisfied again. Test: supersede a pass review; dependent returns to `waiting`. Accepted limit for this release: there is no queue-log kind for `ready` to `waiting`, so only `waiting` to `ready` is written. The stored state can lag the effective one in that direction; readiness is recomputed from files on every operation (Q-DEP-08), so a claim of such a task is refused and `status` reports `waiting`.
 
 ## Queue states
 
@@ -130,7 +130,7 @@ The queue state is stored in `queue.jsonl` and must agree with the task's lifecy
 | review | failed | Review or its verification fails. | human or wrapper | review to failed |
 | review | done | Human approval, then closure under the `close` rules. | human enters approved; human or wrapper closes | review to approved to closed |
 | hold-owner, hold-ci | ready | Blocker resolved (Q-RET-07). | human | blocked to open |
-| hold-owner, hold-ci | running | Wrapper resumes after the blocker is resolved. | wrapper | blocked to running |
+| hold-owner, hold-ci | running | Wrapper resumes after the blocker is resolved. Accepted limit for this release: not implemented, because a running task needs a live lease and a resume has no claim. A hold leaves only through a human reopen to `ready`. | wrapper | blocked to running |
 | hold-owner, hold-ci | failed | Blocker became a failure. | human or wrapper | blocked to failed |
 | failed | ready | Reopen for another attempt (Q-RET-03). | human only | failed to open |
 
@@ -146,7 +146,7 @@ A worker claims a step of a task for a bounded time. The claim creates a lease. 
 - **Q-CLAIM-04.** One task has at most one live lease. One worker label may hold several leases, up to the configured capacity for its resource class; the wrapper counts leases from files, not from worker statements. Test: claiming past capacity leaves the task `ready`, and the pass records the capacity shortfall (issue 18 records such a claim as `dispatched`, never falsely `ready`).
 - **Q-CLAIM-05.** The wrapper generates `lease_id` and `generation`. A claim request supplies only task id, step and worker label and kind. A request that supplies a lease id, generation, time or state is rejected with exit code 2. Test: request with an extra field is refused.
 - **Q-CLAIM-06.** A claim of a step needs the worker's capability tags to include every tag the task requires. Tags are strings from configuration. A worker with no tags can claim a task that requires none. Test: manual worker claims an untagged task; refused for a tagged one.
-- **Q-LEASE-01.** Every later operation by the worker (`start`, `renew`, `release`, `submit`, `fail`, `hold`) must present `lease_id` and `generation`. The wrapper compares both against the lease file with a constant-time comparison. A mismatch, a missing lease or an expired lease is refused with the proposed exit code 12 `lease_refused` (OQ-1) and nothing is written. Test: wrong id, wrong generation, expired lease and no lease each refused.
+- **Q-LEASE-01.** Every later operation by the worker (`start`, `renew`, `release`, `submit`, `fail`, `hold`) must present `lease_id` and `generation`. The wrapper compares both against the lease file with a constant-time comparison. A mismatch, a missing lease or an expired lease is refused with exit code 12 `lease_refused` (approved, OQ-1) and nothing is written. Test: wrong id, wrong generation, expired lease and no lease each refused.
 - **Q-LEASE-02.** `generation` increases by one on every new lease for the task and is also recorded on every queue entry. An operation presenting a generation lower than the task's latest is refused (stale worker). Test: worker A's lease expires, worker B claims (generation 2), worker A submits with generation 1; refused and B's lease intact.
 - **Q-LEASE-03.** Leases expire at `expires_at` by the wrapper's clock. The initial length is `lease_ttl_seconds`. `renew` adds `lease_ttl_seconds`, bounded so total lease length never exceeds `lease_max_seconds` and renewals never exceed `lease_max_renewals`. A renewal past a bound is refused with exit code 12. Test: renew until each bound.
 - **Q-LEASE-04.** Workers never supply times. All timestamps come from the wrapper clock. Test: a request carrying a time field is rejected (Q-CLAIM-05).
@@ -167,7 +167,7 @@ An apply step is the step that changes shared state outside `.shit` (for example
 - **Q-SER-01.** Two apply steps whose target sets overlap never hold slots at the same time. Apply steps with disjoint targets may run in parallel. Test: three tasks, two sharing a target; the sharing pair never overlaps in `apply_started`/`apply_finished` intervals while the third overlaps freely.
 - **Q-SER-02.** A task starting its `apply` step acquires a slot for every target, all or nothing, in one locked operation, in sorted target order. If any slot is held, none is taken and the step is refused with exit code 4 and stays queued. Test: a task needing targets X and Y while X is held takes no slot on Y.
 - **Q-SER-03.** An `apply` edge from D to P keeps D's `apply` step refused until P's `apply_finished` entry exists. It does not affect D's draft or review steps (Q-DEP-02). Test: see the worked example.
-- **Q-SER-04.** Without an `apply` edge, overlapping apply steps are admitted in order of `(priority, task created_at, task id)` among tasks whose apply step is requested. The slot file carries the holder's `lease_id` and `generation`; releasing or writing under a slot with a mismatching pair is refused with exit code 12. Test: equal priority tasks apply in creation order.
+- **Q-SER-04.** Without an `apply` edge, overlapping apply steps are admitted in order of `(task created_at, task id)` among tasks whose apply step is requested. There is no priority field (OQ-9, decided). The slot file carries the holder's `lease_id` and `generation`; releasing or writing under a slot with a mismatching pair is refused with exit code 12. Test: tasks apply in creation order.
 - **Q-SER-05.** A slot is released by `apply_finished`, by `release`, by lease expiry or by a hold or failure. A held or failed task keeps no slot. Test: each path removes the slot.
 - **Q-SER-06.** Before applying, the worker's step must present the sha256 of each target as it read it while drafting (`base_sha256`). If the target's current digest differs at apply start, the apply step is refused with exit code 9 and the task moves to `hold-owner` with a fixed reason, because the draft was made against a changed base. Test: change a target after drafting; apply is refused and the target is untouched.
 - **Q-SER-07.** Target paths follow the evidence path rules: repository-relative, no empty, `.` or `..` component, never under `.shit`, reached without a symlink. A target outside those rules is rejected with exit code 5. Test: `../x`, absolute path and `.shit/tasks/a.json` all refused.
@@ -180,7 +180,7 @@ Tasks `fix-timeout` (A) and `rename-timeout-key` (B) both change `config/app.tom
 |---|---|---|---|
 | 1 | Graph loaded. B has only an `apply` edge. | ready | ready (Q-DEP-02) |
 | 2 | Worker 1 claims A step `draft`; worker 2 (a human working by hand) claims B step `draft`. Both run in parallel. | running | running |
-| 3 | Worker 3 claims B step `review` of its draft while A is still unapplied. Reviews never wait on apply-only edges. | running | running |
+| 3 | Worker 3 asks to claim B step `review` while worker 2's lease on B is live. Refused with exit code 4: one live lease per task (Q-CLAIM-04), whatever the step. B's draft is reviewed after worker 2 submits it (B is in `review`), and that review does not wait on A's apply, because reviews never wait on apply-only edges. | running | running, claim refused |
 | 4 | Worker 2 asks to start B step `apply`. A's `apply_finished` does not exist. | running | refused (Q-SER-03), exit code 4, stays queued |
 | 5 | A starts `apply`: slot for `config/app.toml` acquired (Q-SER-02). | applying | queued |
 | 6 | A records `apply_finished`; slot released. A submits for review. | review | now eligible |
@@ -203,16 +203,16 @@ If the file was not actually affected (for example the edit touched a different 
 
 - **Q-REC-01.** Every queue mutation uses the commit-point pattern of `shit/task.py`: validate, write `pending.json` (the commit point), apply lease, queue entry, chain entry and any lifecycle record idempotently, remove `pending.json`. Test: inject a crash after each stage and run any locked operation; the end state equals an uninterrupted run.
 - **Q-REC-02.** The first thing every locked queue operation does is finish or discard a pending record: finish when the commit point is complete and verifiable against the chain; discard (exit code 8 and no change) when it is not.
-- **Q-REC-03.** After pending recovery the wrapper reconciles: (a) a lease file with no matching `claimed` or `renewed` entry is deleted and an `orphan_removed` entry is written; (b) a `claimed` entry whose lease file is missing is treated as expired; (c) a lease or apply slot belonging to a task in `waiting`, `ready`, `review`, a hold, `failed` or `done` is deleted; (d) an apply slot whose `lease_id` does not match a live lease is deleted. Test: construct each inconsistency; reconciliation fixes exactly it.
+- **Q-REC-03.** After pending recovery the wrapper reconciles: (a) a lease file with no matching `claimed` or `renewed` entry is deleted and an `orphan_removed` entry is written; (b) a `claimed` entry whose lease file is missing is treated as expired; (c) a lease or apply slot belonging to a task in `waiting`, `ready`, `review`, a hold, `failed` or `done` is deleted; (d) an apply slot whose `lease_id` does not match a live lease is deleted. Test: construct each inconsistency; reconciliation fixes exactly it. Accepted limit: an `orphan_removed` entry is written only for a task that is in the queue; for any other task the file is removed and nothing is written, because an entry needs a queue state to carry.
 - **Q-REC-04.** A broken queue chain, an unparseable queue entry or a queue entry that contradicts the lifecycle mapping makes every queue operation return exit code 8. The wrapper never repairs history. Test: truncate a middle line; all operations return 8.
 - **Q-REC-05.** After a crash of a worker (not of the wrapper), nothing happens until the lease expires (Q-LEASE-05, Q-LEASE-06). A worker may release explicitly; a human may force expiry of a lease by recording the reclaim, which is treated as expiry. Test: forced reclaim writes the same entries as natural expiry.
 - **Q-REC-06.** `QUEUE.md` is regenerated from files after every successful mutation and by an explicit command. Deleting it changes no state and is not an error. Editing it changes no state. Test: delete and edit it; every query is unchanged.
 - **Q-RES-01.** A task id that has ever appeared in `queue.jsonl`, the event log or a task file is never accepted for a new task. A `done` task cannot transition. A new task needs a new id. Test: create a task with a closed task's id; refused with exit code 3.
-- **Q-RES-02.** Restoring an older copy of `.shit` over a newer one is detected when the queue chain tip is older than the event-log chain's latest queue-related reference, or the task files carry later `updated_at` than the queue; the wrapper returns exit code 8. Test: replace `queue.jsonl` with an earlier prefix; operations return 8.
+- **Q-RES-02.** Restoring an older copy of `.shit` over a newer one is detected when the queue chain tip is older than the event-log chain's latest queue-related reference, or the task files carry later `updated_at` than the queue; the wrapper returns exit code 8. Test: replace `queue.jsonl` with an earlier prefix; operations return 8. Accepted limit: deleting `queue.jsonl`, `queue.chain` and the shards together leaves nothing to compare, so a task that is not enqueued in that copy is simply not queued. Detecting that needs signing, which the threat model lists under residual risks.
 
 ## Event kinds in the queue log
 
-- **Q-LOG-01.** `kind` is one of `enqueued`, `ready`, `claimed`, `started`, `renewed`, `released`, `expired`, `dispatch_failed`, `apply_started`, `apply_finished`, `submitted`, `held`, `failed`, `reopened`, `done`, `orphan_removed`. Any other kind is rejected with exit code 3.
+- **Q-LOG-01.** `kind` is one of `enqueued`, `ready`, `claimed`, `started`, `renewed`, `released`, `expired`, `dispatch_failed`, `apply_started`, `apply_finished`, `submitted`, `held`, `failed`, `reopened`, `done`, `orphan_removed`. Any other kind is rejected with exit code 3. `graph_changed` is also accepted: it records a change to the dependency shards (see "dependency-shard record").
 - **Q-LOG-02.** Every lifecycle transition continues to be recorded in the existing event log by the existing mechanism. The queue log adds queue facts only and is the source for metrics.
 
 ## Heterogeneous workers
@@ -235,15 +235,15 @@ All metrics are computed by replaying the verified queue chain (Q-REC-04) for a 
 
 ## Open questions
 
-These are not decided here. Each needs a human decision before the named issue starts.
+Decided items carry the owner's decision date. OQ-10 is still open.
 
-- **OQ-1: lease refusal exit code.** `docs/exit-codes.md` has no code for a refused lease or slot. This spec uses the name `lease_refused` and proposes exit code 12. Needs a human to approve the number; it must be added to `docs/exit-codes.md` with the issue 17 work.
-- **OQ-2: event-log version.** The event-log `event` enum is closed in version 1. This spec keeps queue facts in `queue.jsonl` and leaves the event log unchanged. A human should confirm that split, or choose an event-log version 2 with migration (see "Schema version changes" in `docs/schemas.md`).
-- **OQ-3: automatic retry.** `docs/lifecycle.md` forbids `running` to `open` and makes `failed` to `open` human-only, so an expired running lease cannot return to `ready` without a human. A bounded wrapper-only retry would need a lifecycle amendment and a threat-model row. Default in this spec: no automatic retry (Q-RET-02).
-- **OQ-4: by-hand `running`.** `docs/lifecycle.md` says `running` is entered only when the wrapper starts a subprocess. A human working by hand starts no subprocess. This spec has the wrapper record the transition (actor `wrapper`) when the worker asks to start. Needs a human decision on whether that wording is acceptable or the lifecycle text changes.
-- **OQ-5: graph size.** The 65,536-byte record limit caps `dependencies.json` at roughly 500 edges. Decide whether that is enough for the first release or the graph is sharded per task.
-- **OQ-6: apply gate milestone.** An `apply` edge opens when the prerequisite's `apply_finished` is recorded, not when it is reviewed or closed. A stricter rule (gate on `done`) is safer but serializes review chains. Needs a human choice.
-- **OQ-7: `base_sha256` source.** Q-SER-06 needs the draft step to record the digest of each target. Decide whether the worker supplies it (trusted only as a claim) or the wrapper computes it at claim time of the draft step.
-- **OQ-8: lease secrecy.** A lease id is readable by any process of the same user. Decide whether stage-three needs per-worker credentials or accepts this limit (TM-17).
-- **OQ-9: priority.** The spec orders apply admission by `(priority, created_at, id)` but no `priority` field exists in the task record. Decide whether to add one (task schema version 2) or order by `(created_at, id)` only.
+- **OQ-1: lease refusal exit code. DECIDED 2026-11-27.** Exit code 12 with the name `lease_refused`, recorded in `docs/exit-codes.md`.
+- **OQ-2: event-log version. DECIDED 2026-11-27.** Queue facts stay in `queue.jsonl`; the event log stays at version 1, no migration.
+- **OQ-3: automatic retry. DECIDED in principle 2026-11-27.** A bounded wrapper-only automatic retry is allowed (a small configured limit, then a human decides). It needs a lifecycle amendment; the draft is in `docs/lifecycle.md` ("Proposed amendment", not in force) and awaits review. Until then no automatic retry (Q-RET-02) and an expired running lease ends in `failed` (Q-LEASE-06).
+- **OQ-4: by-hand `running`. DECIDED 2026-11-27.** The wrapper records open to running with actor `wrapper` when the worker asks to start, including a by-hand start. The lifecycle wording stands as built.
+- **OQ-5: graph size. DECIDED 2026-11-27.** Shard per task now; see "dependency-shard record".
+- **OQ-6: apply gate milestone. DECIDED 2026-11-27.** An `apply` edge opens when the prerequisite's `apply_finished` is recorded.
+- **OQ-7: `base_sha256` source. DECIDED 2026-11-27.** The wrapper computes it at claim time of the draft step. The work belongs to issue 18 (apply slots); `docs/queue.md` holds the stub.
+- **OQ-8: lease secrecy. DECIDED 2026-11-27.** Per-worker credentials are wanted. This is a design change larger than a patch: see `docs/design/lease-credentials.md`. Until it is implemented the lease id is a bearer token and TM-17 residual risk stands.
+- **OQ-9: priority. DECIDED 2026-11-27.** No priority field. Apply admission is ordered by `(created_at, id)` only.
 - **OQ-10: shared filesystems.** Locking relies on advisory `flock` on a local filesystem. Behavior on network or synced folders is not specified and is unsupported until tested.

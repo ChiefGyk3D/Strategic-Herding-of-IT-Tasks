@@ -24,7 +24,7 @@ For privacy scan findings, output contains only the file path and line number. I
 | 9 | precondition_missing | `precondition missing` | A required record, file, directory, or prior state was not found. |
 | 10 | human_approval_required | `human approval required` | The operation requires an explicit human approval that is absent. |
 | 11 | tool_unavailable | `subprocess or tool unavailable` | An allowed subprocess or required local tool is unavailable or cannot start. |
-| 12 | lease_refused | `lease refused` | PROPOSED, not yet approved (docs/queue-spec.md, OQ-1). A queue operation presented a missing, wrong, stale, expired or over-renewed lease. The number and name may change. |
+| 12 | lease_refused | `lease refused` | Approved by the owner on 2026-11-27 (docs/queue-spec.md, OQ-1). A queue operation presented a missing, wrong, stale, expired or over-renewed lease. |
 
 ## Per-command exit codes
 
