@@ -16,6 +16,7 @@ LOG_PATH = "events.jsonl"
 CHAIN_PATH = "events.chain"
 MAX_LOG_BYTES = 64 * 1024 * 1024
 GENESIS = "0" * 64
+CHAIN_LINE_BYTES = 65  # a hex digest and its newline
 
 Prepared = namedtuple("Prepared", "index line chain_line")
 
@@ -84,6 +85,12 @@ class EventLog:
         self.project.write_atomic(rel, b"".join(line + b"\n" for line in lines), limit=MAX_LOG_BYTES)
         return lines
 
+    def check_room(self, line_bytes, chain_bytes, *, data=LOG_PATH, chain=CHAIN_PATH):
+        """Refuse (exit code 7) an append that would take the data or the chain file past the size cap."""
+        if (self.project.size(data) + line_bytes > MAX_LOG_BYTES
+                or self.project.size(chain) + chain_bytes > MAX_LOG_BYTES):
+            raise ShitError(INPUT_LIMIT)
+
     def _raw(self):
         """Return (log_lines, chain_lines) with only line-shape checks."""
         log_lines = self._lines(LOG_PATH)
@@ -119,6 +126,7 @@ class EventLog:
         if any(e["id"] == event["id"] for e in events):
             raise ShitError(REJECTED)
         _check_lifecycle([*events, event])  # the complete sequence including the candidate: time never goes backwards
+        self.check_room(len(line) + 1, CHAIN_LINE_BYTES)
         previous = GENESIS if not events else self._last_chain()
         return Prepared(len(events), line, chain_hash(previous, line))
 
@@ -144,7 +152,7 @@ class EventLog:
 
     def _apply_one(self, rel, lines, index, line):
         if len(lines) == index:
-            self.project.append(rel, line + b"\n")
+            self.project.append(rel, line + b"\n", limit=MAX_LOG_BYTES)
         elif len(lines) != index + 1 or lines[index] != line:
             raise ShitError(REJECTED)
 

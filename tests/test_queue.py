@@ -1536,5 +1536,41 @@ class ReplayCeilings(QueueCase):
         qr.replay(self.entries())
 
 
+class LogCap(QueueCase):
+    """An append that would cross the log size cap is refused before anything is written."""
+
+    def sizes(self):
+        return {n: (self.shit / n).stat().st_size if (self.shit / n).exists() else 0
+                for n in ("events.jsonl", "events.chain", "queue.jsonl", "queue.chain")}
+
+    def test_a_queue_append_past_the_cap_changes_nothing(self):  # M3
+        from shit import log as log_mod
+        self.task("t1")
+        before = self.snap()
+        with mock.patch.object(log_mod, "MAX_LOG_BYTES", self.sizes()["queue.jsonl"] + 10):
+            self.assertEqual(self.code(self.claim, "t1"), 7)
+        self.assertEqual(self.snap(), before)
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+
+    def test_an_event_append_past_the_cap_changes_nothing(self):  # M3
+        from shit import log as log_mod
+        self.task("t1", enqueue=False)
+        before = self.snap()
+        limit = self.sizes()["events.jsonl"] + 10
+        with mock.patch.object(log_mod, "MAX_LOG_BYTES", limit):
+            self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t2", title="T", summary="S",
+                                       owner="human", actor="human", now=self.tick()), 7)
+        self.assertEqual(self.snap(), before)
+
+    def test_a_lifecycle_step_past_the_cap_is_refused_before_the_queue_writes(self):  # M3
+        from shit import log as log_mod
+        self.task("t1")
+        lease = self.claim("t1")
+        before = self.snap()
+        with mock.patch.object(log_mod, "MAX_LOG_BYTES", max(self.sizes().values()) + 10):
+            self.assertEqual(self.code(q.start, self.proj, self.present(lease), now=self.tick()), 7)
+        self.assertEqual(self.snap(), before)
+
+
 if __name__ == "__main__":
     unittest.main()

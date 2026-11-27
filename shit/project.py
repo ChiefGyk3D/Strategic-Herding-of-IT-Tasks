@@ -305,8 +305,20 @@ class Project:
                     os.unlink(tmp, dir_fd=dirfd)
             self._close(dirfd)
 
-    def append(self, rel, data):
-        """Append `data` to a regular single-link file, creating it with mode 0600."""
+    def size(self, rel):
+        """Byte size of the regular single-link file `rel`, or 0 when it does not exist."""
+        parts = self._split(rel)
+        dirfd = self._walk(parts[:-1])
+        try:
+            st = self._stat_leaf(dirfd, parts[-1])
+            return 0 if st is None else st.st_size
+        finally:
+            self._close(dirfd)
+
+    def append(self, rel, data, limit=None):
+        """Append `data` to a regular single-link file, creating it with mode 0600.
+
+        With `limit`, an append that would make the file longer than `limit` is refused before any byte is written."""
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])
         try:
@@ -317,7 +329,10 @@ class Project:
             except OSError as exc:
                 raise _os_error(exc) from None
             try:
-                self._check_regular(os.fstat(fd))
+                after = os.fstat(fd)
+                self._check_regular(after)
+                if limit is not None and after.st_size + len(data) > limit:
+                    raise ShitError(INPUT_LIMIT)
                 view = memoryview(data)
                 while view:
                     view = view[os.write(fd, view):]

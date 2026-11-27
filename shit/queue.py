@@ -40,7 +40,8 @@ from .errors import (
     ShitError,
 )
 from .lifecycle import check_transition
-from .log import GENESIS, EventLog, chain_hash
+from . import log as eventlog
+from .log import CHAIN_LINE_BYTES, GENESIS, EventLog, chain_hash
 
 QUEUE = "queue.jsonl"
 CHAIN = "queue.chain"
@@ -411,7 +412,7 @@ def _apply_lifecycle(project, log, life):
 
 def _append_one(project, rel, lines, index, line):
     if len(lines) == index:
-        project.append(rel, line + b"\n")
+        project.append(rel, line + b"\n", limit=eventlog.MAX_LOG_BYTES)
     elif len(lines) != index + 1 or lines[index] != line:
         raise ShitError(FAILED_CLOSED)
 
@@ -504,6 +505,9 @@ def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, 
            "lease": lease, "lease_replaces": lease_replaces, "remove_lease": remove_lease, "lifecycle": lifecycle,
            "shards": list(shards)}
     _check_pending_shards(doc["shards"], entry)
+    ctx.log.check_room(len(line) + 1, CHAIN_LINE_BYTES, data=QUEUE, chain=CHAIN)  # refuse before anything is written
+    if lifecycle is not None:
+        ctx.log.check_room(records.MAX_RECORD_BYTES + 1, CHAIN_LINE_BYTES)  # the event is built later: assume the largest
     ctx.project.write_atomic(PENDING, json.dumps(doc, ensure_ascii=True).encode("ascii"), limit=PENDING_LIMIT)
     _checkpoint("pending-written")
     ctx.invalidate()
