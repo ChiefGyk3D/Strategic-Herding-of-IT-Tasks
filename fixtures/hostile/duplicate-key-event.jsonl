@@ -1,0 +1,1 @@
+{"schema":"event-log","schema_version":1,"id":"event-0001","task_id":"hostile-task","timestamp":"2026-11-26T15:30:00Z","actor":"model","actor":"human","event":"task_created","message":"Task record created."}

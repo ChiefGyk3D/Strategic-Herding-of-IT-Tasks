@@ -1,0 +1,27 @@
+{
+  "schema": "task",
+  "schema_version": 1,
+  "id": "hostile-task",
+  "title": "Hostile fixture",
+  "summary": "The second history entry is earlier than the first.",
+  "state": "review",
+  "owner": "human",
+  "created_at": "2026-11-26T15:30:00Z",
+  "updated_at": "2026-11-26T15:31:00Z",
+  "history": [
+    {
+      "from": "open",
+      "to": "running",
+      "actor": "wrapper",
+      "at": "2026-11-26T15:31:00Z",
+      "reason": "a"
+    },
+    {
+      "from": "running",
+      "to": "review",
+      "actor": "wrapper",
+      "at": "2026-11-26T15:30:30Z",
+      "reason": "b"
+    }
+  ]
+}

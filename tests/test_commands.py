@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _bootstrap import make_git_dir
+
 from shit import commands
 from shit import task as task_mod
 from shit.errors import ShitError
@@ -22,7 +24,7 @@ class Base(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name).resolve() / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
         self.proj = Project.init(self.repo)
         self.addCleanup(self.proj.close)
         self.shit = self.repo / ".shit"

@@ -71,7 +71,7 @@ def _evidence(obj):
     records._text(obj, "description", 1000)
     path = records._text(obj, "path", MAX_PATH)
     parts = path.split("/")
-    if path.startswith("/") or any(p in ("", ".", "..") for p in parts):
+    if "\n" in path or path.startswith("/") or any(p in ("", ".", "..") for p in parts):
         raise ShitError(records.REJECTED)
     if not SHA256.fullmatch(obj.get("sha256") if isinstance(obj.get("sha256"), str) else ""):
         raise ShitError(records.REJECTED)
