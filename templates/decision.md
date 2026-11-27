@@ -1,23 +1,20 @@
 <!--
-Template. Copy for a decision worth reopening later. Its fields follow the decision record in
-docs/schemas.md, so the text can be copied into a record. Adapted from the
+Template for a decision record. Its fields are the decision record in docs/schemas.md, one line each, so
+a filled copy validates with shit/decision.py and can be written as the record. Adapted from the
 department-of-internal-arguments decision template (see PROVENANCE.md). Keep it free of hostnames,
-addresses and personal identifiers.
+addresses and personal identifiers. Add supersedes_id only when status is superseded. A model or wrapper
+may record a proposed decision; only a human may record an accepted one.
 -->
 
-# Decision: <short title>
+# Decision record
 
-- Task id (lowercase slug of the task this belongs to):
-- Actor (human | wrapper | model): only a human may record an accepted decision that grants approval.
-- Status (proposed | accepted | rejected | superseded):
-- Supersedes (decision id; only when the status is superseded):
-- Date (RFC 3339 UTC, for example 2026-11-26T15:30:00Z):
-- Question (at most 2,000 characters):
-- Choice (at most 2,000 characters):
-- Rationale (at most 4,000 characters):
-- Context and evidence (measured facts first; mark anything UNVERIFIED):
-- Options considered, with the tradeoff and the opportunity cost of each:
-- Consequences for security, operations and accessibility:
-- Failure handling and rollback:
-- Verification: the command or test that shows the decision holds:
-- Evidence that would reopen the decision:
+schema: decision
+schema_version: 1
+id: <lowercase slug, for example schema-versioning-decision>
+task_id: <lowercase slug of the task this belongs to>
+created_at: <RFC 3339 UTC, for example 2026-11-26T15:30:00Z>
+actor: <human | wrapper | model>
+status: <proposed | accepted | rejected | superseded>
+question: <one line, at most 2,000 characters>
+choice: <one line, at most 2,000 characters>
+rationale: <one line, at most 4,000 characters>

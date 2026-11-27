@@ -143,9 +143,12 @@ def validate_header(text):
     }
 
 
-def read_header(path):
-    """Read at most 16 KiB from the start of a report file (regular file only) and validate its header."""
-    data = read_bounded(path, MAX_BYTES)
+def read_header(path, base=None):
+    """Read at most 16 KiB from the start of a report file (regular file only, below base) and validate its header.
+
+    base is the trusted project or working root (default: the working directory); see _text.open_regular.
+    """
+    data = read_bounded(path, MAX_BYTES, base)
     end = data.find(b"\n\n")
     if end >= 0:
         data = data[: end + 1]

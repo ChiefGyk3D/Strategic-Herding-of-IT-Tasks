@@ -23,7 +23,7 @@ import unicodedata
 from pathlib import Path
 
 from . import _cli
-from ._text import decode, open_regular
+from ._text import decode
 from .errors import (
     CONFINEMENT,
     INPUT_LIMIT,
@@ -107,16 +107,65 @@ def name_embeds_secret(name):
 # -- the deny list ------------------------------------------------------------------------------
 
 
-def load_deny(path, repo):
-    """Validate and read the deny file; return the folded terms in entry order (entry 1 first)."""
-    real = os.path.realpath(path)
-    root = os.path.realpath(repo)
-    if os.path.commonpath([root, real]) == root:
+def _walk_open(real):
+    """Open the canonical absolute path from the filesystem root, O_NOFOLLOW on every component.
+
+    Any symlink met at open time is refused as confinement; nothing is resolved a second time.
+    """
+    names = [n for n in real.split(os.sep) if n]
+    if not names:
         raise ShitError(CONFINEMENT)
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    dfd = os.open(os.sep, dir_flags)
     try:
-        fd = open_regular(path)
-    except _cli.EXPECTED as exc:
-        raise ShitError(_cli.error_code(exc)) from None
+        for name in names[:-1]:
+            nfd = os.open(name, dir_flags, dir_fd=dfd)
+            os.close(dfd)
+            dfd = nfd
+        return os.open(names[-1], file_flags, dir_fd=dfd)
+    except FileNotFoundError:
+        raise ShitError(PRECONDITION) from None
+    except OSError:
+        raise ShitError(CONFINEMENT) from None
+    finally:
+        os.close(dfd)
+
+
+def load_deny(path, repo):
+    """Validate and read the deny file; return the folded terms in entry order (entry 1 first).
+
+    The path is resolved once (realpath) to a canonical path. The repository exclusion is checked
+    on that canonical path, and the file is then opened from the root by that same path with no
+    symlink followed, so a link retargeted after the check cannot change what is read.
+    """
+    try:
+        path, repo = os.fspath(path), os.fspath(repo)
+        if not isinstance(path, str) or not isinstance(repo, str):
+            raise TypeError
+        try:
+            final_is_link = stat.S_ISLNK(os.lstat(path).st_mode)
+        except OSError:
+            final_is_link = False  # a missing file is reported by the open below
+        real = os.path.realpath(path)
+        root = os.path.realpath(repo)
+        inside = os.path.commonpath([root, real]) == root
+    except (TypeError, ValueError):
+        raise ShitError(CONFINEMENT) from None
+    if final_is_link or inside:
+        raise ShitError(CONFINEMENT)
+    fd = _walk_open(real)
+    try:
+        again = _walk_open(real)
+        try:
+            first, second = os.fstat(fd), os.fstat(again)
+        finally:
+            os.close(again)
+        if (first.st_dev, first.st_ino) != (second.st_dev, second.st_ino) or not stat.S_ISREG(first.st_mode):
+            raise ShitError(CONFINEMENT)
+    except BaseException:
+        os.close(fd)
+        raise
     try:
         st = os.fstat(fd)
         if st.st_nlink != 1 or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o600:
