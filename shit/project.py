@@ -91,7 +91,7 @@ class Project:
         """Create `.shit/` with its subdirectories (mode 0700) and return the open project."""
         proj = cls._open_store(repo, create=True)
         try:
-            os.fchmod(proj._fd, DIR_MODE)
+            os.fchmod(proj._fd, stat.S_IRWXU)  # == DIR_MODE (0o700)
             for sub in SUBDIRS:
                 try:
                     os.mkdir(sub, DIR_MODE, dir_fd=proj._fd)

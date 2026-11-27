@@ -8,7 +8,7 @@ without its event or an event without its task.
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from . import records
 from .errors import (
@@ -31,7 +31,7 @@ def _checkpoint(stage):
 
 
 def _now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _task_path(task_id):
