@@ -1,0 +1,12 @@
+{
+  "schema": "task",
+  "schema_version": 1,
+  "id": "hostile-task",
+  "title": "\u001b[2Jclear",
+  "summary": "A terminal escape sequence in the title.",
+  "state": "open",
+  "owner": "human",
+  "created_at": "2026-11-26T15:30:00Z",
+  "updated_at": "2026-11-26T15:30:00Z",
+  "history": []
+}
