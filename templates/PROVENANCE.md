@@ -11,8 +11,9 @@ These templates are adapted from generic content in the department-of-internal-a
 | `handoff.md` | `templates/handoff.md` | Wording made tool-neutral; fields unchanged. |
 | `decision.md` | `templates/adr.md` | Fields aligned to the decision record in `docs/schemas.md`. |
 
-Not imported: `config.toml`. The source repository has no generic config template at that commit, so none
-is invented here; a configuration file belongs with the first command that reads one.
+`config.toml` is NEW content, not imported from DoIA: the source repository has no generic config template at
+that commit. It was written from the Stage 1 docs (`docs/schemas.md`, `docs/threat-model.md`, `docs/exit-codes.md`,
+`docs/design/local-model-tier.md`) and is read by `shit/config.py`.
 
 To refresh a template, read the source file at a newer commit, update this table with the new commit, and
 re-run `python3 -m unittest discover -s tests -v`. Any update is a reviewed diff, never an automatic copy.

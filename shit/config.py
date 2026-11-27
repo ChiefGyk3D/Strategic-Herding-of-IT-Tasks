@@ -1,0 +1,156 @@
+"""Validate the project configuration (templates/config.toml).
+
+The file is TOML, parsed with the standard library (tomllib). Every key is named here; an unknown key,
+an unknown table, a wrong type, a duplicate key, a placeholder left unfilled or a missing required key is
+rejected with exit code 3. A file over the byte limit is rejected with exit code 7 before it is parsed
+(docs/exit-codes.md). Missing `schema_version` or any other `schema_version` than 1 is rejected.
+
+Secure defaults: privacy scanning is on when the key is absent, and the storage root and log file must
+stay under the fixed `.shit` root. A context window other than 32768 (32K default) or 65536 (64K opt-in)
+is rejected. Errors are fixed strings and never echo the rejected value.
+
+    python3 -c "from shit import config; print(config.read('config.toml'))"
+"""
+
+import re
+import tomllib
+
+from shit._text import check_size, check_text, decode, has_placeholder, read_bounded
+from shit.errors import rejected
+
+MAX_BYTES = 8192
+
+_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}")
+_LOG = re.compile(r"\.shit/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){0,3}")
+_CONTEXT_WINDOWS = (32768, 65536)
+_MAX_TEXT = 500
+_MAX_ROLES = 16
+
+# table -> {key: kind}. Kinds: "int1" exact schema version, "text" bounded string, "slug" lowercase slug,
+# "repo" owner/repo reference, "log" path under .shit, "root" the fixed storage root, "bool", "window"
+# context size in tokens, "slugs" list of slugs. The top level has only schema_version.
+SCHEMA = {
+    "": {"schema_version": "int1"},
+    "project": {"name": "slug"},
+    "tracker": {"repository": "repo"},
+    "roles": {"names": "slugs"},
+    "review": {"destination": "text"},
+    "storage": {"root": "root"},
+    "log": {"file": "log"},
+    "privacy": {"scan": "bool"},
+    "local_model": {"context_tokens": "window"},
+}
+REQUIRED = {
+    "": ["schema_version"],
+    "project": ["name"],
+    "tracker": ["repository"],
+    "review": ["destination"],
+    "storage": ["root"],
+    "log": ["file"],
+    "local_model": ["context_tokens"],
+}
+# Defaults applied when an optional key is absent. Privacy scanning fails closed: absent means on.
+DEFAULTS = {
+    "roles": {"names": ["implementer", "reviewer", "researcher", "planner"]},
+    "privacy": {"scan": True},
+}
+
+
+def _check_str(value):
+    if not isinstance(value, str):
+        raise rejected("value must be text")
+    check_text(value)
+    if not value or value != value.strip():
+        raise rejected("value empty or padded")
+    if len(value) > _MAX_TEXT:
+        raise rejected("value too long")
+    if has_placeholder(value):
+        raise rejected("unfilled placeholder")
+
+
+def _check_value(kind, value):
+    if kind == "int1":
+        if type(value) is not int or value != 1:
+            raise rejected("schema_version: must be the integer 1")
+        return value
+    if kind == "bool":
+        if type(value) is not bool:
+            raise rejected("value must be true or false")
+        return value
+    if kind == "window":
+        if type(value) is not int or value not in _CONTEXT_WINDOWS:
+            raise rejected("context_tokens: must be 32768 or 65536")
+        return value
+    if kind == "slugs":
+        if not isinstance(value, list) or not value or len(value) > _MAX_ROLES:
+            raise rejected("roles: must be a non-empty list of names")
+        for item in value:
+            if not isinstance(item, str) or not _SLUG.fullmatch(item):
+                raise rejected("roles: names must be lowercase slugs")
+        if len(set(value)) != len(value):
+            raise rejected("roles: duplicate name")
+        return list(value)
+    _check_str(value)
+    if kind == "slug" and not _SLUG.fullmatch(value):
+        raise rejected("name must be a lowercase slug")
+    if kind == "repo" and not _REPO.fullmatch(value):
+        raise rejected("tracker: repository must be owner/repo")
+    if kind == "root" and value != ".shit":
+        raise rejected("storage: root must be .shit")
+    if kind == "log" and (not _LOG.fullmatch(value) or ".." in value.split("/")):
+        raise rejected("log: file must stay under .shit")
+    return value
+
+
+def parse(text):
+    """Validate configuration text and return a dict of tables. Raises ContractError."""
+    if not isinstance(text, str):
+        raise rejected("input must be text")
+    check_size(text, MAX_BYTES)
+    check_text(text)
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        raise rejected("configuration is not valid TOML") from None
+
+    for name, value in raw.items():
+        if name in SCHEMA:
+            if not isinstance(value, dict):
+                raise rejected(f"{name}: must be a table")
+        elif name not in SCHEMA[""]:
+            raise rejected("unknown key or table")
+    for table, keys in SCHEMA.items():
+        section = raw if table == "" else raw.get(table, {})
+        for key in section:
+            if table == "" and key in SCHEMA:
+                continue
+            if key not in keys:
+                raise rejected("unknown key")
+
+    out = {}
+    for table, keys in SCHEMA.items():
+        section = raw if table == "" else raw.get(table, {})
+        clean = {}
+        for key, kind in keys.items():
+            if key not in section:
+                if key in REQUIRED.get(table, []):
+                    raise rejected(f"{key}: required")
+                if key in DEFAULTS.get(table, {}):
+                    clean[key] = DEFAULTS[table][key]
+                continue
+            clean[key] = _check_value(kind, section[key])
+        if table == "":
+            out.update(clean)
+        else:
+            out[table] = clean
+    for table, defaults in DEFAULTS.items():
+        if table not in out:
+            out[table] = dict(defaults)
+    return out
+
+
+def read(path):
+    """Read at most MAX_BYTES + 1 bytes from a regular file (no symlink, no FIFO) and validate it."""
+    data = read_bounded(path, MAX_BYTES)
+    return parse(decode(data))
