@@ -238,7 +238,7 @@ def dump_lease(obj):
 
 def _new_task(state):
     return {"state": state, "generation": 0, "lease": None, "attempts": 0, "not_before": None,
-            "apply_finished": False, "last_failure": None, "last_stamp": None}
+            "apply_finished": False, "apply_phase": None, "last_failure": None, "last_stamp": None}
 
 
 def _lease_matches(task, entry):
@@ -264,9 +264,16 @@ def _step(task, entry, before):
                 raise reject()
             lease["expires_at"] = entry["expires_at"]
             lease["renewals"] += 1
-        elif before != "running":
+        elif before != "running" or task["lease"]["step"] != "apply":
             raise reject()
-        elif kind == "apply_finished":
+        elif kind == "apply_started":
+            if task["apply_phase"] is not None:
+                raise reject()
+            task["apply_phase"] = "started"
+        else:
+            if task["apply_phase"] != "started":
+                raise reject()
+            task["apply_phase"] = "finished"
             task["apply_finished"] = True
         return
     reenter = kind == "reopened" and pair in REENTER_WAITING
@@ -281,6 +288,8 @@ def _step(task, entry, before):
         if task["not_before"] is not None and stamp < task["not_before"]:
             raise reject()
         task["generation"] = entry["generation"]
+        task["apply_phase"] = None  # every attempt starts without an apply marker
+        task["apply_finished"] = False
         task["lease"] = {"lease_id": entry["lease_id"], "generation": entry["generation"], "worker": entry["worker"],
                          "step": entry["step"], "claimed_at": stamp, "expires_at": entry["expires_at"], "renewals": 0}
     elif kind == "started":

@@ -1320,5 +1320,50 @@ class PendingProof(QueueCase):
         self.assertTrue(path.exists())
 
 
+class ApplyMarkers(QueueCase):
+    """`apply_started` and `apply_finished` are accepted only as one ordered pair under an apply-step lease."""
+
+    def extend(self, lease, *kinds):
+        lines = self.queue_lines()
+        for kind in kinds:
+            entry = {"schema": "queue-entry", "schema_version": 1, "id": f"queue-{len(lines) + 1:04d}",
+                     "timestamp": self.tick(), "message": q.MESSAGE, "task_id": lease["task_id"], "actor": "wrapper",
+                     "kind": kind, "state_after": "running", "lease_id": lease["lease_id"],
+                     "generation": lease["generation"]}
+            lines.append(qr.dump_entry(entry))
+        self.rewrite_queue(lines)
+
+    def running(self, step):
+        self.task("t1")
+        lease = self.claim("t1", step=step)
+        q.start(self.proj, self.present(lease), now=self.tick())
+        return lease
+
+    def test_an_ordered_pair_under_an_apply_lease_is_accepted(self):
+        lease = self.running("apply")
+        self.extend(lease, "apply_started", "apply_finished")
+        self.assertEqual(self.status()["t1"]["state"], "running")
+
+    def test_a_finish_under_a_draft_lease_is_refused(self):  # H5
+        lease = self.running("draft")
+        self.extend(lease, "apply_started", "apply_finished")
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_a_finish_without_a_start_is_refused(self):  # H5
+        lease = self.running("apply")
+        self.extend(lease, "apply_finished")
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_a_repeated_start_or_finish_is_refused(self):  # H5
+        lease = self.running("apply")
+        self.extend(lease, "apply_started", "apply_started")
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_a_repeated_finish_is_refused(self):  # H5
+        lease = self.running("apply")
+        self.extend(lease, "apply_started", "apply_finished", "apply_finished")
+        self.assertEqual(self.code(self.status), 8)
+
+
 if __name__ == "__main__":
     unittest.main()
