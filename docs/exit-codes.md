@@ -25,7 +25,7 @@ For privacy scan findings, output contains only the file path and line number. I
 | 10 | human_approval_required | `human approval required` | The operation requires an explicit human approval that is absent. |
 | 11 | tool_unavailable | `subprocess or tool unavailable` | An allowed subprocess or required local tool is unavailable or cannot start. |
 | 12 | lease_refused | `lease refused` | Approved by the owner on 2026-11-27 (docs/queue-spec.md, OQ-1). A queue operation presented a missing, wrong, stale, expired or over-renewed lease. |
-| 13 | store_busy | `store busy` | The SQLite store (docs/store.md) could not take its write lock within the configured wait because another process holds it. Nothing was written. The operation is safe to retry. |
+| 13 | store_busy | `store busy` | The SQLite store (docs/store.md) could not take its write lock within the configured wait because another process holds it. Nothing was written (a rollback that itself fails is exit code 8 instead and the connection is closed). The operation is safe to retry. |
 
 ## Per-command exit codes
 
