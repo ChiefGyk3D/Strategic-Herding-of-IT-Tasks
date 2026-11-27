@@ -11,7 +11,8 @@ from test_config import GOOD
 
 from shit import commands, config, yardstick
 from shit import task as task_mod
-from shit.errors import ContractError
+from shit.errors import ContractError, ShitError
+from shit.log import EventLog
 from shit.project import Project
 
 T = [f"2026-11-26T15:3{i}:00Z" for i in range(10)]
@@ -45,10 +46,12 @@ class Yardstick(unittest.TestCase):
         self.assertEqual(out["tasks"]["by_state"], {"open": 1, "review": 1})
         self.assertEqual(out["events"]["task_created"], 2)
         self.assertEqual(out["events"]["state_transition"], 2)
-        self.assertEqual(out["reports_by_outcome"], {"success": 1})
-        self.assertEqual(out["reviews_by_verdict"], {"pass": 1})
+        self.assertEqual(out["reports_by_outcome"], {"label": "measured", "success": 1})
+        self.assertEqual(out["reviews_by_verdict"], {"label": "measured", "pass": 1})
         self.assertEqual(out["tasks"]["label"], "measured")
         self.assertEqual(out["events"]["label"], "measured")
+        self.assertEqual(out["reports_by_outcome"]["label"], "measured")
+        self.assertEqual(out["reviews_by_verdict"]["label"], "measured")
 
     def test_points_are_estimates_and_weights_are_config(self):
         self.seed()
@@ -62,6 +65,32 @@ class Yardstick(unittest.TestCase):
         out = yardstick.compute(self.p)
         self.assertEqual(out["tokens"], {"value": None, "label": "not supplied"})
         self.assertEqual(out["basis"], "this project's own task log")
+
+    def test_record_event_without_record_id_is_refused_not_a_crash(self):
+        self.seed()
+        log = EventLog(self.p)
+        event = task_mod._event(log, "t1", "wrapper", "report_recorded", "Report record added.", T[6])
+        del event["record_id"]
+        with self.p.locked():
+            log.append(event)
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 3)
+
+    def test_loading_a_record_does_not_rescan_the_whole_log(self):
+        self.seed()
+        seen = []
+        real = commands._find_event
+
+        def spy(events, kind, rid):
+            seen.append(len(events))
+            return real(events, kind, rid)
+
+        commands._find_event = spy
+        self.addCleanup(setattr, commands, "_find_event", real)
+        yardstick.compute(self.p)
+        self.assertTrue(seen)
+        self.assertEqual(max(seen), 1)
 
     def test_empty_store(self):
         out = yardstick.compute(self.p)

@@ -39,10 +39,15 @@ def compute(project, weights=None):
             task_mod._recover(project, log)
             events = log.verify()
             outcomes, verdicts = Counter(), Counter()
+            first = {}  # (kind, record_id) -> first matching event, so each load is O(1), not a log scan
+            for event in events:
+                first.setdefault((event["event"], event.get("record_id")), event)
             for kind, tally, key in (("report", outcomes, "outcome"), ("review", verdicts, "verdict")):
                 for event in events:
                     if event["event"] == commands.EVENT[kind]:
-                        tally[commands._load(project, events, kind, event["record_id"])[key]] += 1
+                        rid = event.get("record_id")  # a missing id is refused by _load with exit code 3
+                        match = first[(event["event"], rid)]
+                        tally[commands._load(project, [match], kind, rid)[key]] += 1
             return events, outcomes, verdicts
 
     events, outcomes, verdicts = task_mod._guarded(run)
@@ -65,8 +70,8 @@ def compute(project, weights=None):
         "basis": "this project's own task log",
         "tasks": {"label": "measured", "total": len(state), "by_state": _counts(Counter(state.values()))},
         "events": {"label": "measured", **_counts(by_kind)},
-        "reports_by_outcome": _counts(outcomes),
-        "reviews_by_verdict": _counts(verdicts),
+        "reports_by_outcome": {"label": "measured", **_counts(outcomes)},
+        "reviews_by_verdict": {"label": "measured", **_counts(verdicts)},
         "effort_points": {"label": "estimate", "value": points, "weights": weights},
         "tokens": {"value": None, "label": "not supplied"},
         "per_task": rows[:MAX_ROWS],
