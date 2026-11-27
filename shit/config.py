@@ -13,7 +13,6 @@ is rejected. Errors are fixed strings and never echo the rejected value.
 """
 
 import re
-
 import tomllib
 
 from shit._text import check_size, check_text, decode, has_placeholder, read_bounded
