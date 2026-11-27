@@ -469,15 +469,27 @@ class Project:
 
     @contextlib.contextmanager
     def locked(self, timeout=5.0):
-        """Hold the store's exclusive advisory lock. Contention past `timeout` is exit code 1."""
+        """Hold the store's exclusive advisory lock. Contention past `timeout` is exit code 1.
+
+        The lock is taken on a fresh descriptor of the store directory itself: a descriptor, not a pathname, so
+        unlinking or replacing the `lock` file cannot admit a second holder. The `lock` file is still opened and
+        checked (a special file there is refused) but exclusion does not depend on it.
+        """
         if self._lock_fd is not None:
             raise ShitError(INTERNAL)
         try:
-            fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=self._fd)
+            check = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=self._fd)
         except OSError as exc:
             raise _os_error(exc) from None
         try:
-            self._check_regular(os.fstat(fd))
+            self._check_regular(os.fstat(check))
+        finally:
+            self._close(check)
+        try:
+            fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=self._fd)
+        except OSError as exc:
+            raise _os_error(exc) from None
+        try:
             deadline = time.monotonic() + timeout
             while True:
                 try:

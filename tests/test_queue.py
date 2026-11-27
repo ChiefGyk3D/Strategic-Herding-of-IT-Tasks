@@ -1468,5 +1468,26 @@ class TipAnchor(QueueCase):
         self.assertEqual(json.loads((self.shit / "queue-anchor.json").read_text())["generations"], {"a": 1})
 
 
+class LockIdentity(QueueCase):
+    def test_replacing_the_lock_file_does_not_admit_a_second_holder(self):  # H2
+        other = Project.open(self.repo)
+        self.addCleanup(other.close)
+        with self.proj.locked():
+            (self.shit / "lock").unlink()
+            (self.shit / "lock").write_bytes(b"")
+            with self.assertRaises(ShitError) as raised, other.locked(0.3):
+                pass
+            self.assertEqual(raised.exception.code, 1)
+        with other.locked(0.3):
+            pass
+
+    def test_a_second_holder_waits_for_the_first(self):  # H2 positive control
+        other = Project.open(self.repo)
+        self.addCleanup(other.close)
+        with self.proj.locked():
+            with self.assertRaises(ShitError), other.locked(0.2):
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()
