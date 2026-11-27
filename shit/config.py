@@ -26,10 +26,18 @@ _LOG = re.compile(r"\.shit/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){0,3}")
 _CONTEXT_WINDOWS = (32768, 65536)
 _MAX_TEXT = 500
 _MAX_ROLES = 16
+_MAX_LIMIT = 10_000_000
+_MODES = ("warn", "fail")
+
+# Event kinds the yardstick report (shit/yardstick.py) can weight, in docs/schemas.md event order.
+WEIGHT_KEYS = ("task_created", "state_transition", "brief_recorded", "report_recorded", "decision_recorded",
+               "evidence_recorded", "review_recorded", "command_failed")
+_MAX_WEIGHT = 1000
 
 # table -> {key: kind}. Kinds: "int1" exact schema version, "text" bounded string, "slug" lowercase slug,
 # "repo" owner/repo reference, "log" path under .shit, "root" the fixed storage root, "bool", "window"
-# context size in tokens, "slugs" list of slugs. The top level has only schema_version.
+# context size in tokens, "slugs" list of slugs, "weight" integer 0 to 1000, "limit" positive int up to 10 million,
+# "mode" warn or fail. The top level has only schema_version.
 SCHEMA = {
     "": {"schema_version": "int1"},
     "project": {"name": "slug"},
@@ -40,6 +48,8 @@ SCHEMA = {
     "log": {"file": "log"},
     "privacy": {"scan": "bool"},
     "local_model": {"context_tokens": "window"},
+    "limits": {"instruction_max_bytes": "limit", "listed_roles_max": "limit", "on_exceed": "mode"},
+    "yardstick": {name: "weight" for name in WEIGHT_KEYS},
 }
 REQUIRED = {
     "": ["schema_version"],
@@ -54,6 +64,8 @@ REQUIRED = {
 DEFAULTS = {
     "roles": {"names": ["implementer", "reviewer", "researcher", "planner"]},
     "privacy": {"scan": True},
+    "limits": {"on_exceed": "warn"},
+    "yardstick": {name: 1 for name in WEIGHT_KEYS},
 }
 
 
@@ -81,6 +93,18 @@ def _check_value(kind, value):
     if kind == "window":
         if type(value) is not int or value not in _CONTEXT_WINDOWS:
             raise rejected("context_tokens: must be 32768 or 65536")
+        return value
+    if kind == "weight":
+        if type(value) is not int or not 0 <= value <= _MAX_WEIGHT:
+            raise rejected("yardstick: weight must be an integer from 0 to 1000")
+        return value
+    if kind == "limit":
+        if type(value) is not int or not 1 <= value <= _MAX_LIMIT:
+            raise rejected("limits: must be an integer from 1 to 10000000")
+        return value
+    if kind == "mode":
+        if value not in _MODES:
+            raise rejected("limits: on_exceed must be warn or fail")
         return value
     if kind == "slugs":
         if not isinstance(value, list) or not value or len(value) > _MAX_ROLES:
@@ -150,7 +174,7 @@ def parse(text):
     return out
 
 
-def read(path):
+def read(path, base=None):
     """Read at most MAX_BYTES + 1 bytes from a regular file (no symlink, no FIFO) and validate it."""
-    data = read_bounded(path, MAX_BYTES)
+    data = read_bounded(path, MAX_BYTES, base)
     return parse(decode(data))

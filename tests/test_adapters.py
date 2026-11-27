@@ -97,6 +97,27 @@ class ArgvTests(unittest.TestCase):
         self.assertEqual(len(plan.argv), 5)
         self.assertEqual(plan.stdin, "")
 
+    def test_copilot_never_combines_stdin_with_prompt_flag(self):
+        # Vendor docs: standard input is ignored when -p is given, so a brief sent there would be lost.
+        for config in (None, {"extra_args": ["--no-ask-user"]}):
+            plan = adapters.get("copilot").prepare(brief_text(), config=config)
+            self.assertIn("-p", plan.argv)
+            self.assertEqual(plan.stdin, "")
+        # Negative case: an adapter that uses stdin does not pass the prompt as an argument.
+        codex = adapters.get("codex").prepare(brief_text())
+        self.assertNotEqual(codex.stdin, "")
+        self.assertNotIn("-p", codex.argv)
+
+    def test_copilot_no_ask_user_is_a_safe_extra_arg(self):
+        plan = adapters.get("copilot").prepare(brief_text(), config={"extra_args": ["--no-ask-user"]})
+        self.assertIn("--no-ask-user", plan.argv)
+        self.assertLess(plan.argv.index("--no-ask-user"), plan.argv.index("-p"))
+
+    def test_copilot_permissions_text_makes_no_unproven_claim(self):
+        text = adapters.get("copilot").prepare(brief_text()).permissions
+        self.assertNotIn("no tool permission is granted", text)
+        self.assertIn("no allow flag passed", text)
+
     def test_no_model_means_no_model_flag(self):
         fields = dict(GOOD_BRIEF)
         del fields["model"]
@@ -112,7 +133,7 @@ class ArgvTests(unittest.TestCase):
     def test_default_permissions_are_least_capable(self):
         self.assertIn("plan", adapters.get("claude").prepare(brief_text()).permissions)
         self.assertIn("read-only", adapters.get("codex").prepare(brief_text()).permissions)
-        self.assertIn("no tools allowed", adapters.get("copilot").prepare(brief_text()).permissions)
+        self.assertIn("no allow flag passed", adapters.get("copilot").prepare(brief_text()).permissions)
 
     def test_argv_is_a_tuple_of_strings(self):
         for name in ("claude", "codex", "copilot"):
