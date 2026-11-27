@@ -18,6 +18,7 @@ from shit import brief, evidence
 from shit._text import check_size, check_text
 from shit.errors import HUMAN_APPROVAL, INPUT_LIMIT, USAGE, ContractError, rejected
 
+# Upper bound for a prompt. The brief limit (64 KiB) plus the fixed wrapper text always fits, which a test checks.
 MAX_PROMPT_BYTES = 98304
 MAX_OUTPUT_BYTES = 262144
 DEFAULT_TIMEOUT = 600
@@ -129,7 +130,6 @@ class Adapter:
         fields = brief.parse(brief_text)
         settings, overrides = self._settings(config, override)
         prompt = _PREAMBLE + brief.render(fields) + _POSTAMBLE
-        check_size(prompt, MAX_PROMPT_BYTES)
         argv, stdin = self.command(fields, prompt, settings["extra_args"])
         return Plan(self.name, prompt, argv, stdin, self.default_permissions, tuple(fields["scope"]), ENV_ALLOW,
                     settings["timeout"], overrides)

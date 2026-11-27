@@ -185,9 +185,14 @@ class InputGuardTests(unittest.TestCase):
             adapters.get("prompt").prepare(b"bytes")
 
     def test_prompt_size_is_bounded(self):
-        self.assertLessEqual(base.MAX_PROMPT_BYTES, 131072)
-        plan = adapters.get("prompt").prepare(brief_text())
+        # The largest brief the contract accepts, plus the fixed wrapper text, stays under the prompt bound.
+        scope = ["s" * 480] * 130
+        text = brief_text(scope=scope)
+        self.assertGreater(len(text.encode()), brief.MAX_BYTES - 5000)
+        self.assertLessEqual(len(text.encode()), brief.MAX_BYTES)
+        plan = adapters.get("prompt").prepare(text)
         self.assertLessEqual(len(plan.prompt.encode()), base.MAX_PROMPT_BYTES)
+        self.assertLessEqual(base.MAX_PROMPT_BYTES, 131072)
 
 
 class ConfigTests(unittest.TestCase):
