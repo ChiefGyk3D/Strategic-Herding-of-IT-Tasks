@@ -176,6 +176,32 @@ class ConfigSizeTests(unittest.TestCase):
         self.assertEqual(config.parse(text)["schema_version"], 1)
 
 
+class ConfigLimitsTests(unittest.TestCase):
+    LIMITS = "\n[limits]\ninstruction_max_bytes = 8000\nlisted_roles_max = 6\non_exceed = \"fail\"\n"
+
+    def test_limits_parse(self):
+        self.assertEqual(config.parse(GOOD + self.LIMITS)["limits"],
+                         {"instruction_max_bytes": 8000, "listed_roles_max": 6, "on_exceed": "fail"})
+
+    def test_absent_limits_leave_sizes_unset_and_mode_warn(self):
+        self.assertEqual(config.parse(GOOD)["limits"], {"on_exceed": "warn"})
+
+    def test_bad_limit_values_are_rejected(self):
+        for bad in ("0", "-1", "true", "1.5", '"9"', "10000001"):
+            with self.subTest(bad=bad):
+                text = GOOD + f"\n[limits]\ninstruction_max_bytes = {bad}\n"
+                self.assertEqual(code_of(config.parse, text), 3)
+
+    def test_bad_mode_and_unknown_limit_key_are_rejected(self):
+        self.assertEqual(code_of(config.parse, GOOD + '\n[limits]\non_exceed = "ignore"\n'), 3)
+        self.assertEqual(code_of(config.parse, GOOD + "\n[limits]\nsurprise = 1\n"), 3)
+
+    def test_template_documents_limits_as_comments(self):
+        text = (TEMPLATES / "config.toml").read_text(encoding="utf-8")
+        for key in ("instruction_max_bytes", "listed_roles_max", "on_exceed"):
+            self.assertRegex(text, rf"(?m)^# {key} = ")
+
+
 class ConfigTemplateTests(unittest.TestCase):
     def setUp(self):
         self.text = (TEMPLATES / "config.toml").read_text(encoding="utf-8")
