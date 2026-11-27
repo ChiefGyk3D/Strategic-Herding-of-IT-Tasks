@@ -19,6 +19,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  classify:
+    name: Classify changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read   # the changed-file list, read from the API, never from the checkout
+    outputs:
+      docs-only: ${{ steps.c.outputs.docs-only }}
+    steps:
+      - id: c
+        uses: ChiefGyk3D/git-your-ship-together/.github/actions/classify-changes@9e0d7b2e7e8530e2b1bb200ecb4fbf6de021881f # v1.38.0
+        with:
+          docs-only-patterns: |
+            docs/**/*.md
+            *.md
+
   security:
     uses: ChiefGyk3D/git-your-ship-together/.github/workflows/security.yml@9e0d7b2e7e8530e2b1bb200ecb4fbf6de021881f # v1.38.0
     permissions:
@@ -34,12 +51,15 @@ jobs:
       egress-policy: block
 
   python:
+    needs: classify
+    if: needs.classify.outputs.docs-only != 'true'
     uses: ChiefGyk3D/git-your-ship-together/.github/workflows/python-ci.yml@9e0d7b2e7e8530e2b1bb200ecb4fbf6de021881f # v1.38.0
     permissions:
       contents: read
       id-token: write   # declared by the shared python-ci workflow; checked statically, unused here
     with:
       python-versions: '["3.11", "3.12", "3.13"]'
+      pr-python-versions: '["3.11", "3.13"]'   # pull requests: oldest and newest; push, schedule and dispatch run all three
       install-command: python -m pip --version   # standard library only, nothing to install
       test-command: python -m unittest discover -s tests -v
       docker-build: false
@@ -47,8 +67,10 @@ jobs:
 
   gate:
     if: always()
-    needs: [security, python]
+    needs: [classify, security, python]
     uses: ChiefGyk3D/git-your-ship-together/.github/workflows/ci-gate.yml@9e0d7b2e7e8530e2b1bb200ecb4fbf6de021881f # v1.38.0
     permissions: {}
     with:
-      needs-json: '{"security": "${{ needs.security.result }}", "python": "${{ needs.python.result }}"}'
+      needs-json: '{"classify": "${{ needs.classify.result }}", "security": "${{ needs.security.result }}", "python": "${{ needs.python.result }}"}'
+      # python may be skipped only by the classifier; a skip with classify not green still fails the gate
+      deliberate-skips: ${{ needs.classify.outputs.docs-only == 'true' && '["python"]' || '[]' }}
