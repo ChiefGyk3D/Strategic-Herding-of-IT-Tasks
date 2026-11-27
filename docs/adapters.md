@@ -6,8 +6,10 @@ Adapters are optional. A brief and a report header work by hand; an adapter only
 |---|---|---|
 | `claude` | argument array, brief on standard input | plan mode (read and propose only) |
 | `codex` | argument array, brief on standard input | read-only sandbox |
-| `copilot` | argument array, brief as one prompt argument | no tool allowed |
+| `copilot` | argument array, brief as one prompt argument | no allow flag passed; tool use is denied or prompts, and unattended runs deny |
 | `prompt` | plain text to copy; no command | none (the worker pastes the answer back) |
+
+For `copilot`, standard input stays empty because the tool ignores it when a prompt argument is given. `--no-ask-user` is on its safe extra-argument list, so a configured unattended run cannot stall on a question.
 
 Vendor flags follow each tool's command-line reference at the time of writing and have not been run in this repository; check them with the tool's `--help` before relying on them.
 
