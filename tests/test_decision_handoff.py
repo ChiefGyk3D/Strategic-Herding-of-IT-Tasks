@@ -171,13 +171,13 @@ class DecisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "d.md").write_text(render_lines(GOOD_DECISION), encoding="utf-8")
-            self.assertEqual(decision.read(d / "d.md")["id"], "schema-versioning-decision")
+            self.assertEqual(decision.read(d / "d.md", d)["id"], "schema-versioning-decision")
             os.symlink(d / "d.md", d / "link.md")
-            self.assertEqual(code_of(decision.read, d / "link.md"), 5)
+            self.assertEqual(code_of(decision.read, d / "link.md", d), 5)
             os.mkfifo(d / "pipe")
-            self.assertEqual(code_of(decision.read, d / "pipe"), 5)
-            self.assertEqual(code_of(decision.read, d), 5)
-            self.assertEqual(code_of(decision.read, d / "missing.md"), 9)
+            self.assertEqual(code_of(decision.read, d / "pipe", d), 5)
+            self.assertEqual(code_of(decision.read, d, d), 5)
+            self.assertEqual(code_of(decision.read, d / "missing.md", d), 9)
 
 
 class HandoffTests(unittest.TestCase):
@@ -240,8 +240,8 @@ class HandoffTests(unittest.TestCase):
             d = Path(tmp)
             (d / "h.md").write_text(render_lines(GOOD_HANDOFF), encoding="utf-8")
             os.symlink(d / "h.md", d / "link.md")
-            self.assertEqual(code_of(handoff.read, d / "link.md"), 5)
-            self.assertEqual(handoff.read(d / "h.md")["task"], "shit-part-two")
+            self.assertEqual(code_of(handoff.read, d / "link.md", d), 5)
+            self.assertEqual(handoff.read(d / "h.md", d)["task"], "shit-part-two")
 
 
 class TemplateAlignmentTests(unittest.TestCase):

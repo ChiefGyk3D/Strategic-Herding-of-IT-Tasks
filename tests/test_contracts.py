@@ -248,35 +248,35 @@ class BriefFileTests(unittest.TestCase):
     def test_read_valid_file(self):
         p = self.dir / "b.md"
         p.write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
-        self.assertEqual(brief.read(p)["role"], "implementer")
+        self.assertEqual(brief.read(p, self.dir)["role"], "implementer")
 
     def test_read_bounds_the_bytes(self):
         p = self.dir / "big.md"
         p.write_bytes(b"#" * 70000)
-        self.assertEqual(code_of(brief.read, p), 7)
+        self.assertEqual(code_of(brief.read, p, self.dir), 7)
 
     def test_read_rejects_invalid_utf8(self):
         p = self.dir / "bad.md"
         p.write_bytes(b"issue: \xff\xfe\n")
-        self.assertEqual(code_of(brief.read, p), 3)
+        self.assertEqual(code_of(brief.read, p, self.dir), 3)
 
     def test_read_missing_file_is_precondition_missing(self):
-        self.assertEqual(code_of(brief.read, self.dir / "nope.md"), 9)
+        self.assertEqual(code_of(brief.read, self.dir / "nope.md", self.dir), 9)
 
     def test_read_refuses_a_symlink(self):
         real = self.dir / "real.md"
         real.write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
         link = self.dir / "link.md"
         os.symlink(real, link)
-        self.assertEqual(code_of(brief.read, link), 5)
+        self.assertEqual(code_of(brief.read, link, self.dir), 5)
 
     def test_read_refuses_a_fifo_without_blocking(self):
         fifo = self.dir / "pipe"
         os.mkfifo(fifo)
-        self.assertEqual(code_of(brief.read, fifo), 5)
+        self.assertEqual(code_of(brief.read, fifo, self.dir), 5)
 
     def test_read_refuses_a_directory(self):
-        self.assertEqual(code_of(brief.read, self.dir), 5)
+        self.assertEqual(code_of(brief.read, self.dir, self.dir), 5)
 
     def test_read_refuses_a_symlinked_parent_directory(self):
         outside = self.dir / "outside"
@@ -285,36 +285,106 @@ class BriefFileTests(unittest.TestCase):
         work = self.dir / "work"
         work.mkdir()
         os.symlink(outside, work / "linked-dir")
-        self.assertEqual(code_of(brief.read, work / "linked-dir" / "brief.md"), 5)
+        self.assertEqual(code_of(brief.read, work / "linked-dir" / "brief.md", self.dir), 5)
 
     def test_read_refuses_a_symlink_in_the_middle_of_the_path(self):
         real = self.dir / "real"
         (real / "deep").mkdir(parents=True)
         (real / "deep" / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
         os.symlink(real, self.dir / "alias")
-        self.assertEqual(code_of(brief.read, self.dir / "alias" / "deep" / "brief.md"), 5)
+        self.assertEqual(code_of(brief.read, self.dir / "alias" / "deep" / "brief.md", self.dir), 5)
 
     def test_read_refuses_a_hard_linked_file(self):
         outside = self.dir / "outside.md"
         outside.write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
         hard = self.dir / "hard.md"
         os.link(outside, hard)
-        self.assertEqual(code_of(brief.read, hard), 5)
+        self.assertEqual(code_of(brief.read, hard, self.dir), 5)
 
     def test_header_reader_refuses_a_symlinked_parent_and_a_hard_link(self):
         real = self.dir / "real"
         real.mkdir()
         (real / "r.md").write_text(GOOD_HEADER, encoding="utf-8")
         os.symlink(real, self.dir / "linked")
-        self.assertEqual(code_of(evidence.read_header, self.dir / "linked" / "r.md"), 5)
+        self.assertEqual(code_of(evidence.read_header, self.dir / "linked" / "r.md", self.dir), 5)
         os.link(real / "r.md", self.dir / "hard.md")
-        self.assertEqual(code_of(evidence.read_header, self.dir / "hard.md"), 5)
+        self.assertEqual(code_of(evidence.read_header, self.dir / "hard.md", self.dir), 5)
 
     def test_read_of_a_plain_nested_path_still_works(self):
         nested = self.dir / "a" / "b"
         nested.mkdir(parents=True)
         (nested / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
-        self.assertEqual(brief.read(nested / "brief.md")["role"], "implementer")
+        self.assertEqual(brief.read(nested / "brief.md", self.dir)["role"], "implementer")
+
+
+class TrustedBaseTests(unittest.TestCase):
+    """The base is the trusted root, chosen by the owner or the CLI. Only the part below it is walked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.proj = self.dir / "proj"
+        self.proj.mkdir()
+        (self.proj / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+
+    def test_base_reached_through_a_symlinked_parent_works(self):
+        # macOS style: /tmp is a symlink to /private/tmp, so the base lies behind a symlink.
+        real = self.dir / "real"
+        (real / "proj").mkdir(parents=True)
+        (real / "proj" / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        os.symlink(real, self.dir / "link")
+        base = self.dir / "link" / "proj"
+        self.assertEqual(brief.read(base / "brief.md", base)["role"], "implementer")
+
+    def test_base_that_is_itself_a_symlink_works(self):
+        os.symlink(self.proj, self.dir / "alias")
+        base = self.dir / "alias"
+        self.assertEqual(brief.read(base / "brief.md", base)["role"], "implementer")
+
+    def test_plain_file_below_the_base_still_works(self):
+        self.assertEqual(brief.read(self.proj / "brief.md", self.proj)["role"], "implementer")
+
+    def test_default_base_is_the_working_directory(self):
+        cwd = os.getcwd()
+        os.chdir(self.proj)
+        self.addCleanup(os.chdir, cwd)
+        self.assertEqual(brief.read("brief.md", self.dir)["role"], "implementer")
+
+    def test_symlinked_directory_below_the_base_is_refused(self):
+        outside = self.dir / "outside"
+        outside.mkdir()
+        (outside / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        os.symlink(outside, self.proj / "alias")
+        self.assertEqual(code_of(brief.read, self.proj / "alias" / "brief.md", self.proj), 5)
+
+    def test_symlinked_leaf_below_the_base_is_refused(self):
+        os.symlink(self.proj / "brief.md", self.proj / "link.md")
+        self.assertEqual(code_of(brief.read, self.proj / "link.md", self.proj), 5)
+
+    def test_dot_dot_out_of_the_base_is_refused(self):
+        outside = self.dir / "outside"
+        outside.mkdir()
+        (outside / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        self.assertEqual(code_of(brief.read, self.proj / ".." / "outside" / "brief.md", self.proj), 5)
+
+    def test_path_outside_the_base_is_refused(self):
+        outside = self.dir / "outside.md"
+        outside.write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        self.assertEqual(code_of(brief.read, outside, self.proj), 5)
+
+    def test_hard_link_below_the_base_is_refused(self):
+        os.link(self.proj / "brief.md", self.proj / "hard.md")
+        self.assertEqual(code_of(brief.read, self.proj / "hard.md", self.proj), 5)
+
+    def test_the_base_itself_is_not_a_file(self):
+        self.assertEqual(code_of(brief.read, self.proj, self.proj), 5)
+
+    def test_header_reader_honours_the_base(self):
+        os.symlink(self.proj, self.dir / "alias")
+        (self.proj / "r.md").write_text(GOOD_HEADER, encoding="utf-8")
+        self.assertEqual(evidence.read_header(self.dir / "alias" / "r.md", self.dir / "alias")["role"], "implementer")
+        self.assertEqual(code_of(evidence.read_header, self.proj / "r.md", self.dir / "elsewhere"), 5)
 
 
 class HeaderTests(unittest.TestCase):
@@ -447,31 +517,31 @@ class HeaderFileTests(unittest.TestCase):
     def test_read_header_from_a_report_with_a_long_body(self):
         p = self.dir / "r.md"
         p.write_text(GOOD_HEADER + "\n" + "body line\n" * 100000, encoding="utf-8")
-        self.assertEqual(evidence.read_header(p)["role"], "implementer")
+        self.assertEqual(evidence.read_header(p, self.dir)["role"], "implementer")
 
     def test_read_header_bounds_the_bytes_when_there_is_no_blank_line(self):
         p = self.dir / "r.md"
         p.write_text(GOOD_HEADER + "NOT VERIFIED: x\n" * 5000, encoding="utf-8")
-        self.assertEqual(code_of(evidence.read_header, p), 7)
+        self.assertEqual(code_of(evidence.read_header, p, self.dir), 7)
 
     def test_read_header_missing_symlink_and_fifo(self):
-        self.assertEqual(code_of(evidence.read_header, self.dir / "none.md"), 9)
+        self.assertEqual(code_of(evidence.read_header, self.dir / "none.md", self.dir), 9)
         real = self.dir / "real.md"
         real.write_text(GOOD_HEADER, encoding="utf-8")
         os.symlink(real, self.dir / "link.md")
-        self.assertEqual(code_of(evidence.read_header, self.dir / "link.md"), 5)
+        self.assertEqual(code_of(evidence.read_header, self.dir / "link.md", self.dir), 5)
         os.mkfifo(self.dir / "pipe")
-        self.assertEqual(code_of(evidence.read_header, self.dir / "pipe"), 5)
+        self.assertEqual(code_of(evidence.read_header, self.dir / "pipe", self.dir), 5)
 
     def test_read_header_rejects_invalid_utf8(self):
         p = self.dir / "r.md"
         p.write_bytes(GOOD_HEADER.encode() + b"\xff\n")
-        self.assertEqual(code_of(evidence.read_header, p), 3)
+        self.assertEqual(code_of(evidence.read_header, p, self.dir), 3)
 
     def test_multibyte_character_cut_at_the_read_limit_is_not_a_false_reject(self):
         p = self.dir / "r.md"
         p.write_bytes(GOOD_HEADER.encode() + b"\n" + chr(0xE9).encode() * 20000)
-        self.assertEqual(evidence.read_header(p)["role"], "implementer")
+        self.assertEqual(evidence.read_header(p, self.dir)["role"], "implementer")
 
 
 class TemplateTests(unittest.TestCase):
