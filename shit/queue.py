@@ -270,6 +270,7 @@ def _read_pending(project, log):
             if life[key] is not None and not isinstance(life[key], str):
                 raise ShitError(REJECTED)
     _check_pending_shards(doc["shards"], entry)
+    qr.check_effects(doc, entry)
     return doc, line, entry
 
 
@@ -371,16 +372,35 @@ def _apply_pending(project, log, doc, line):
     _checkpoint("pending-removed")
 
 
+def _prove_tail(log, doc, line, entry):
+    """The pending commit must be the next step of the verified chain (or its already-appended last step)."""
+    index = doc["index"]
+    lines, chain = log._lines(QUEUE), log._lines(CHAIN)
+    if len(lines) not in (index, index + 1) or len(chain) not in (index, index + 1) or len(chain) > len(lines):
+        raise ShitError(REJECTED)
+    previous, prior = GENESIS, []
+    for raw, recorded in zip(lines[:index], chain[:index]):
+        previous = chain_hash(previous, raw)
+        if raw == b"" or len(raw) > records.MAX_RECORD_BYTES or recorded.decode("ascii", "replace") != previous:
+            raise ShitError(REJECTED)
+        prior.append(qr.load_entry(raw))
+    if (len(lines) == index + 1 and lines[index] != line) or (
+            len(chain) == index + 1 and chain[index].decode("ascii", "replace") != doc["chain_line"]):
+        raise ShitError(REJECTED)
+    tasks = qr.replay(prior)
+    qr.replay([*prior, entry])
+    qr.check_effects(doc, entry, tasks.get(entry["task_id"]))
+
+
 def _recover(project, log):
     task_mod._recover(project, log)
     if not project.exists(PENDING):
         return
     try:
-        doc, line, _entry = _read_pending(project, log)
+        doc, line, entry = _read_pending(project, log)
     except ShitError as exc:
         if exc.code in (REJECTED, 7):
-            project.remove(PENDING)  # not verifiable: discard, no change (Q-REC-02)
-            raise ShitError(FAILED_CLOSED) from None
+            raise ShitError(FAILED_CLOSED) from None  # not verifiable: nothing applied, the record is kept (Q-REC-02)
         raise
     index = doc["index"]
     lines, torn = log._split(QUEUE)
@@ -395,6 +415,7 @@ def _recover(project, log):
         previous = GENESIS if index == 0 else chain[index - 1].decode("ascii", "replace")
         if chain_hash(previous, line) != doc["chain_line"]:
             raise ShitError(REJECTED)
+        _prove_tail(log, doc, line, entry)
     except ShitError as exc:
         if exc.code == REJECTED:
             raise ShitError(FAILED_CLOSED) from None

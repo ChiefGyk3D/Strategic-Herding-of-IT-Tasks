@@ -601,7 +601,7 @@ class GraphCrash(QueueCase):
         before = self.snap()
         self.assertEqual(self.code(self.status), 8)
         self.assertFalse((self.shit / "deps" / "b.json").exists())  # nothing from the forged pending was applied
-        self.assertNotIn("queue-pending.json", {k.split("/")[-1] for k in self.snap()})
+        self.assertIn("queue-pending.json", {k.split("/")[-1] for k in self.snap()})  # kept as evidence
         self.assertNotEqual(before, {})
 
 
@@ -1200,14 +1200,14 @@ class CrashRecovery(QueueCase):
         self.status()
         self.assertEqual(os.listdir(self.shit / "leases"), [])
 
-    def test_pending_record_that_is_garbage_is_discarded_with_exit_8(self):  # Q-REC-02
+    def test_pending_record_that_is_garbage_fails_closed_and_is_kept(self):  # Q-REC-02
         self.task("t1")
         before = self.snap()
         pending = self.shit / "queue-pending.json"
         pending.write_text("{not json")
         self.assertEqual(self.code(self.status), 8)
-        self.assertFalse(pending.exists())
-        self.assertEqual(self.snap(), before)
+        self.assertTrue(pending.exists())  # kept as evidence, nothing applied
+        self.assertEqual(self.snap(), {**before, "queue-pending.json": b"{not json"})
         pending.write_text(json.dumps({"index": 0}))
         self.assertEqual(self.code(self.status), 8)
 
@@ -1239,6 +1239,85 @@ class CrashRecovery(QueueCase):
         doc["chain_line"] = hashlib.sha256(b"x").hexdigest()
         path.write_text(json.dumps(doc))
         self.assertEqual(self.code(self.status), 8)
+
+
+class PendingProof(QueueCase):
+    """A pending commit is applied only when it is the current tail and carries exactly the effects of its entry."""
+
+    class Crash(Exception):
+        pass
+
+    def crash_at(self, stage, fn, *args, **kw):
+        def crash(seen):
+            if seen == stage:
+                raise PendingProof.Crash
+
+        with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(PendingProof.Crash):
+            fn(*args, **kw)
+
+    def to_review(self, tid):
+        lease = self.run_to_running(tid)
+        q.submit(self.proj, self.present(lease), now=self.tick())
+
+    def events(self):
+        return (self.shit / "events.jsonl").read_bytes()
+
+    def forge(self, task_id, kind, state_after, actor="wrapper", **effects):
+        """Write a pending record whose entry is validly chained but whose side effects are chosen by the test."""
+        entries = [json.loads(line) for line in self.queue_lines()]
+        previous = (self.shit / "queue.chain").read_bytes().splitlines()[-1].decode()
+        entry = {"schema": "queue-entry", "schema_version": 1, "id": f"queue-{len(entries) + 1:04d}",
+                 "timestamp": self.tick(), "message": q.MESSAGE, "task_id": task_id, "actor": actor, "kind": kind,
+                 "state_after": state_after}
+        line = qr.dump_entry(entry)
+        doc = {"index": len(entries), "entry_line": line.decode(), "chain_line": chain_hash(previous, line),
+               "lease": None, "lease_replaces": None, "remove_lease": None, "lifecycle": None, "shards": []}
+        doc.update(effects)
+        (self.shit / "queue-pending.json").write_text(json.dumps(doc))
+
+    def test_an_entry_kind_with_no_effects_cannot_carry_a_lifecycle_effect(self):  # H1
+        self.task("t1")
+        self.to_review("t1")
+        life = q._life("t1", "review", "approved", "human", "forged", self.tick())
+        self.forge("t1", "orphan_removed", "review", lifecycle=life)
+        events, state = self.events(), self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.lifecycle("t1"), "review")
+        self.assertEqual(self.events(), events)
+        self.assertEqual(self.queue_lines(), [line for line in state["queue.jsonl"].splitlines()])
+
+    def test_a_lifecycle_effect_must_match_its_entry_kind_and_actor(self):  # H1
+        self.task("t1")
+        self.to_review("t1")
+        life = q._life("t1", "review", "approved", "human", "forged", self.tick())
+        self.forge("t1", "reopened", "ready", actor="human", lifecycle=life)
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.lifecycle("t1"), "review")
+
+    def test_a_stale_pending_record_applies_nothing(self):  # M1
+        for tid in ("a", "b", "c"):
+            self.task(tid)
+        self.crash_at("pending-written", q.add_edge, self.proj, "b", "a", "draft", "human", now=self.tick())
+        old = (self.shit / "queue-pending.json").read_bytes()
+        self.status()
+        q.add_edge(self.proj, "b", "c", "draft", "human", now=self.tick())
+        shard = (self.shit / "deps" / "b.json").read_bytes()
+        (self.shit / "queue-pending.json").write_bytes(old)
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual((self.shit / "deps" / "b.json").read_bytes(), shard)
+
+    def test_an_unverifiable_pending_record_is_kept_as_evidence(self):  # M1
+        self.task("t1")
+        lease = self.claim("t1")
+        self.crash_at("lifecycle-applied", q.start, self.proj, self.present(lease), now=self.tick())
+        path = self.shit / "queue-pending.json"
+        doc = json.loads(path.read_text())
+        doc["chain_line"] = "zz"
+        path.write_text(json.dumps(doc))
+        self.assertEqual(self.code(self.status), 8)
+        self.assertTrue(path.exists())
+        self.assertEqual(self.code(self.status), 8)
+        self.assertTrue(path.exists())
 
 
 if __name__ == "__main__":

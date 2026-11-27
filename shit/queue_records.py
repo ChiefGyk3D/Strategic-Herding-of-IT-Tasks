@@ -355,6 +355,58 @@ def expected_lease(task_id, task):
     return {"task_id": task_id, **lease}
 
 
+# Side effects a pending commit may carry, by entry kind. `life` lists permitted (from, to, actor) lifecycle steps;
+# actor "entry" means the entry's own actor. Every other effect (lease file, lease removal, shards) is derived from the kind.
+_NONE = {"life": (), "lease": None, "remove": False}
+_LEAVE = (("running", "", "wrapper"), ("open", "", "wrapper"))
+EFFECTS = {
+    "claimed": {**_NONE, "lease": "new"},
+    "renewed": {**_NONE, "lease": "renew"},
+    "started": {**_NONE, "life": (("open", "running", "wrapper"),)},
+    "released": {**_NONE, "remove": True},
+    "expired": {**_NONE, "remove": True, "life": (("running", "failed", "wrapper"),)},
+    "submitted": {**_NONE, "remove": True, "life": (("running", "review", "wrapper"),)},
+    "failed": {**_NONE, "remove": True, "life": tuple((a, "failed", c) for a, _, c in _LEAVE)},
+    "held": {**_NONE, "remove": True, "life": tuple((a, "blocked", c) for a, _, c in _LEAVE)},
+    "reopened": {**_NONE, "life": tuple((a, "open", "entry") for a in ("review", "failed", "blocked"))},
+    "done": {**_NONE, "life": (("approved", "closed", "entry"),)},
+}
+
+
+def check_effects(doc, entry, before=None):
+    """Raise unless the lease, lifecycle and removal effects of pending `doc` are exactly those `entry` implies.
+
+    `before` is the replayed queue state of the task before the entry, when known."""
+    spec = EFFECTS.get(entry["kind"], _NONE)
+    task_id = entry["task_id"]
+    life, lease = doc["lifecycle"], doc["lease"]
+    if (doc["remove_lease"] is not None) != spec["remove"] or (spec["remove"] and doc["remove_lease"] != task_id):
+        raise reject()
+    if (lease is None) != (spec["lease"] is None) or (doc["lease_replaces"] is not None) != (spec["lease"] == "renew"):
+        raise reject()
+    if lease is not None:
+        same = ("task_id", "lease_id", "generation", "expires_at") if spec["lease"] == "renew" else (
+            "task_id", "lease_id", "generation", "expires_at", "step", "worker")
+        if any(lease[k] != entry.get(k, task_id if k == "task_id" else None) for k in same):
+            raise reject()
+        if spec["lease"] == "new" and (lease["claimed_at"] != entry["timestamp"] or lease["renewals"] != 0):
+            raise reject()
+    allowed = spec["life"]
+    if entry["kind"] == "expired" and entry["state_after"] != "failed":
+        allowed = ()
+    if (life is None) != (not allowed):
+        raise reject()
+    if life is None:
+        return
+    actor_ok = {(a, b, entry["actor"] if c == "entry" else c) for a, b, c in allowed}
+    if (life["from"], life["to"], life["actor"]) not in actor_ok or life["at"] != entry["timestamp"]:
+        raise reject()
+    if (life["to"] == "blocked") != (life["blocked_reason"] is not None and life["blocking_item"] is not None):
+        raise reject()
+    if before is not None and life["from"] not in LIFECYCLE[before["state"]]:
+        raise reject()
+
+
 def check_queue_transition(before, after):
     """True when the spec's transition table allows `before` to `after` (a repeat is never allowed)."""
     return (before, after) in ALLOWED
