@@ -161,7 +161,7 @@ class Project:
                     raise _os_error(exc) from None
                 fd = proj._walk((sub,))
                 try:
-                    os.fchmod(fd, DIR_MODE)
+                    os.fchmod(fd, stat.S_IRWXU)
                 except OSError as exc:
                     raise _os_error(exc) from None
                 finally:
