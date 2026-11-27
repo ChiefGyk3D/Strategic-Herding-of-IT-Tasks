@@ -59,3 +59,11 @@ context_tokens = 32768
 # listed_roles_max = 6
 # What an exceeded limit does: "warn" prints a warning and exits 0; "fail" exits 7. Default: "warn".
 # on_exceed = "warn"
+
+[yardstick]
+# Optional weights for `python3 -m shit.yardstick`, one per event kind, each an integer from 0 to 1000.
+# The report multiplies each event count by its weight and sums them into "effort points". Points are an
+# estimate that this project tunes, not a measurement. Default: 1 for every kind (points = event count).
+# Kinds: task_created, state_transition, brief_recorded, report_recorded, decision_recorded,
+# evidence_recorded, review_recorded, command_failed.
+# review_recorded = 1
