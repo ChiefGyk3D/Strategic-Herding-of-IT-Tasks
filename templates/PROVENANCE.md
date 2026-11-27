@@ -8,11 +8,12 @@ These templates are adapted from generic content in the department-of-internal-a
 |---|---|---|
 | `brief.md` | `templates/brief.md`, `docs/writing-a-brief.md` | Fields renamed to match `docs/schemas.md` (objective, scope, constraints, cleanup_duty) plus issue, packs, acceptance, data_class, evidence, review_destination; `model` optional; role is any lowercase slug; vendor-specific lines removed; read by `shit/brief.py`. |
 | `evidence-header.md` | `fragments/report-header.md` (the report header) | Header kept field for field; MODEL and LOCAL-LLM may say `n/a` so a person with no AI tool can fill it; read by `shit/evidence.py`. |
-| `handoff.md` | `templates/handoff.md` | Wording made tool-neutral; fields unchanged. |
-| `decision.md` | `templates/adr.md` | Fields aligned to the decision record in `docs/schemas.md`. |
+| `handoff.md` | `templates/handoff.md` | Wording made tool-neutral; bullets restated as one `key: value` line per field so `shit/handoff.py` can read them; the source's free-text sections are reduced to single-line fields. No record schema in `docs/schemas.md` covers a handoff, so the template is its field set. |
+| `decision.md` | `templates/adr.md` | Restated as the decision record fields in `docs/schemas.md` exactly (schema, schema_version, id, task_id, created_at, actor, status, supersedes_id, question, choice, rationale); the source's extra sections (context, options, consequences, verification, reopen evidence) are dropped because version 1 rejects unknown fields; read by `shit/decision.py`. |
 
-Not imported: `config.toml`. The source repository has no generic config template at that commit, so none
-is invented here; a configuration file belongs with the first command that reads one.
+`config.toml` is NEW content, not imported from DoIA: the source repository has no generic config template at
+that commit. It was written from the Stage 1 docs (`docs/schemas.md`, `docs/threat-model.md`, `docs/exit-codes.md`,
+`docs/design/local-model-tier.md`) and is read by `shit/config.py`.
 
 To refresh a template, read the source file at a newer commit, update this table with the new commit, and
 re-run `python3 -m unittest discover -s tests -v`. Any update is a reviewed diff, never an automatic copy.
