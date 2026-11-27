@@ -432,8 +432,7 @@ def _append_one(project, rel, lines, index, line):
 def _apply_pending(project, log, doc, line):
     """Apply a pending commit step by step. Every step is idempotent, so it is safe to repeat after a crash."""
     if not _apply_lease(project, doc, None):
-        project.remove(PENDING)  # nothing was applied yet: discard the commit and fail closed (Q-REC-02)
-        raise ShitError(FAILED_CLOSED)
+        raise ShitError(FAILED_CLOSED)  # defensive: recovery proves the lease path first; the record is never removed here
     _checkpoint("lease-applied")
     _apply_lifecycle(project, log, doc["lifecycle"])
     _checkpoint("lifecycle-applied")
@@ -467,10 +466,23 @@ def _check_anchor_for_pending(project, doc, chain):
         raise ShitError(REJECTED)
 
 
-def _prove_tail(project, log, doc, line, entry):
-    """The pending commit must be the next step of the verified chain (or its already-appended last step)."""
+def _check_lease_effect(project, doc):
+    """A lease effect needs the path free, already holding this lease, or holding the one it replaces."""
+    lease = doc["lease"]
+    path = _lease_path(lease["task_id"]) if lease is not None else None
+    if path is None or not project.exists(path):
+        return
+    existing = project.read(path, limit=records.MAX_RECORD_BYTES)
+    if existing != qr.dump_lease(lease) and not (doc["lease_replaces"] is not None
+                                                 and _sha(existing) == doc["lease_replaces"]):
+        raise ShitError(REJECTED)
+
+
+def _prove_tail(project, doc, line, entry, lines, chain, task_plan):
+    """The pending commit must be the next step of the verified chain (or its already-appended last step).
+
+    `lines` and `chain` are the queue files as they would be once a torn tail is dropped. Pure: nothing is written."""
     index = doc["index"]
-    lines, chain = log._lines(QUEUE), log._lines(CHAIN)
     if len(lines) not in (index, index + 1) or len(chain) not in (index, index + 1) or len(chain) > len(lines):
         raise ShitError(REJECTED)
     previous, prior = GENESIS, []
@@ -487,49 +499,77 @@ def _prove_tail(project, log, doc, line, entry):
     qr.check_effects(doc, entry, tasks.get(entry["task_id"]), after.get(entry["task_id"]))
     life = doc["lifecycle"]
     if life is not None:
-        for text in (life["reason"], life["blocked_reason"], life["blocking_item"]):
-            if text is not None:
-                _clean(text)
-        if life["to"] not in qr.LIFECYCLE[after[entry["task_id"]]["state"]]:
-            raise ShitError(REJECTED)
-        current = records.load_task(project.read(task_mod._task_path(life["task_id"])))
-        done = {"from": life["from"], "to": life["to"], "actor": life["actor"], "at": life["at"], "reason": life["reason"]}
-        applied = current["state"] == life["to"] and current["history"] and current["history"][-1] == done
-        if current["state"] != life["from"] and not applied:
-            raise ShitError(REJECTED)
+        _prove_lifecycle(project, doc, entry, after, task_plan)
     if doc["shards"]:
         _load_graph(project, [*prior, entry], after, {item["task_id"]: item["content"] for item in doc["shards"]})
 
 
-def _recover(project, log):
-    task_mod._recover(project, log)
-    if not project.exists(PENDING):
-        return
+def _prove_lifecycle(project, doc, entry, after, task_plan):
+    """The lifecycle step must be applicable now: legal, in time order against task and event log, and in agreement."""
+    life = doc["lifecycle"]
+    for text in (life["reason"], life["blocked_reason"], life["blocking_item"]):
+        if text is not None:
+            _clean(text)
+    if life["to"] not in qr.LIFECYCLE[after[entry["task_id"]]["state"]]:
+        raise ShitError(REJECTED)
+    current = records.load_task(project.read(task_mod._task_path(life["task_id"])))
+    done = {"from": life["from"], "to": life["to"], "actor": life["actor"], "at": life["at"], "reason": life["reason"]}
+    if current["state"] == life["to"] and current["history"] and current["history"][-1] == done:
+        return  # already applied
+    if current["state"] != life["from"] or life["at"] < current["updated_at"]:
+        raise ShitError(REJECTED)
+    check_transition(life["from"], life["to"], life["actor"])
+    tip = task_plan["event"]["timestamp"] if task_plan else None
+    lines = task_plan["log_lines"] if task_plan else EventLog(project)._lines(eventlog.LOG_PATH)
+    if lines:
+        last = records.load_event(lines[-1])["timestamp"]
+        tip = last if tip is None else max(tip, last)
+    if tip is not None and life["at"] < tip:
+        raise ShitError(REJECTED)  # the event would precede the event log's tip
+
+
+def _refusing(fn):
+    """Run a validation pass: anything that does not verify is a fail-closed refusal (exit code 8), nothing written."""
     try:
-        doc, line, entry = _read_pending(project, log)
+        return fn()
     except ShitError as exc:
-        if exc.code in (REJECTED, 7):
-            raise ShitError(FAILED_CLOSED) from None  # not verifiable: nothing applied, the record is kept (Q-REC-02)
+        if exc.code in (REJECTED, ILLEGAL_TRANSITION, HUMAN_APPROVAL, PRECONDITION):
+            raise ShitError(FAILED_CLOSED) from None
         raise
+
+
+def _plan_recovery(project, log):
+    """Prove the whole interrupted commit before the first write: record, healed tail, anchor, effects, lifecycle."""
+    task_plan = task_mod._plan_recovery(project, log)
+    doc, line, entry = _read_pending(project, log)
     index = doc["index"]
     lines, torn = log._split(QUEUE)
     chain, chain_torn = log._split(CHAIN)
-    _closed(lambda: _check_anchor_for_pending(project, doc, chain))  # before anything is healed or applied
-    try:
-        log.heal_torn_tail(QUEUE, lines, torn, index, line + b"\n")
-        log.heal_torn_tail(CHAIN, chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
-        lines, _ = log._split(QUEUE)
-        chain, _ = log._split(CHAIN)
-        if len(lines) < index or len(chain) < index:
-            raise ShitError(REJECTED)
-        previous = GENESIS if index == 0 else chain[index - 1].decode("ascii", "replace")
-        if chain_hash(previous, line) != doc["chain_line"]:
-            raise ShitError(REJECTED)
-        _prove_tail(project, log, doc, line, entry)
-    except ShitError as exc:
-        if exc.code == REJECTED:
-            raise ShitError(FAILED_CLOSED) from None
-        raise
+    lines = log.healed(lines, torn, index, line + b"\n")
+    chain = log.healed(chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
+    _check_anchor_for_pending(project, doc, chain)
+    if len(lines) < index or len(chain) < index:
+        raise ShitError(REJECTED)
+    previous = GENESIS if index == 0 else chain[index - 1].decode("ascii", "replace")
+    if chain_hash(previous, line) != doc["chain_line"]:
+        raise ShitError(REJECTED)
+    _prove_tail(project, doc, line, entry, lines, chain, task_plan)
+    _check_lease_effect(project, doc)
+    return task_plan, doc, line
+
+
+def _recover(project, log):
+    """Validate everything first, then write. A refusal leaves every file as it was, the pending records included."""
+    if not project.exists(PENDING):
+        task_mod._recover(project, log, queue_pending_ok=True)
+        return
+    task_plan, doc, line = _refusing(lambda: _plan_recovery(project, log))
+    task_mod._recover(project, log, task_plan, queue_pending_ok=True)
+    index = doc["index"]
+    lines, torn = log._split(QUEUE)
+    chain, chain_torn = log._split(CHAIN)
+    log.heal_torn_tail(QUEUE, lines, torn, index, line + b"\n")
+    log.heal_torn_tail(CHAIN, chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
     _closed(lambda: _apply_pending(project, log, doc, line))
     _load(project, log)
 
@@ -549,6 +589,7 @@ def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, 
            "lease": lease, "lease_replaces": lease_replaces, "remove_lease": remove_lease, "lifecycle": lifecycle,
            "shards": list(shards)}
     _check_pending_shards(doc["shards"], entry)
+    _closed(lambda: _check_lease_effect(ctx.project, doc))  # a conflicting lease file: refuse before anything is written
     ctx.log.check_room(len(line) + 1, CHAIN_LINE_BYTES, data=QUEUE, chain=CHAIN)  # refuse before anything is written
     if lifecycle is not None:
         ctx.log.check_room(records.MAX_RECORD_BYTES + 1, CHAIN_LINE_BYTES)  # the event is built later: assume the largest

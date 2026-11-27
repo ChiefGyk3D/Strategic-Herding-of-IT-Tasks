@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 from . import records
 from .errors import (
+    FAILED_CLOSED,
     HUMAN_APPROVAL,
     INTERNAL,
     REJECTED,
@@ -53,9 +54,13 @@ def _guarded(fn):
 # -- recovery ---------------------------------------------------------------
 
 
-def _recover(project, log):
+QUEUE_PENDING = "queue-pending.json"  # owned by shit/queue.py
+
+
+def _plan_recovery(project, log):
+    """Validate an interrupted commit without writing anything. Returns the plan, or None when nothing is pending."""
     if not project.exists(PENDING):
-        return
+        return None
     data = project.read(PENDING, limit=PENDING_LIMIT)
     try:
         doc = json.loads(data.decode("utf-8"), object_pairs_hook=records._pairs)
@@ -78,13 +83,32 @@ def _recover(project, log):
         raise ShitError(REJECTED)
     log_lines, log_torn = log._split(LOG_PATH)
     chain_lines, chain_torn = log._split(CHAIN_PATH)
-    log_lines = log.heal_torn_tail(LOG_PATH, log_lines, log_torn, index, line + b"\n")
-    chain_lines = log.heal_torn_tail(CHAIN_PATH, chain_lines, chain_torn, index, chain_line.encode("ascii") + b"\n")
+    log_lines = log.healed(log_lines, log_torn, index, line + b"\n")
+    chain_lines = log.healed(chain_lines, chain_torn, index, chain_line.encode("ascii") + b"\n")
     if len(chain_lines) < index or len(log_lines) < index:
         raise ShitError(REJECTED)
     previous = GENESIS if index == 0 else chain_lines[index - 1].decode("ascii", "replace")
     if chain_hash(previous, line) != chain_line:
         raise ShitError(REJECTED)
+    return {"index": index, "line": line, "chain_line": chain_line, "task": task, "event": event,
+            "log_lines": log_lines, "torn": (log_torn, chain_torn)}
+
+
+def _recover(project, log, plan=None, *, queue_pending_ok=False):
+    """Finish an interrupted commit. Every check runs before the first write (`_plan_recovery`).
+
+    A queue commit that is still pending also holds back every event writer: its lifecycle event has to be
+    proven against the event log as it is now, so the queue recovers first (exit code 8 until it does)."""
+    if not queue_pending_ok and project.exists(QUEUE_PENDING):
+        raise ShitError(FAILED_CLOSED)
+    plan = plan or _plan_recovery(project, log)
+    if plan is None:
+        return
+    index, line, chain_line, task = plan["index"], plan["line"], plan["chain_line"], plan["task"]
+    log_lines, log_torn = log._split(LOG_PATH)
+    chain_lines, chain_torn = log._split(CHAIN_PATH)
+    log.heal_torn_tail(LOG_PATH, log_lines, log_torn, index, line + b"\n")
+    log.heal_torn_tail(CHAIN_PATH, chain_lines, chain_torn, index, chain_line.encode("ascii") + b"\n")
     log.apply(Prepared(index, line, chain_line))
     project.write_atomic(_task_path(task["id"]), records.dump_task(task))
     project.remove(PENDING)

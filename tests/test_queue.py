@@ -657,8 +657,8 @@ class Claims(QueueCase):
         with mock.patch.object(q, "_checkpoint", plant):
             self.assertEqual(self.code(self.claim, "t1"), 8)
         self.assertEqual(self.queue_lines().__len__(), 1)  # only the enqueue entry
-        self.assertFalse((self.shit / "queue-pending.json").exists())
-        self.assertEqual(self.lifecycle("t1"), "open")
+        self.assertTrue((self.shit / "queue-pending.json").exists())  # kept as evidence, never deleted on a conflict
+        self.assertEqual(json.loads((self.shit / "tasks" / "t1.json").read_text())["state"], "open")
         planted.unlink()
         self.assertNotEqual(before_queue, {})
 
@@ -1295,7 +1295,7 @@ class PendingProof(QueueCase):
         self.forge("t1", "orphan_removed", "review", lifecycle=life)
         events, state = self.events(), self.snap()
         self.assertEqual(self.code(self.status), 8)
-        self.assertEqual(self.lifecycle("t1"), "review")
+        self.assertEqual(json.loads((self.shit / "tasks" / "t1.json").read_text())["state"], "review")
         self.assertEqual(self.events(), events)
         self.assertEqual(self.queue_lines(), [line for line in state["queue.jsonl"].splitlines()])
 
@@ -1305,7 +1305,7 @@ class PendingProof(QueueCase):
         life = q._life("t1", "review", "approved", "human", "forged", self.tick())
         self.forge("t1", "reopened", "ready", actor="human", lifecycle=life)
         self.assertEqual(self.code(self.status), 8)
-        self.assertEqual(self.lifecycle("t1"), "review")
+        self.assertEqual(json.loads((self.shit / "tasks" / "t1.json").read_text())["state"], "review")
 
     def test_a_stale_pending_record_applies_nothing(self):  # M1
         for tid in ("a", "b", "c"):
@@ -1349,6 +1349,71 @@ class PendingProof(QueueCase):
         before = self.snap()
         self.assertEqual(self.code(self.status), 8)
         self.assertEqual(self.snap(), before)
+
+    def test_a_task_writer_refuses_while_a_queue_commit_is_pending(self):  # round 3
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        self.crash_at("pending-written", q.submit, self.proj, self.present(lease), now=self.tick())
+        before = self.snap()
+        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t2", title="T", summary="S",
+                                   owner="human", actor="human", now=self.tick(500)), 8)
+        self.assertEqual(self.snap(), before)
+        self.assertEqual(self.status(now=at(self.clock + 1))["t1"]["state"], "review")  # the commit still recovers
+
+    def test_a_pending_lifecycle_older_than_the_event_log_tip_changes_nothing(self):  # round 3
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        self.crash_at("pending-written", q.submit, self.proj, self.present(lease), now=self.tick())
+        path = self.shit / "queue-pending.json"
+        held = path.read_bytes()
+        path.unlink()  # an event writer that did not look at the pending record
+        task_mod.create_task(self.proj, task_id="t2", title="T", summary="S", owner="human", actor="human",
+                             now=self.tick(500))
+        path.write_bytes(held)
+        before = self.snap()
+        self.assertEqual(self.code(self.status, now=at(self.clock + 1)), 8)
+        self.assertEqual(self.snap(), before)  # the lease is still there, nothing was removed
+
+    def test_task_recovery_does_not_run_before_the_queue_record_is_proven(self):  # round 3
+        self.task("t1")
+        lease = self.claim("t1")
+
+        def crash(stage):
+            if stage == "pending-written":
+                raise PendingProof.Crash
+
+        with mock.patch.object(task_mod, "_checkpoint", crash), self.assertRaises(PendingProof.Crash):
+            q.start(self.proj, self.present(lease), now=self.tick())
+        self.assertTrue((self.shit / "pending.json").exists())
+        path = self.shit / "queue-anchor.json"
+        doc = json.loads(path.read_text())
+        doc["tip"] = "0" * 64
+        path.write_text(json.dumps(doc))
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_a_torn_tail_is_not_rewritten_when_the_pending_record_cannot_be_proven(self):  # round 3
+        self.task("t1")
+        self.crash_at("pending-written", self.claim, "t1")
+        lines = self.queue_lines()
+        pending = json.loads((self.shit / "queue-pending.json").read_text())
+        (self.shit / "queue.jsonl").write_bytes(lines[0][:-1] + b"X" + b"\n" + b"".join(l + b"\n" for l in lines[1:])
+                                                + pending["entry_line"].encode()[:20])
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_a_lease_conflict_keeps_the_pending_record_and_changes_nothing(self):  # round 3
+        self.task("t1")
+        self.crash_at("pending-written", self.claim, "t1")
+        pending = json.loads((self.shit / "queue-pending.json").read_text())
+        other = {**pending["lease"], "lease_id": "f" * 32}
+        (self.shit / "leases" / "t1.json").write_bytes(qr.dump_lease(other))
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+        self.assertTrue((self.shit / "queue-pending.json").exists())
 
     def test_a_graph_pending_record_with_an_empty_shard_applies_nothing(self):  # round 2
         self.task("a")

@@ -71,17 +71,26 @@ class EventLog:
             raise ShitError(REJECTED)
         return lines
 
-    def heal_torn_tail(self, rel, lines, torn, index, expected):
-        """Drop a torn final line left by an interrupted append of the pending transaction at `index`.
+    @staticmethod
+    def healed(lines, torn, index, expected):
+        """The complete lines left after dropping a torn tail, or a rejection. Pure: nothing is written.
 
         The torn bytes must be a proper prefix of the full append (`expected`, newline included) and the
-        file must hold exactly `index` complete lines. The file is then rewritten atomically with only
-        those lines, so the next append re-writes the whole entry. Anything else is refused.
-        """
+        file must hold exactly `index` complete lines."""
         if torn is None:
             return lines
         if len(lines) != index or not 0 < len(torn) < len(expected) or not expected.startswith(torn):
             raise ShitError(REJECTED)
+        return lines
+
+    def heal_torn_tail(self, rel, lines, torn, index, expected):
+        """Drop a torn final line left by an interrupted append of the pending transaction at `index`.
+
+        The file is rewritten atomically with only the complete lines, so the next append re-writes the whole
+        entry. Anything else is refused (see `healed`)."""
+        if torn is None:
+            return lines
+        self.healed(lines, torn, index, expected)
         self.project.write_atomic(rel, b"".join(line + b"\n" for line in lines), limit=MAX_LOG_BYTES)
         return lines
 
