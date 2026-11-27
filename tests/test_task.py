@@ -1,10 +1,13 @@
 """Task creation and transition tests (issue #9), including crash recovery."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from _bootstrap import make_git_dir
 
 from shit import task as task_mod
 from shit.errors import ShitError
@@ -23,7 +26,7 @@ class TaskBase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name).resolve() / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
         self.proj = Project.init(self.repo)
         self.addCleanup(self.proj.close)
         self.shit = self.repo / ".shit"
@@ -199,6 +202,63 @@ class CrashRecovery(TaskBase):
         path.write_bytes(path.read_bytes().replace(b"Task record created.", b"Task record forged!!", 1))
         self.assertEqual(self.code(task_mod.transition, self.proj, "t1", "running", "wrapper", "s", now=T1), 3)
         self.assertEqual(task_mod.get_task(self.proj, "t1")["state"], "open")
+
+
+@unittest.skipUnless(os.path.isdir("/proc/self/fd"), "needs /proc to name the file behind a descriptor")
+class TornWrites(TaskBase):
+    """A partial os.write that raises mid-append, as after a crash or a full disk."""
+
+    def tear(self, name, keep):
+        real = os.write
+        done = []
+
+        def torn(fd, data):
+            if not done and os.path.basename(os.readlink(f"/proc/self/fd/{fd}")) == name:
+                done.append(True)
+                n = len(data) - 1 if keep is None else keep
+                real(fd, bytes(data[:n]))
+                raise OSError("injected")
+            return real(fd, data)
+
+        return mock.patch("os.write", torn)
+
+    def interrupt_then_recover(self, name, keep):
+        self.create()
+        with self.tear(name, keep):
+            self.assertEqual(self.code(task_mod.transition, self.proj, "t1", "running", "wrapper", "s", now=T1), 1)
+        self.assertFalse((self.shit / name).read_bytes().endswith(b"\n"))
+        self.proj.close()
+        proj = Project.open(self.repo)
+        self.addCleanup(proj.close)
+        self.assertEqual(task_mod.get_task(proj, "t1")["state"], "running")
+        self.assertFalse((self.shit / "pending.json").exists())
+        self.assertEqual(len(EventLog(proj).verify()), 2)
+        self.assertEqual((self.shit / "events.chain").read_bytes().count(b"\n"), 2)
+        self.assertEqual((self.shit / "events.jsonl").read_bytes().count(b"\n"), 2)
+
+    def test_torn_event_line_recovers(self):
+        self.interrupt_then_recover("events.jsonl", 10)
+
+    def test_torn_event_line_missing_only_newline_recovers(self):
+        # Keep every byte except the final newline; the entry is still incomplete.
+        self.interrupt_then_recover("events.jsonl", None)
+
+    def test_torn_chain_entry_recovers(self):
+        self.interrupt_then_recover("events.chain", 7)
+
+    def test_torn_tail_without_pending_is_refused(self):
+        self.create()
+        with (self.shit / "events.jsonl").open("ab") as fh:
+            fh.write(b'{"schema":"event-log"')
+        self.assertEqual(self.code(self.events), 3)
+
+    def test_torn_tail_that_does_not_match_pending_is_refused(self):
+        self.create()
+        with self.tear("events.jsonl", 10):
+            self.code(task_mod.transition, self.proj, "t1", "running", "wrapper", "s", now=T1)
+        path = self.shit / "events.jsonl"
+        path.write_bytes(path.read_bytes()[:-10] + b"zzzzzzzzzz")
+        self.assertEqual(self.code(task_mod.get_task, self.proj, "t1"), 3)
 
 
 if __name__ == "__main__":
