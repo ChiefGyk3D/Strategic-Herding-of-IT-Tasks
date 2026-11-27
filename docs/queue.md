@@ -16,7 +16,7 @@
 
 Files under `.shit`: `queue.jsonl` with the sidecar `queue.chain`, `deps/<task-id>.json` (one dependency shard per dependent task), `leases/<task-id>.json`, `queue-pending.json` (the commit point, present only during a mutation) and the generated `QUEUE.md`.
 
-Every operation takes the store lock, finishes an interrupted commit, loads and verifies everything (chain, replay, graph, lifecycle agreement), runs maintenance (orphan leases, missing lease files, expiry, waiting to ready) and then does its own step. A queue state that the recovery planner cannot verify is exit code 8 and nothing is written before the planner's proof (Q-REC-02); maintenance steps after it are separate committed steps, and an orphan lease file is deleted only after its `orphan_removed` entry has committed, and the entry is not repeated after a crash between the two.
+Every operation takes the store lock, refuses with exit code 8 if a `queue-pending.json` exists (only `queue.recover` finishes a queue commit; a task-only `pending.json` is finished after the planner proved the queue), loads and verifies everything (chain, replay, graph, lifecycle agreement), runs maintenance (orphan leases, missing lease files, expiry, waiting to ready) and then does its own step. A queue state that the recovery planner cannot verify is exit code 8 and nothing is written before the planner's proof (Q-REC-02); maintenance steps after it are separate committed steps, and an orphan lease file is deleted only after its `orphan_removed` entry has committed, and the entry is not repeated after a crash between the two.
 
 ## Decisions recorded by the owner (2026-11-27)
 

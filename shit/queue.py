@@ -8,10 +8,11 @@ State lives in plain files under the confined `.shit` root:
 - `queue-pending.json`: the commit point of one queue mutation (lease file, lifecycle transition, entry, chain).
 - `QUEUE.md`: a generated view. It is written after each mutation and never read.
 
-Every public operation takes the store lock, finishes any interrupted commit, loads and verifies the whole
-state, applies maintenance (orphan leases, expiry, waiting to ready) and only then performs its own step.
-A queue operation that cannot verify its state fails closed with exit code 8 and writes nothing. Workers
-never supply a time, a lease id, a generation or a state: those come from the wrapper.
+Every public operation takes the store lock, refuses on sight when a `queue-pending.json` exists (only `recover`
+finishes a queue commit; see `_recover`), loads and verifies the whole state, applies maintenance (orphan leases,
+expiry, waiting to ready) and only then performs its own step. A queue operation that cannot verify its state
+fails closed with exit code 8 and writes nothing. Workers never supply a time, a lease id, a generation or a
+state: those come from the wrapper.
 """
 
 import hashlib

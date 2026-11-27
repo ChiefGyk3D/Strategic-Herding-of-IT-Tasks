@@ -6,7 +6,7 @@
 
 This threat model covers the proposed provider-neutral `shit` wrapper's versioned records, lifecycle enforcement, local confined storage boundary, event and diagnostic logging, subprocess launch boundary, privacy scanning, and fail-closed hooks.
 
-It evaluates the design inputs for later implementation issues. It does not test an implementation because no implementation exists in this issue.
+It began as the design input for the implementation issues. Those are now implemented in this repository; `docs/queue.md` maps each queue and lease row below to its tests. This document is still a self-review and does not itself test or audit the code.
 
 This is not an audit. It does not establish that the wrapper, host, repository, providers, models, operating system, or future implementation is secure.
 
