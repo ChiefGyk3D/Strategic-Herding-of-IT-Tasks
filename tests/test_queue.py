@@ -1365,5 +1365,31 @@ class ApplyMarkers(QueueCase):
         self.assertEqual(self.code(self.status), 8)
 
 
+class ClockOrder(QueueCase):
+    """Every mutation checks the clock against the queue tip and the event-log tip, and never appends out of order."""
+
+    def test_a_clock_behind_the_event_log_changes_nothing(self):  # H6
+        self.task("t1")
+        self.clock = 5000
+        self.success_report("t1")
+        before = self.snap()
+        for operation in (lambda: q.claim(self.proj, {"task_id": "t1", "step": "draft", "worker": "w1",
+                                                      "worker_kind": "ai"}, now=at(10)),
+                          lambda: q.status(self.proj, now=at(10))):
+            self.assertEqual(self.code(operation), 8)
+        self.assertEqual(self.snap(), before)
+        from shit.log import EventLog
+        EventLog(self.proj).verify()
+
+    def test_the_event_log_refuses_a_candidate_older_than_its_tip(self):  # H6
+        from shit.log import EventLog
+        self.task("t1", enqueue=False)
+        log = EventLog(self.proj)
+        events = log.verify()
+        stale = {**events[-1], "id": f"event-{len(events) + 1:04d}", "timestamp": at(0)}
+        with self.proj.locked():
+            self.assertEqual(self.code(log.prepare, stale), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

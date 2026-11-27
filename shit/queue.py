@@ -491,6 +491,9 @@ class _Ctx:
 def _check_clock(ctx, state):
     if state.entries and ctx.now < state.entries[-1]["timestamp"]:
         raise ShitError(FAILED_CLOSED)  # the clock is earlier than a recorded time: no claim, no expiry (Q-LEASE-08)
+    tip = _closed(ctx.log.last_timestamp)
+    if tip is not None and ctx.now < tip:
+        raise ShitError(FAILED_CLOSED)  # the same holds for the event log: a lifecycle event must not precede its tip
 
 
 def _expire(ctx, task_id, state):

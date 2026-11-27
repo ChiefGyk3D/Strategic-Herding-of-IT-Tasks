@@ -118,8 +118,14 @@ class EventLog:
         line = records.dump_event(event)
         if any(e["id"] == event["id"] for e in events):
             raise ShitError(REJECTED)
+        _check_lifecycle([*events, event])  # the complete sequence including the candidate: time never goes backwards
         previous = GENESIS if not events else self._last_chain()
         return Prepared(len(events), line, chain_hash(previous, line))
+
+    def last_timestamp(self):
+        """Timestamp of the final event line, or None for an empty log. Used only to refuse an earlier clock."""
+        lines = self._lines(LOG_PATH)
+        return records.load_event(lines[-1])["timestamp"] if lines else None
 
     def _last_chain(self):
         return self._lines(CHAIN_PATH)[-1].decode("ascii")
