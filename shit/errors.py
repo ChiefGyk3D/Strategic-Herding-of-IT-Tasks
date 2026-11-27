@@ -1,8 +1,38 @@
-"""The one error type for contract validation, carrying a stable exit code from docs/exit-codes.md.
+"""Stable exit codes from docs/exit-codes.md, as two error types.
 
-Messages are fixed strings plus a field name. They never contain the rejected value, so a secret or
-private term that lands in a rejected input is not copied into a log or a report.
+ShitError (storage, log, lifecycle) carries a code and its fixed message. ContractError (contract
+validation) carries a code and a fixed message plus a field name, never the rejected value.
 """
+
+MESSAGES = {
+    1: "internal error",
+    2: "usage error",
+    3: "record rejected",
+    4: "illegal lifecycle transition",
+    5: "confinement violation",
+    7: "input exceeds limit",
+    9: "precondition missing",
+    10: "human approval required",
+}
+
+OK = 0
+INTERNAL = 1
+USAGE = 2
+REJECTED = 3
+ILLEGAL_TRANSITION = 4
+CONFINEMENT = 5
+INPUT_LIMIT = 7
+PRECONDITION = 9
+HUMAN_APPROVAL = 10
+
+
+class ShitError(Exception):
+    """An error that maps to one stable exit code. It never carries raw paths, content or OS text."""
+
+    def __init__(self, code):
+        super().__init__(MESSAGES[code])
+        self.code = code
+        self.message = MESSAGES[code]
 
 RECORD_REJECTED = 3
 CONFINEMENT_VIOLATION = 5
