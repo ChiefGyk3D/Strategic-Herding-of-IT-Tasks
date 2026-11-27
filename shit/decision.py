@@ -10,7 +10,7 @@ a model or wrapper may propose but cannot grant approval. Errors never echo the 
 """
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from shit._text import check_size, decode, read_bounded, read_fields
 from shit.errors import HUMAN_APPROVAL, INPUT_LIMIT, ContractError, rejected
@@ -32,7 +32,7 @@ def _timestamp(value):
     if _TIMESTAMP.fullmatch(value) is None:
         return False
     try:
-        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
     except ValueError:
         return False
     return True
