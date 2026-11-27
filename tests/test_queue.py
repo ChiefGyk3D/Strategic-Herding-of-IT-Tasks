@@ -238,6 +238,14 @@ class Readiness(QueueCase):
                               rationale="r", actor="human", now=self.tick())
         rows = self.status()
         self.assertEqual((rows["b"]["state"], rows["c"]["state"]), ("ready", "waiting"))
+        q.submit(self.proj, self.present(self.run_to_running("a")), now=self.tick())
+        self.success_report("a")
+        commands.add_review(self.proj, task_id="a", review_id="rv1", report_id="a-report", verdict="pass",
+                            summary="ok", actor="model", now=self.tick())
+        self.assertEqual(self.status()["c"]["state"], "waiting")  # a model's pass does not open a review edge
+        commands.add_review(self.proj, task_id="a", review_id="rv2", report_id="a-report", verdict="pass",
+                            summary="ok", actor="human", now=self.tick())
+        self.assertEqual(self.status()["c"]["state"], "ready")
 
     def test_a_dependent_returns_to_waiting_when_the_gate_recloses(self):  # Q-DEP-09
         self.task("a")
@@ -768,25 +776,29 @@ class Hostile(QueueCase):
     def test_forged_rechained_entries_are_rejected_by_validation(self):  # TM-17, TM-19
         self.task("a")
         base = self.entries()[0]
+        wrapper = {**base, "actor": "wrapper", "id": "queue-0002"}
+        valid = {**wrapper, "kind": "orphan_removed"}  # a well-formed entry the cases below each break in one way
         forged_cases = {
-            "model reopen": {**base, "id": "queue-0002", "kind": "reopened", "actor": "model", "state_after": "ready"},
-            "unknown kind": {**base, "id": "queue-0002", "kind": "approved"},
-            "extra field": {**base, "id": "queue-0002", "kind": "ready", "model": "gpt"},
-            "claim without lease": {**base, "id": "queue-0002", "kind": "claimed", "state_after": "dispatched"},
-            "generation jump": {**base, "id": "queue-0002", "kind": "claimed", "state_after": "dispatched",
-                                "lease_id": "1" * 32, "generation": 7, "worker": "w", "step": "draft",
-                                "expires_at": at(10 ** 5)},
-            "done from ready": {**base, "id": "queue-0002", "kind": "done", "state_after": "done"},
+            "model reopen": {**valid, "kind": "reopened", "actor": "model"},
+            "human claim": {**valid, "kind": "claimed", "actor": "human", "state_after": "dispatched",
+                            "lease_id": "1" * 32, "generation": 1, "worker": "w", "step": "draft",
+                            "expires_at": at(10 ** 5)},
+            "unknown kind": {**valid, "kind": "approved"},
+            "extra field": {**valid, "model": "gpt"},
+            "claim without lease": {**wrapper, "kind": "claimed", "state_after": "dispatched"},
+            "generation jump": {**wrapper, "kind": "claimed", "state_after": "dispatched", "lease_id": "1" * 32,
+                                "generation": 7, "worker": "w", "step": "draft", "expires_at": at(10 ** 5)},
+            "done from ready": {**valid, "kind": "done", "state_after": "done"},
             "reused task id": {**base, "id": "queue-0002"},
-            "time goes back": {**base, "id": "queue-0002", "kind": "ready", "timestamp": at(-100)},
-            "wrong id": {**base, "id": "queue-0009", "kind": "ready"},
+            "time goes back": {**valid, "timestamp": at(-100)},
+            "wrong id": {**valid, "id": "queue-0009"},
         }
         original = self.queue_lines()
         for name, forged in forged_cases.items():
             self.rewrite_queue([*original, json.dumps(forged, separators=(",", ":")).encode()])
             self.assertEqual(self.code(self.status), 8, name)
-        self.rewrite_queue(original)
-        self.assertEqual(self.status()["a"]["state"], "ready")
+        self.rewrite_queue([*original, json.dumps(valid, separators=(",", ":")).encode()])
+        self.assertEqual(self.status()["a"]["state"], "ready")  # the unbroken entry is accepted: the cases bite
 
     def test_duplicate_key_and_depth_in_an_entry_are_refused(self):
         self.task("a")
