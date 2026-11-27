@@ -62,7 +62,7 @@ _LEASE = {"lease_id", "generation"}
 KINDS = {
     "enqueued": (set(), set(), HW, ("waiting", "ready")),
     "ready": (set(), set(), W, ("ready",)),
-    "claimed": (_LEASE | {"worker", "step", "expires_at"}, set(), W, ("dispatched",)),
+    "claimed": (_LEASE | {"worker", "worker_kind", "step", "expires_at"}, set(), W, ("dispatched",)),
     "started": (_LEASE | {"worker", "step", "attempt"}, set(), W, ("running",)),
     "renewed": (_LEASE | {"worker", "step", "expires_at"}, set(), W, ("dispatched", "running")),
     "released": (_LEASE, set(), W, ("ready",)),
@@ -155,6 +155,8 @@ def validate_entry(obj):
         records._slug(obj, "worker")
     if "step" in obj:
         records._choice(obj, "step", STEPS)
+    if "worker_kind" in obj:
+        records._choice(obj, "worker_kind", WORKER_KINDS)
     for key in ("expires_at", "not_before"):
         if key in obj:
             records._stamp(obj, key)
@@ -309,7 +311,8 @@ def _step(task, entry, before):
         task["apply_phase"] = None  # every attempt starts without an apply marker
         task["apply_finished"] = False
         task["lease"] = {"lease_id": entry["lease_id"], "generation": entry["generation"], "worker": entry["worker"],
-                         "step": entry["step"], "claimed_at": stamp, "expires_at": entry["expires_at"], "renewals": 0}
+                         "worker_kind": entry["worker_kind"], "step": entry["step"], "claimed_at": stamp,
+                         "expires_at": entry["expires_at"], "renewals": 0}
     elif kind == "started":
         if before != "dispatched" or not _lease_matches(task, entry) or entry["attempt"] != task["attempts"] + 1:
             raise reject()
@@ -413,7 +416,7 @@ def check_effects(doc, entry, before=None):
         raise reject()
     if lease is not None:
         same = ("task_id", "lease_id", "generation", "expires_at") if spec["lease"] == "renew" else (
-            "task_id", "lease_id", "generation", "expires_at", "step", "worker")
+            "task_id", "lease_id", "generation", "expires_at", "step", "worker", "worker_kind")
         if any(lease[k] != entry.get(k, task_id if k == "task_id" else None) for k in same):
             raise reject()
         if spec["lease"] == "new" and (lease["claimed_at"] != entry["timestamp"] or lease["renewals"] != 0):

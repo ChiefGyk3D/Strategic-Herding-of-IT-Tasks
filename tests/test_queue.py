@@ -727,7 +727,7 @@ class Claims(QueueCase):
         entries.append({**entries[-1], "id": "queue-0003", "timestamp": self.tick(), "kind": "dispatch_failed",
                         "state_after": "ready", "lease_id": lease["lease_id"], "generation": 1,
                         "not_before": at(self.clock + 500)})
-        for key in ("worker", "step", "expires_at"):
+        for key in ("worker", "worker_kind", "step", "expires_at"):
             entries[-1].pop(key)
         (self.shit / "leases" / "t1.json").unlink()
         self.rewrite_queue([json.dumps(e, separators=(",", ":")).encode() for e in entries])
@@ -1570,6 +1570,20 @@ class LogCap(QueueCase):
         with mock.patch.object(log_mod, "MAX_LOG_BYTES", max(self.sizes().values()) + 10):
             self.assertEqual(self.code(q.start, self.proj, self.present(lease), now=self.tick()), 7)
         self.assertEqual(self.snap(), before)
+
+
+class WorkerKindProof(QueueCase):
+    def test_editing_the_worker_kind_of_a_live_lease_is_refused(self):  # L1
+        self.task("t1")
+        self.claim("t1", kind="ai")
+        path = self.shit / "leases" / "t1.json"
+        path.write_text(path.read_text().replace('"worker_kind": "ai"', '"worker_kind": "human"'))
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_the_claim_entry_records_the_worker_kind(self):  # L1
+        self.task("t1")
+        self.claim("t1", kind="script")
+        self.assertEqual(json.loads(self.queue_lines()[-1])["worker_kind"], "script")
 
 
 if __name__ == "__main__":

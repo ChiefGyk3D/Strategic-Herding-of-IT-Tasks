@@ -835,7 +835,7 @@ def claim(project, request, *, now=None, config=None):
                  "claimed_at": ctx.now, "expires_at": _plus(ctx.now, ctx.config["lease_ttl_seconds"]), "renewals": 0}
         _commit(ctx, {"task_id": task_id, "actor": "wrapper", "kind": "claimed", "state_after": "dispatched",
                       "lease_id": lease["lease_id"], "generation": lease["generation"], "worker": worker,
-                      "step": step, "expires_at": lease["expires_at"]}, lease=lease)
+                      "worker_kind": kind, "step": step, "expires_at": lease["expires_at"]}, lease=lease)
         return lease
 
     return _operate(project, now, config, body)
