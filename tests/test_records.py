@@ -72,7 +72,7 @@ class Records(unittest.TestCase):
             {"title": ""}, {"title": "t" * 201}, {"summary": ""}, {"summary": "s" * 4001},
             {"state": "done"}, {"owner": "root"}, {"created_at": "2026-11-26T15:30:00+00:00"},
             {"created_at": "2026-11-26T15:30:00.5Z"}, {"created_at": "2026-13-26T15:30:00Z"},
-            {"updated_at": "2026-11-26T15:29:59Z"}, {"history": "x"}, {"title": "a\ud800"},
+            {"updated_at": "2026-11-26T15:29:59Z"}, {"history": "x"}, {"history": 5}, {"history": {"a": 1}}, {"history": [5]}, {"title": "a\ud800"},
             {"blocked_reason": "why"}, {"extra": 1}, {"schema": "brief"},
         ]
         for over in bad:
