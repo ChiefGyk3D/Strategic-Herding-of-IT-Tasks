@@ -1319,6 +1319,70 @@ class PendingProof(QueueCase):
         self.assertEqual(self.code(self.status), 8)
         self.assertEqual((self.shit / "deps" / "b.json").read_bytes(), shard)
 
+    def test_a_renewal_pending_record_must_equal_the_replayed_lease_plus_one_renewal(self):  # round 2
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        self.crash_at("pending-written", q.renew, self.proj, self.present(lease), now=self.tick())
+        path = self.shit / "queue-pending.json"
+        good = path.read_bytes()
+        changes = {"worker": "w2", "worker_kind": "human", "step": "apply", "claimed_at": at(0), "renewals": 5}
+        for key, value in changes.items():
+            with self.subTest(field=key):
+                doc = json.loads(good)
+                doc["lease"][key] = value
+                path.write_text(json.dumps(doc))
+                before = self.snap()
+                self.assertEqual(self.code(self.status), 8)
+                self.assertEqual(self.snap(), before)  # nothing applied, the record is kept
+                self.assertTrue(path.exists())
+        path.write_bytes(good)
+        self.assertEqual(self.status()["t1"]["state"], "running")  # the genuine record still recovers
+
+    def test_a_lifecycle_reason_in_a_pending_record_must_be_the_fixed_one(self):  # round 2
+        self.task("t1")
+        lease = self.claim("t1")
+        self.crash_at("pending-written", q.start, self.proj, self.present(lease), now=self.tick())
+        path = self.shit / "queue-pending.json"
+        doc = json.loads(path.read_text())
+        doc["lifecycle"]["reason"] = "something else"
+        path.write_text(json.dumps(doc))
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_a_graph_pending_record_with_an_empty_shard_applies_nothing(self):  # round 2
+        self.task("a")
+        self.task("b")
+        data = dep.dump_shard("b", [])
+        entry = {"schema": "queue-entry", "schema_version": 1, "id": f"queue-{len(self.queue_lines()) + 1:04d}",
+                 "timestamp": self.tick(), "message": q.MESSAGE, "task_id": "b", "actor": "human",
+                 "kind": "graph_changed", "shards": [{"task_id": "b", "sha256": hashlib.sha256(data).hexdigest()}]}
+        line = qr.dump_entry(entry)
+        previous = (self.shit / "queue.chain").read_bytes().splitlines()[-1].decode()
+        doc = {"index": len(self.queue_lines()), "entry_line": line.decode(), "chain_line": chain_hash(previous, line),
+               "lease": None, "lease_replaces": None, "remove_lease": None, "lifecycle": None,
+               "shards": [{"task_id": "b", "content": data.decode()}]}
+        (self.shit / "queue-pending.json").write_text(json.dumps(doc))
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_a_corrupt_anchor_is_found_before_recovery_changes_anything(self):  # round 2
+        self.task("a")
+        self.crash_at("pending-written", self.claim, "a")
+        path = self.shit / "queue-anchor.json"
+        for key, value in (("tip", "0" * 64), ("count", 9)):
+            with self.subTest(field=key):
+                good = path.read_bytes()
+                doc = json.loads(good)
+                doc[key] = value
+                path.write_text(json.dumps(doc))
+                before = self.snap()
+                self.assertEqual(self.code(self.status), 8)
+                self.assertEqual(self.snap(), before)
+                path.write_bytes(good)
+        self.assertEqual(self.status()["a"]["state"], "dispatched")
+
     def test_an_unverifiable_pending_record_is_kept_as_evidence(self):  # M1
         self.task("t1")
         lease = self.claim("t1")

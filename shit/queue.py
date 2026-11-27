@@ -188,7 +188,7 @@ def _read_shard(project, task_id):
         raise
 
 
-def _load_graph(project, entries, tasks):
+def _load_graph(project, entries, tasks, overrides=None):
     """Assemble the graph from its shards, each proven by the chain, then check cycles and dangling edges."""
     proven = {t: d for t, d in qr.graph_digests(entries).items() if d != qr.ABSENT}
     if project.exists(LEGACY_GRAPH):
@@ -201,11 +201,17 @@ def _load_graph(project, entries, tasks):
         if not records.SLUG.fullmatch(task_id):
             raise ShitError(REJECTED)
         present.add(task_id)
+    for task_id, content in (overrides or {}).items():  # a pending commit is judged as if it were already applied
+        if content is None:
+            present.discard(task_id)
+        else:
+            present.add(task_id)
     if present != set(proven) or len(present | set(tasks)) > dep.MAX_TASKS:
         raise ShitError(REJECTED)  # a shard without a chain entry, a proven shard that is gone, or too many task ids
     edges = []
     for task_id in sorted(present):
-        data = _read_shard(project, task_id)
+        data = overrides[task_id].encode("ascii") if overrides and overrides.get(task_id) is not None \
+            else _read_shard(project, task_id)
         if _sha(data) != proven[task_id]:
             raise ShitError(REJECTED)
         try:
@@ -360,7 +366,8 @@ def _check_pending_shards(shards, entry):
             digest = qr.ABSENT
         elif isinstance(content, str) and content.isascii():
             digest = _sha(content.encode("ascii"))
-            dep.load_shard(content.encode("ascii"), task_id)
+            if not dep.load_shard(content.encode("ascii"), task_id)["needs"]:
+                raise ShitError(REJECTED)  # an empty shard is never written
         else:
             raise ShitError(REJECTED)
         if proven.get(task_id) != digest:
@@ -443,7 +450,24 @@ def _apply_pending(project, log, doc, line):
     _checkpoint("pending-removed")
 
 
-def _prove_tail(log, doc, line, entry):
+def _check_anchor_for_pending(project, doc, chain):
+    """The anchor must sit at the pre-commit prefix or already at this exact commit; anything else applies nothing."""
+    index = doc["index"]
+    anchor = _read_anchor(project)
+    if index > len(chain):
+        raise ShitError(REJECTED)
+    previous = GENESIS if index == 0 else chain[index - 1].decode("ascii", "replace")
+    if anchor is None:
+        if index != 0:
+            raise ShitError(REJECTED)
+        return
+    at_prefix = anchor["count"] == index and anchor["tip"] == previous
+    at_commit = anchor["count"] == index + 1 and anchor["tip"] == doc["chain_line"]
+    if not (at_prefix or at_commit):
+        raise ShitError(REJECTED)
+
+
+def _prove_tail(project, log, doc, line, entry):
     """The pending commit must be the next step of the verified chain (or its already-appended last step)."""
     index = doc["index"]
     lines, chain = log._lines(QUEUE), log._lines(CHAIN)
@@ -459,8 +483,22 @@ def _prove_tail(log, doc, line, entry):
             len(chain) == index + 1 and chain[index].decode("ascii", "replace") != doc["chain_line"]):
         raise ShitError(REJECTED)
     tasks = qr.replay(prior)
-    qr.replay([*prior, entry])
-    qr.check_effects(doc, entry, tasks.get(entry["task_id"]))
+    after = qr.replay([*prior, entry])
+    qr.check_effects(doc, entry, tasks.get(entry["task_id"]), after.get(entry["task_id"]))
+    life = doc["lifecycle"]
+    if life is not None:
+        for text in (life["reason"], life["blocked_reason"], life["blocking_item"]):
+            if text is not None:
+                _clean(text)
+        if life["to"] not in qr.LIFECYCLE[after[entry["task_id"]]["state"]]:
+            raise ShitError(REJECTED)
+        current = records.load_task(project.read(task_mod._task_path(life["task_id"])))
+        done = {"from": life["from"], "to": life["to"], "actor": life["actor"], "at": life["at"], "reason": life["reason"]}
+        applied = current["state"] == life["to"] and current["history"] and current["history"][-1] == done
+        if current["state"] != life["from"] and not applied:
+            raise ShitError(REJECTED)
+    if doc["shards"]:
+        _load_graph(project, [*prior, entry], after, {item["task_id"]: item["content"] for item in doc["shards"]})
 
 
 def _recover(project, log):
@@ -476,6 +514,7 @@ def _recover(project, log):
     index = doc["index"]
     lines, torn = log._split(QUEUE)
     chain, chain_torn = log._split(CHAIN)
+    _closed(lambda: _check_anchor_for_pending(project, doc, chain))  # before anything is healed or applied
     try:
         log.heal_torn_tail(QUEUE, lines, torn, index, line + b"\n")
         log.heal_torn_tail(CHAIN, chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
@@ -486,7 +525,7 @@ def _recover(project, log):
         previous = GENESIS if index == 0 else chain[index - 1].decode("ascii", "replace")
         if chain_hash(previous, line) != doc["chain_line"]:
             raise ShitError(REJECTED)
-        _prove_tail(log, doc, line, entry)
+        _prove_tail(project, log, doc, line, entry)
     except ShitError as exc:
         if exc.code == REJECTED:
             raise ShitError(FAILED_CLOSED) from None

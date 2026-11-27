@@ -408,10 +408,15 @@ EFFECTS = {
 }
 
 
-def check_effects(doc, entry, before=None):
+REASONS = {"started": "worker started", "submitted": "work submitted", "failed": "worker reported failure",
+           "held": "blocker identified", "expired": "lease expired"}  # fixed wrapper text; reopen and done carry the caller's
+
+
+def check_effects(doc, entry, before=None, after=None):
     """Raise unless the lease, lifecycle and removal effects of pending `doc` are exactly those `entry` implies.
 
-    `before` is the replayed queue state of the task before the entry, when known."""
+    `before` and `after` are the replayed queue state of the task before and after the entry, when known. With
+    `after`, a lease effect must equal, field for field, the lease the replay says the entry produces."""
     spec = EFFECTS.get(entry["kind"], _NONE)
     task_id = entry["task_id"]
     life, lease = doc["lifecycle"], doc["lease"]
@@ -426,6 +431,10 @@ def check_effects(doc, entry, before=None):
             raise reject()
         if spec["lease"] == "new" and (lease["claimed_at"] != entry["timestamp"] or lease["renewals"] != 0):
             raise reject()
+    if after is not None and lease is not None:
+        expected = expected_lease(task_id, after)
+        if expected is None or {k: lease.get(k) for k in expected} != expected:
+            raise reject()
     allowed = spec["life"]
     if entry["kind"] == "expired" and entry["state_after"] != "failed":
         allowed = ()
@@ -437,6 +446,8 @@ def check_effects(doc, entry, before=None):
     if (life["from"], life["to"], life["actor"]) not in actor_ok or life["at"] != entry["timestamp"]:
         raise reject()
     if (life["to"] == "blocked") != (life["blocked_reason"] is not None and life["blocking_item"] is not None):
+        raise reject()
+    if entry["kind"] in REASONS and life["reason"] != REASONS[entry["kind"]]:
         raise reject()
     if before is not None and life["from"] not in LIFECYCLE[before["state"]]:
         raise reject()
