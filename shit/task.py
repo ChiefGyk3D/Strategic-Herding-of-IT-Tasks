@@ -152,7 +152,8 @@ def create_task(project, *, task_id, title, summary, owner, actor, now=None):
     return _guarded(run)
 
 
-def transition(project, task_id, to, actor, reason, *, now=None, blocked_reason=None, blocking_item=None):
+def transition(project, task_id, to, actor, reason, *, now=None, blocked_reason=None, blocking_item=None,
+               precheck=None):
     now = now or _now()
     path = _task_path(task_id)
     log = EventLog(project)
@@ -165,6 +166,8 @@ def transition(project, task_id, to, actor, reason, *, now=None, blocked_reason=
             if to == "approved" and actor != "human" and (frm, to) in LEGAL:
                 raise ShitError(HUMAN_APPROVAL)
             check_transition(frm, to, actor)
+            if precheck is not None:
+                precheck(current)
             if now < current["updated_at"]:
                 raise ShitError(REJECTED)
             record = {k: v for k, v in current.items() if k not in ("blocked_reason", "blocking_item")}
