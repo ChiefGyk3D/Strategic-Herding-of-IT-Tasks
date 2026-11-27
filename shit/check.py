@@ -19,7 +19,7 @@ import re
 import stat
 
 from . import _cli, brief, config, evidence, records
-from ._text import check_text, decode, open_regular
+from ._text import check_text, decode
 from .errors import (
     CONFINEMENT,
     ILLEGAL_TRANSITION,
@@ -67,14 +67,64 @@ class _Failures:
         return 1 if present else 0
 
 
-def _check_limits(repo, failures):
+_DIR = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0)
+_FILE = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _same(a, b):
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _open_at(repo_fd, rel):
+    """Open a regular, single-link file below the anchored repository descriptor; no symlink is followed."""
+    dfd = os.dup(repo_fd)
+    try:
+        parts = rel.split("/")
+        for part in parts[:-1]:
+            nxt = os.open(part, _DIR | os.O_NOFOLLOW, dir_fd=dfd)
+            os.close(dfd)
+            dfd = nxt
+        fd = os.open(parts[-1], _FILE, dir_fd=dfd)
+    except FileNotFoundError:
+        raise ShitError(PRECONDITION) from None
+    except OSError:
+        raise ShitError(CONFINEMENT) from None
+    finally:
+        os.close(dfd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        os.close(fd)
+        raise ShitError(CONFINEMENT)
+    return fd
+
+
+def _read_at(repo_fd, rel, limit):
+    fd = _open_at(repo_fd, rel)
+    with os.fdopen(fd, "rb") as fh:
+        return fh.read(limit + 1)
+
+
+def _root_unchanged(repo, repo_fd, project, failures):
+    """The repository path, the anchored root and the opened store must still be one tree."""
+    try:
+        ok = (_same(os.stat(repo), os.fstat(repo_fd))
+              and _same(os.stat(".shit", dir_fd=repo_fd, follow_symlinks=False), os.fstat(project._fd)))
+    except OSError:
+        ok = False
+    if not ok:
+        failures.add(CONFINEMENT, "repository", "root changed during check")
+    return ok
+
+
+def _check_limits(repo_fd, failures):
     """Instruction-file bytes and listed-role count against the optional `[limits]` of config.toml.
 
     No config.toml means no limits. Over a limit is a warning, or a failure when on_exceed is "fail".
-    Only fixed file names and fixed words are printed, never file content.
+    Only fixed file names and fixed words are printed, never file content. Every read goes through
+    the repository descriptor opened once at the start of the check.
     """
     try:
-        cfg = config.read(os.path.join(repo, "config.toml"), repo)
+        cfg = config.parse(decode(_read_at(repo_fd, "config.toml", config.MAX_BYTES)))
     except _cli.EXPECTED as exc:
         if _code(exc) != PRECONDITION:  # a missing file is simply "no limits"
             failures.add(_code(exc), "config", "rejected")
@@ -96,7 +146,7 @@ def _check_limits(repo, failures):
         return
     for name in INSTRUCTION_FILES:
         try:
-            fd = open_regular(os.path.join(repo, name), repo)
+            fd = _open_at(repo_fd, name)
         except _cli.EXPECTED as exc:
             if _code(exc) != PRECONDITION:
                 failures.add(_code(exc), name, "instruction file rejected")
@@ -214,7 +264,12 @@ def run_check(repo, task=None):
     """Return (exit code, lines). `task` is a task id or None for every task."""
     if task is not None and not records.SLUG.fullmatch(task):
         raise ShitError(USAGE)
-    project = Project.open(repo)
+    repo_fd = os.open(repo, _DIR)
+    try:
+        project = Project.open(repo)
+    except BaseException:
+        os.close(repo_fd)
+        raise
     try:
         st = os.fstat(project._fd)
         if not stat.S_ISDIR(st.st_mode):
@@ -233,11 +288,14 @@ def run_check(repo, task=None):
             EventLog(project).verify()
         except _cli.EXPECTED as exc:
             failures.add(_code(exc), "events", "log rejected")
-        _check_limits(repo, failures)
+        if _root_unchanged(repo, repo_fd, project, failures):
+            _check_limits(repo_fd, failures)
+            _root_unchanged(repo, repo_fd, project, failures)
         if project.exists("pending.json"):
             failures.add(REJECTED, "store", "unfinished commit; run any task command to recover")
     finally:
         project.close()
+        os.close(repo_fd)
     code = failures.code()
     lines = [line for _, line in failures.items] + failures.warnings
     lines.append(f"check: {'failed' if code else 'ok'} ({len(ids)} task{'s' if len(ids) != 1 else ''})")

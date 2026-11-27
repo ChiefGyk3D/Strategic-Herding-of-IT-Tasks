@@ -280,6 +280,30 @@ class SizeCheck(RepoCase):
         self.assertEqual(code, 5)
         self.assertIn("CLAUDE.md: instruction file rejected", out)
 
+    def test_root_replaced_during_check_is_a_confinement_failure(self):
+        """Review of PR 49: one invocation must not combine records from one tree and limits from another."""
+        self.config("\n[limits]\ninstruction_max_bytes = 1\non_exceed = \"fail\"\n")
+        self.instruction("CLAUDE.md", 50)
+        moved = self.base / "moved"
+        real_verify = check.EventLog.verify
+
+        def swap(log):
+            self.repo.rename(moved)
+            self.repo.mkdir()
+            (self.repo / "config.toml").write_text(
+                CONFIG + "\n[limits]\ninstruction_max_bytes = 1\non_exceed = \"fail\"\n", encoding="utf-8")
+            (self.repo / "CLAUDE.md").write_text("x" * 50, encoding="utf-8")
+            return real_verify(log)
+
+        check.EventLog.verify = swap
+        try:
+            code, out, _ = self.check()
+        finally:
+            check.EventLog.verify = real_verify
+        self.assertEqual(code, 5)
+        self.assertIn("repository: root changed during check", out)
+        self.assertNotIn("instruction file over size limit", out)
+
     def test_limits_are_not_machine_specific_defaults(self):
         from shit import config as cfg
         parsed = cfg.parse(CONFIG)
