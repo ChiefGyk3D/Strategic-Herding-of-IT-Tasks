@@ -20,11 +20,12 @@ For privacy scan findings, output contains only the file path and line number. I
 | 5 | confinement_violation | `confinement violation` | A path escapes its root or encounters a symlink, hard link, FIFO, socket, or device file. |
 | 6 | privacy_hit | `privacy scan hit` | A privacy rule matched; only the file path and line number may be reported. |
 | 7 | input_limit | `input exceeds limit` | A record exceeds the byte-size or nesting-depth limit. |
-| 8 | hook_failed_closed | `hook verification failed` | A hook could not verify its required state and failed closed. For the queue this includes an interrupted queue commit that cannot be proven or a broken event log; the operator procedure is in docs/queue-spec.md, Q-REC-02. |
+| 8 | hook_failed_closed | `hook verification failed` | A hook could not verify its required state and failed closed. For the queue this includes an interrupted queue commit that cannot be proven or a broken event log; the operator procedure is in docs/queue-spec.md, Q-REC-02. For the SQLite store it also covers an unsupported SQLite or Python version, a corrupt or unreadable database, a wrong application id or schema version, a schema fingerprint mismatch and an append-only or no-delete trigger firing (docs/store.md). |
 | 9 | precondition_missing | `precondition missing` | A required record, file, directory, or prior state was not found. |
 | 10 | human_approval_required | `human approval required` | The operation requires an explicit human approval that is absent. |
 | 11 | tool_unavailable | `subprocess or tool unavailable` | An allowed subprocess or required local tool is unavailable or cannot start. |
 | 12 | lease_refused | `lease refused` | Approved by the owner on 2026-11-27 (docs/queue-spec.md, OQ-1). A queue operation presented a missing, wrong, stale, expired or over-renewed lease. |
+| 13 | store_busy | `store busy` | The SQLite store (docs/store.md) could not take its write lock within the configured wait because another process holds it. Nothing was written. The operation is safe to retry. |
 
 ## Per-command exit codes
 

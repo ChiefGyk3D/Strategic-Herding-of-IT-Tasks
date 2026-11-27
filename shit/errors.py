@@ -15,6 +15,7 @@ MESSAGES = {
     9: "precondition missing",
     10: "human approval required",
     12: "lease refused",
+    13: "store busy",
 }
 
 OK = 0
@@ -29,6 +30,8 @@ PRECONDITION = 9
 HUMAN_APPROVAL = 10
 # Approved by the owner on 2026-11-27 (docs/queue-spec.md, OQ-1).
 LEASE_REFUSED = 12
+# The SQLite store could not take its write lock within the configured wait (docs/store.md). Retryable.
+BUSY = 13
 
 
 class ShitError(Exception):

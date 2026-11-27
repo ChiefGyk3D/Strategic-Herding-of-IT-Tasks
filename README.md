@@ -14,6 +14,8 @@ Four roles (implementer, reviewer, researcher, planner) and six packs (review-pr
 
 The dependency graph, durable queue and per-task leases are implemented in `shit/dependencies.py`, `shit/queue.py` and `shit/queue_records.py`. The design is [docs/queue-spec.md](docs/queue-spec.md); what is built, what is deferred and what still needs a human decision is in [docs/queue.md](docs/queue.md).
 
+The SQLite store that will replace the file queue is being built in steps; its foundation (confined connection, schema, fingerprint, error mapping) is `shit/store.py`, described in [docs/store.md](docs/store.md).
+
 ## Contributing
 
 Open an issue describing the change before sending a pull request, and link that issue from the pull request. Every change goes through a pull request; the `CI green` check must pass. Report security problems privately as described in [SECURITY.md](SECURITY.md).
