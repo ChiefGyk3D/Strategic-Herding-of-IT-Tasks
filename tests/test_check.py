@@ -177,5 +177,115 @@ class Check(RepoCase):
         self.assertEqual(self.check()[0], 7)
 
 
+CONFIG = """schema_version = 1
+
+[project]
+name = "example-project"
+
+[tracker]
+repository = "example-owner/example-repo"
+
+[roles]
+names = ["implementer", "reviewer", "researcher", "planner"]
+
+[review]
+destination = "reviewer role, report to the lead"
+
+[storage]
+root = ".shit"
+
+[log]
+file = ".shit/events.jsonl"
+
+[local_model]
+context_tokens = 32768
+"""
+
+
+class SizeCheck(RepoCase):
+    """Issue #45: configurable instruction-file size and role-list size limits."""
+
+    def check(self, *extra):
+        return run_main(check.main, ["--repo", str(self.repo), *extra])
+
+    def config(self, limits=""):
+        (self.repo / "config.toml").write_text(CONFIG + limits, encoding="utf-8")
+
+    def instruction(self, name, size):
+        path = self.repo / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("x" * size, encoding="utf-8")
+
+    def test_no_config_means_no_size_check(self):
+        self.instruction("CLAUDE.md", 100000)
+        self.assertEqual(self.check()[0], 0)
+
+    def test_config_without_limits_passes(self):
+        self.config()
+        self.instruction("CLAUDE.md", 100000)
+        self.assertEqual(self.check()[0], 0)
+
+    def test_within_limits_passes_silently(self):
+        self.config("\n[limits]\ninstruction_max_bytes = 100\nlisted_roles_max = 4\non_exceed = \"fail\"\n")
+        self.instruction("CLAUDE.md", 100)
+        code, out, _ = self.check()
+        self.assertEqual(code, 0)
+        self.assertNotIn("size", out)
+
+    def test_oversize_instruction_warns_by_default_and_exits_zero(self):
+        self.config("\n[limits]\ninstruction_max_bytes = 100\n")
+        self.instruction("AGENTS.md", 101)
+        code, out, _ = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("warning: AGENTS.md: instruction file over size limit", out)
+        self.assertIn("check: ok", out)
+
+    def test_oversize_instruction_fails_in_fail_mode_without_printing_content(self):
+        self.config("\n[limits]\ninstruction_max_bytes = 100\non_exceed = \"fail\"\n")
+        (self.repo / "CLAUDE.md").write_text(SENTINEL * 20, encoding="utf-8")
+        code, out, err = self.check()
+        self.assertEqual(code, 7)
+        self.assertIn("CLAUDE.md: instruction file over size limit", out)
+        self.assertNotIn(SENTINEL, out + err)
+        self.assertIn("check: failed", out)
+
+    def test_nested_instruction_file_is_measured(self):
+        self.config("\n[limits]\ninstruction_max_bytes = 10\non_exceed = \"fail\"\n")
+        self.instruction(".github/copilot-instructions.md", 11)
+        self.assertEqual(self.check()[0], 7)
+
+    def test_too_many_listed_roles(self):
+        self.config("\n[limits]\nlisted_roles_max = 3\non_exceed = \"fail\"\n")
+        code, out, _ = self.check()
+        self.assertEqual(code, 7)
+        self.assertIn("roles: listed roles over limit", out)
+
+    def test_too_many_listed_roles_warns_by_default(self):
+        self.config("\n[limits]\nlisted_roles_max = 3\n")
+        code, out, _ = self.check()
+        self.assertEqual(code, 0)
+        self.assertIn("warning: roles: listed roles over limit", out)
+
+    def test_invalid_config_fails_check(self):
+        self.config("\n[limits]\ninstruction_max_bytes = 0\n")
+        code, out, _ = self.check()
+        self.assertEqual(code, 3)
+        self.assertIn("config: rejected", out)
+
+    def test_symlinked_instruction_file_is_a_confinement_failure(self):
+        self.config("\n[limits]\ninstruction_max_bytes = 100\n")
+        (self.outside / "big.md").write_text("x" * 500, encoding="utf-8")
+        os.symlink(self.outside / "big.md", self.repo / "CLAUDE.md")
+        code, out, _ = self.check()
+        self.assertEqual(code, 5)
+        self.assertIn("CLAUDE.md: instruction file rejected", out)
+
+    def test_limits_are_not_machine_specific_defaults(self):
+        from shit import config as cfg
+        parsed = cfg.parse(CONFIG)
+        self.assertNotIn("instruction_max_bytes", parsed["limits"])
+        self.assertEqual(parsed["limits"]["on_exceed"], "warn")
+
+
 if __name__ == "__main__":
     unittest.main()

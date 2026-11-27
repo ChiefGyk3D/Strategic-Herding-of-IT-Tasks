@@ -18,8 +18,8 @@ import os
 import re
 import stat
 
-from . import _cli, brief, evidence, records
-from ._text import check_text, decode
+from . import _cli, brief, config, evidence, records
+from ._text import check_text, decode, open_regular
 from .errors import (
     CONFINEMENT,
     ILLEGAL_TRANSITION,
@@ -45,12 +45,16 @@ DISPOSITION_KEYS = {
 }
 DISPOSITION_REQUIRED = DISPOSITION_KEYS - {"supersedes_id"}
 _FIELD = re.compile(r"(removed|kept): ?(\S.*)")
+# Instruction files measured when `[limits] instruction_max_bytes` is set (docs/schemas.md). Fixed,
+# vendor-neutral well-known names at the repository root; absent files are skipped.
+INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md", ".github/copilot-instructions.md")
 _ISSUE_LINE = re.compile(r"^issue:", re.MULTILINE)
 
 
 class _Failures:
     def __init__(self):
         self.items = []  # (code, line)
+        self.warnings = []
 
     def add(self, code, task_id, message):
         self.items.append((code, f"{task_id}: {message}"))
@@ -61,6 +65,48 @@ class _Failures:
             if code in present:
                 return code
         return 1 if present else 0
+
+
+def _check_limits(repo, failures):
+    """Instruction-file bytes and listed-role count against the optional `[limits]` of config.toml.
+
+    No config.toml means no limits. Over a limit is a warning, or a failure when on_exceed is "fail".
+    Only fixed file names and fixed words are printed, never file content.
+    """
+    try:
+        cfg = config.read(os.path.join(repo, "config.toml"), repo)
+    except _cli.EXPECTED as exc:
+        if _code(exc) != PRECONDITION:  # a missing file is simply "no limits"
+            failures.add(_code(exc), "config", "rejected")
+        return
+    limits = cfg["limits"]
+    strict = limits["on_exceed"] == "fail"
+
+    def over(name, message):
+        if strict:
+            failures.add(INPUT_LIMIT, name, message)
+        else:
+            failures.warnings.append(f"warning: {name}: {message}")
+
+    roles_max = limits.get("listed_roles_max")
+    if roles_max is not None and len(cfg["roles"]["names"]) > roles_max:
+        over("roles", "listed roles over limit")
+    size_max = limits.get("instruction_max_bytes")
+    if size_max is None:
+        return
+    for name in INSTRUCTION_FILES:
+        try:
+            fd = open_regular(os.path.join(repo, name), repo)
+        except _cli.EXPECTED as exc:
+            if _code(exc) != PRECONDITION:
+                failures.add(_code(exc), name, "instruction file rejected")
+            continue
+        try:
+            size = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        if size > size_max:
+            over(name, "instruction file over size limit")
 
 
 def _code(exc):
@@ -187,12 +233,13 @@ def run_check(repo, task=None):
             EventLog(project).verify()
         except _cli.EXPECTED as exc:
             failures.add(_code(exc), "events", "log rejected")
+        _check_limits(repo, failures)
         if project.exists("pending.json"):
             failures.add(REJECTED, "store", "unfinished commit; run any task command to recover")
     finally:
         project.close()
     code = failures.code()
-    lines = [line for _, line in failures.items]
+    lines = [line for _, line in failures.items] + failures.warnings
     lines.append(f"check: {'failed' if code else 'ok'} ({len(ids)} task{'s' if len(ids) != 1 else ''})")
     return code, lines
 

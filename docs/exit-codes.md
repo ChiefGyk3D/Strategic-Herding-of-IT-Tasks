@@ -83,7 +83,7 @@ For privacy scan findings, output contains only the file path and line number. I
 | `check` | 3 | At least one record was rejected. |
 | `check` | 4 | At least one lifecycle history contains an illegal transition. |
 | `check` | 5 | At least one path or file type violated confinement. |
-| `check` | 7 | At least one record exceeded a size or depth limit. |
+| `check` | 7 | At least one record exceeded a size or depth limit, or `on_exceed = "fail"` limits in `config.toml` were exceeded. |
 | `check` | 9 | A requested check target was not found. |
 | `doctor` | 0 | All local readiness checks passed. |
 | `doctor` | 1 | An unexpected internal failure occurred. |
