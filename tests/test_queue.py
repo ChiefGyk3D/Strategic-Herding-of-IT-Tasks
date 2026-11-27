@@ -93,9 +93,9 @@ class QueueCase(unittest.TestCase):
         return (self.shit / "queue.jsonl").read_bytes().splitlines()
 
     def rewrite_queue(self, lines, anchor=True):
-        """Rewrite queue.jsonl and its chain consistently (what an attacker with write access could do).
+        """Rewrite queue.jsonl and its chain consistently (a writer with full access to the store).
 
-        With `anchor` the anchor file is rewritten to match too: an attacker who can rewrite every queue file at once
+        With `anchor` the anchor file is rewritten to match too: a writer that rewrites every queue file at once
         is the documented unsigned-history residual (docs/threat-model.md); `anchor=False` models the weaker one."""
         previous, chain = GENESIS, []
         for line in lines:
