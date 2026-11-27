@@ -263,6 +263,19 @@ class Project:
         finally:
             self._close(dirfd)
 
+    def ensure_dir(self, name):
+        """Create the single-component directory `name` below the store (mode 0700) if it is absent."""
+        parts = self._split(name)
+        if len(parts) != 1:
+            raise ShitError(CONFINEMENT)
+        try:
+            os.mkdir(name, DIR_MODE, dir_fd=self._fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise _os_error(exc) from None
+        self._close(self._walk(parts))
+
     def exists(self, rel):
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])

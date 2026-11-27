@@ -4,7 +4,8 @@ import json
 import re
 from datetime import datetime
 
-from .errors import INPUT_LIMIT, REJECTED, ShitError
+from ._text import check_text
+from .errors import INPUT_LIMIT, REJECTED, ContractError, ShitError
 from .lifecycle import ACTORS, STATES, check_transition
 
 MAX_RECORD_BYTES = 65536
@@ -122,6 +123,10 @@ def _text(obj, key, maximum=None):
     value = obj.get(key)
     if not isinstance(value, str) or value == "" or (maximum is not None and len(value) > maximum):
         raise _reject()
+    try:
+        check_text(value)  # control, bidi, zero-width and separator characters, as in artifacts.py
+    except ContractError:
+        raise _reject() from None
     return value
 
 
