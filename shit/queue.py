@@ -47,6 +47,7 @@ CHAIN = "queue.chain"
 DEPS = "deps"
 LEGACY_GRAPH = "dependencies.json"  # the pre-shard single file: never written, refused when present
 PENDING = "queue-pending.json"
+ANCHOR = "queue-anchor.json"  # the queue tip and per-task generation high-water marks, kept apart from the queue files
 VIEW = "QUEUE.md"
 LEASES = "leases"
 VIEW_LIMIT = 1 << 20
@@ -110,6 +111,67 @@ def _load_log(project, log):
             raise ShitError(REJECTED)
         entries.append(qr.load_entry(line))
     return entries, lines, chain
+
+
+def _read_anchor(project):
+    """The anchor record, or None when absent. Anything malformed is a rejected record."""
+    try:
+        data = project.read(ANCHOR, limit=records.MAX_RECORD_BYTES)
+    except ShitError as exc:
+        if exc.code == PRECONDITION:
+            return None
+        raise
+    doc = records.parse(data)
+    if not isinstance(doc, dict) or set(doc) != {"schema", "schema_version", "count", "tip", "generations"}:
+        raise ShitError(REJECTED)
+    gens = doc["generations"]
+    if (doc["schema"] != "queue-anchor" or doc["schema_version"] != 1 or type(doc["count"]) is not int
+            or doc["count"] < 0 or not isinstance(doc["tip"], str) or not qr.HEX64.fullmatch(doc["tip"])
+            or not isinstance(gens, dict) or len(gens) > dep.MAX_TASKS):
+        raise ShitError(REJECTED)
+    for task_id, generation in gens.items():
+        if not records.SLUG.fullmatch(task_id) or type(generation) is not int or generation < 1:
+            raise ShitError(REJECTED)
+    return doc
+
+
+def _check_anchor(project, entries, chain, tasks):
+    """The queue must end exactly where the anchor says, and no task's generation may be below its high-water mark."""
+    anchor = _read_anchor(project)
+    tip = chain[-1].decode("ascii") if chain else GENESIS
+    if anchor is None:
+        if entries:
+            raise ShitError(REJECTED)
+        return
+    if anchor["count"] != len(entries) or anchor["tip"] != tip:
+        raise ShitError(REJECTED)
+    held = {t: v["generation"] for t, v in tasks.items() if v["generation"]}
+    if anchor["generations"] != held:
+        raise ShitError(REJECTED)
+
+
+def _write_anchor(project, doc, entry, chain):
+    """Advance the anchor by exactly this commit. Idempotent: an anchor already at this commit is kept."""
+    index = doc["index"]
+    current = _read_anchor(project)
+    if current is not None and current["count"] == index + 1:
+        if current["tip"] != doc["chain_line"]:
+            raise ShitError(REJECTED)
+        return
+    previous = GENESIS if index == 0 else chain[index - 1].decode("ascii")
+    if current is None:
+        if index != 0:
+            raise ShitError(REJECTED)
+        current = {"count": 0, "tip": GENESIS, "generations": {}}
+    if current["count"] != index or current["tip"] != previous:
+        raise ShitError(REJECTED)
+    generations = dict(current["generations"])
+    if entry["kind"] == "claimed":
+        generations[entry["task_id"]] = entry["generation"]
+    new = {"schema": "queue-anchor", "schema_version": 1, "count": index + 1, "tip": doc["chain_line"],
+           "generations": generations}
+    project.write_atomic(ANCHOR, json.dumps(new, sort_keys=True, ensure_ascii=True).encode("ascii"),
+                         limit=records.MAX_RECORD_BYTES)
 
 
 def _task_exists(project, task_id):
@@ -178,6 +240,7 @@ def _load(project, log):
     def run():
         entries, lines, chain = _load_log(project, log)
         tasks = qr.replay(entries)
+        _check_anchor(project, entries, chain, tasks)
         graph = _load_graph(project, entries)
         _check_agreement(project, tasks)
         return State(entries, lines, chain, tasks, graph)
@@ -368,6 +431,8 @@ def _apply_pending(project, log, doc, line):
     _checkpoint("entry-appended")
     _append_one(project, CHAIN, log._lines(CHAIN), index, doc["chain_line"].encode("ascii"))
     _checkpoint("chain-appended")
+    _write_anchor(project, doc, qr.load_entry(line), log._lines(CHAIN))
+    _checkpoint("anchor-written")
     project.remove(PENDING)
     _checkpoint("pending-removed")
 

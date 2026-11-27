@@ -92,14 +92,26 @@ class QueueCase(unittest.TestCase):
     def queue_lines(self):
         return (self.shit / "queue.jsonl").read_bytes().splitlines()
 
-    def rewrite_queue(self, lines):
-        """Rewrite queue.jsonl and its chain consistently (what an attacker with write access could do)."""
+    def rewrite_queue(self, lines, anchor=True):
+        """Rewrite queue.jsonl and its chain consistently (what an attacker with write access could do).
+
+        With `anchor` the anchor file is rewritten to match too: an attacker who can rewrite every queue file at once
+        is the documented unsigned-history residual (docs/threat-model.md); `anchor=False` models the weaker one."""
         previous, chain = GENESIS, []
         for line in lines:
             previous = chain_hash(previous, line)
             chain.append(previous.encode())
         (self.shit / "queue.jsonl").write_bytes(b"".join(line + b"\n" for line in lines))
         (self.shit / "queue.chain").write_bytes(b"".join(c + b"\n" for c in chain))
+        if anchor:
+            try:
+                held = {t: v["generation"] for t, v in qr.replay([qr.load_entry(x) for x in lines]).items()
+                        if v["generation"]}
+            except ShitError:
+                held = {}
+            doc = {"schema": "queue-anchor", "schema_version": 1, "count": len(lines), "tip": previous,
+                   "generations": held}
+            (self.shit / "queue-anchor.json").write_text(json.dumps(doc))
 
 
 class Flow(QueueCase):
@@ -534,7 +546,7 @@ class GraphOperations(QueueCase):
 
 class GraphCrash(QueueCase):
     STAGES = ("pending-written", "lease-applied", "lifecycle-applied", "shards-applied", "entry-appended",
-              "chain-appended", "pending-removed")
+              "chain-appended", "anchor-written", "pending-removed")
 
     class Crash(Exception):
         pass
@@ -1117,7 +1129,7 @@ class Hostile(QueueCase):
 
 
 class CrashRecovery(QueueCase):
-    STAGES = ("pending-written", "lease-applied", "lifecycle-applied", "entry-appended", "chain-appended",
+    STAGES = ("pending-written", "lease-applied", "lifecycle-applied", "entry-appended", "chain-appended", "anchor-written",
               "pending-removed")
 
     class Crash(Exception):
@@ -1414,6 +1426,46 @@ class PublicationWindow(QueueCase):
         self.claim("t1")
         os.link(self.shit / "leases" / "t1.json", self.shit / "leases" / "t1-copy.json")
         self.assertEqual(self.code(self.status), 5)
+
+
+class TipAnchor(QueueCase):
+    """The queue tip and each task's generation high-water mark are anchored apart from the queue files."""
+
+    def test_restoring_an_earlier_consistent_prefix_is_refused(self):  # H3
+        self.task("t1")
+        prefix = {n: (self.shit / n).read_bytes() for n in ("queue.jsonl", "queue.chain")}
+        first = self.claim("t1")
+        for name, data in prefix.items():
+            (self.shit / name).write_bytes(data)
+        self.assertEqual(self.code(self.status), 8)
+        self.assertTrue((self.shit / "leases" / "t1.json").exists())  # the lease is not removed as an orphan
+        self.assertEqual(self.code(self.claim, "t1"), 8)
+        self.assertEqual(first["generation"], 1)
+
+    def test_a_missing_anchor_over_a_nonempty_queue_is_refused(self):  # H3
+        self.task("t1")
+        (self.shit / "queue-anchor.json").unlink()
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_an_anchor_that_disagrees_with_the_queue_is_refused(self):  # H3
+        self.task("t1")
+        path = self.shit / "queue-anchor.json"
+        doc = json.loads(path.read_text())
+        doc["tip"] = "0" * 64
+        path.write_text(json.dumps(doc))
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_a_crash_before_the_anchor_is_written_recovers(self):  # Q-REC-01
+        self.task("a")
+
+        def crash(stage):
+            if stage == "chain-appended":
+                raise PendingProof.Crash
+
+        with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(PendingProof.Crash):
+            self.claim("a")
+        self.assertEqual(self.status()["a"]["state"], "dispatched")
+        self.assertEqual(json.loads((self.shit / "queue-anchor.json").read_text())["generations"], {"a": 1})
 
 
 if __name__ == "__main__":
