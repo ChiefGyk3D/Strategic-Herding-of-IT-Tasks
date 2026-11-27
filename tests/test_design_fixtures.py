@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 STATES = ["open", "running", "review", "approved", "closed", "blocked", "failed"]
-ROW = re.compile(r"^\| (\w+) \| (\w+) \| (legal|illegal) \| [^|]+\| [^|]+\|$", re.M)
+ROW = re.compile(r"^\| (\w+) \| (\w+) \| (legal|illegal) \| [^|]+\| [^|]+\|$", re.MULTILINE)
 
 
 def strict_load(text):
@@ -60,7 +60,7 @@ class TransitionTableTests(unittest.TestCase):
 class ExitCodeTests(unittest.TestCase):
     def test_shared_codes_are_unique_and_contiguous(self):
         text = (ROOT / "docs" / "exit-codes.md").read_text(encoding="utf-8")
-        codes = [int(m) for m in re.findall(r"^\| (\d+) \| \w+ \| `", text, re.M)]
+        codes = [int(m) for m in re.findall(r"^\| (\d+) \| \w+ \| `", text, re.MULTILINE)]
         self.assertEqual(codes, list(range(len(codes))))
         self.assertGreaterEqual(len(codes), 12)
 
