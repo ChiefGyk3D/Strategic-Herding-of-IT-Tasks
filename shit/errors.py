@@ -1,4 +1,8 @@
-"""Stable exit codes from docs/exit-codes.md. Errors carry only a code and its fixed message."""
+"""Stable exit codes from docs/exit-codes.md, as two error types.
+
+ShitError (storage, log, lifecycle) carries a code and its fixed message. ContractError (contract
+validation) carries a code and a fixed message plus a field name, never the rejected value.
+"""
 
 MESSAGES = {
     1: "internal error",
@@ -29,3 +33,18 @@ class ShitError(Exception):
         super().__init__(MESSAGES[code])
         self.code = code
         self.message = MESSAGES[code]
+
+RECORD_REJECTED = 3
+CONFINEMENT_VIOLATION = 5
+INPUT_LIMIT = 7
+PRECONDITION_MISSING = 9
+
+
+class ContractError(ValueError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def rejected(message):
+    return ContractError(RECORD_REJECTED, message)
