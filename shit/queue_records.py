@@ -276,7 +276,8 @@ def _step(task, entry, before):
             lease = task["lease"]
             if entry["worker"] != lease["worker"] or entry["step"] != lease["step"] or entry["expires_at"] <= lease["expires_at"]:
                 raise reject()
-            if (_seconds(entry["expires_at"], lease["expires_at"]) > MAX_TTL
+            if (stamp >= lease["expires_at"] or _seconds(entry["expires_at"], stamp) > MAX_TTL
+                    or _seconds(entry["expires_at"], lease["expires_at"]) > MAX_TTL
                     or _seconds(entry["expires_at"], lease["claimed_at"]) > MAX_LIFETIME
                     or lease["renewals"] + 1 > MAX_RENEWALS):
                 raise reject()

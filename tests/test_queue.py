@@ -1521,6 +1521,34 @@ class ReplayCeilings(QueueCase):
         with self.assertRaises(ShitError):
             qr.replay(entries)
 
+    def test_a_renewal_longer_than_the_ttl_ceiling_from_its_own_time_is_refused(self):  # M2
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        q.renew(self.proj, self.present(lease), now=self.tick())
+        entries = self.entries()
+        previous = entries[-2]["expires_at"] if entries[-2]["kind"] != "started" else entries[-3]["expires_at"]
+        entries[-1]["timestamp"] = at(self.clock)
+        entries[-1]["expires_at"] = at(self.clock + 86401)  # within the old expiry plus a TTL, past the entry's own ceiling
+        self.assertLess(previous, entries[-1]["expires_at"])
+        with self.assertRaises(ShitError):
+            qr.replay(entries)
+
+    def test_a_renewal_recorded_after_the_lease_expired_is_refused(self):  # M2
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        entries = self.entries()
+        expiry = max(e["expires_at"] for e in entries if "expires_at" in e)
+        late = {**entries[-1], "id": f"queue-{len(entries) + 1:04d}", "kind": "renewed", "state_after": "running",
+                "worker": lease["worker"], "step": lease["step"], "lease_id": lease["lease_id"],
+                "generation": lease["generation"], "timestamp": expiry,
+                "expires_at": (datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ") + timedelta(seconds=60)).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")}
+        for key in ("attempt", "worker_kind"):
+            late.pop(key, None)
+        with self.assertRaises(ShitError):
+            qr.replay([*entries, late])
+        qr.replay([*entries, {**late, "timestamp": at(self.clock)}])  # positive control: the same renewal in time
+
     def test_a_lease_file_with_an_impossible_lifetime_is_rejected(self):  # M2
         self.task("t1")
         lease = self.claim("t1")
