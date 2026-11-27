@@ -1391,5 +1391,30 @@ class ClockOrder(QueueCase):
             self.assertEqual(self.code(log.prepare, stale), 3)
 
 
+class PublicationWindow(QueueCase):
+    def test_a_process_killed_between_link_and_unlink_is_recovered(self):  # H7
+        self.task("t1")
+        script = (
+            "import os, sys; sys.path.insert(0, sys.argv[1]);"
+            "from shit import queue as q; from shit.project import Project;"
+            "p = Project.open(sys.argv[2]);"
+            "os.unlink = lambda *a, **k: os._exit(9);"  # die right after the link, before the temp name is removed
+            "q.claim(p, {'task_id': 't1', 'step': 'draft', 'worker': 'w', 'worker_kind': 'ai'}, now=sys.argv[3])")
+        done = subprocess.run([sys.executable, "-I", "-c", script, str(ROOT), str(self.repo), at(100)], timeout=60)
+        self.assertEqual(done.returncode, 9)
+        leases = self.shit / "leases"
+        self.assertEqual((leases / "t1.json").stat().st_nlink, 2)
+        self.assertEqual(self.status(now=at(101))["t1"]["state"], "dispatched")
+        self.assertEqual(self.status(now=at(102))["t1"]["state"], "dispatched")
+        self.assertEqual(os.listdir(leases), ["t1.json"])
+        self.assertEqual((leases / "t1.json").stat().st_nlink, 1)
+
+    def test_an_unrelated_second_link_to_a_lease_is_still_refused(self):  # H7 negative: only an exact temp pair heals
+        self.task("t1")
+        self.claim("t1")
+        os.link(self.shit / "leases" / "t1.json", self.shit / "leases" / "t1-copy.json")
+        self.assertEqual(self.code(self.status), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

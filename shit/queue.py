@@ -567,6 +567,7 @@ def _operate(project, now, config, body):
         with project.locked(LOCK_TIMEOUT):
             project.ensure_dir(LEASES)
             project.ensure_dir(DEPS)
+            project.finish_publications(LEASES)
             _recover(project, log)
             ctx = _Ctx(project, log, now, config)
             state = ctx.load()

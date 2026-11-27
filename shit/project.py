@@ -398,6 +398,47 @@ class Project:
                     os.unlink(tmp, dir_fd=dirfd)
             self._close(dirfd)
 
+    def finish_publications(self, name):
+        """Finish an exclusive publication interrupted between its link and its unlink.
+
+        Only an exact pair is touched: a `.tmp-` name that is a regular file with two links whose other link is
+        a sibling in the same directory. Anything else keeps the ordinary link rejection. Caller holds the lock.
+        """
+        parts = self._split(name)
+        if len(parts) != 1:
+            raise ShitError(CONFINEMENT)
+        fd = self._walk(parts)
+        try:
+            names = os.listdir(fd)
+            temps = [n for n in names if n.startswith(".tmp-")]
+            if not temps:
+                return
+            seen = {}
+            for entry in names:
+                try:
+                    st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_nlink == 2:
+                    seen.setdefault((st.st_dev, st.st_ino), []).append(entry)
+            for tmp in temps:
+                pair = [n for n in seen.get(self._ident(fd, tmp), []) if n != tmp]
+                if len(seen.get(self._ident(fd, tmp), [])) == 2 and len(pair) == 1 and not pair[0].startswith(".tmp-"):
+                    os.unlink(tmp, dir_fd=fd)
+                    os.fsync(fd)
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            self._close(fd)
+
+    @staticmethod
+    def _ident(fd, name):
+        try:
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return (st.st_dev, st.st_ino)
+
     def exists(self, rel):
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])
