@@ -1,0 +1,27 @@
+{
+  "schema": "task",
+  "schema_version": 1,
+  "id": "bad-transition-task",
+  "title": "Illegal closed to open transition",
+  "summary": "The current state is open, but the history attempts to leave terminal state closed.",
+  "state": "open",
+  "owner": "human",
+  "created_at": "2026-11-26T15:30:00Z",
+  "updated_at": "2026-11-26T16:00:00Z",
+  "history": [
+    {
+      "from": "approved",
+      "to": "closed",
+      "actor": "human",
+      "at": "2026-11-26T15:50:00Z",
+      "reason": "Approved work was closed."
+    },
+    {
+      "from": "closed",
+      "to": "open",
+      "actor": "human",
+      "at": "2026-11-26T16:00:00Z",
+      "reason": "This transition is illegal because closed is terminal."
+    }
+  ]
+}

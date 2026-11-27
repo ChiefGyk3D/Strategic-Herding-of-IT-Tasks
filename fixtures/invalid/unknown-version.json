@@ -1,0 +1,12 @@
+{
+  "schema": "task",
+  "schema_version": 99,
+  "id": "unknown-version-task",
+  "title": "Unknown schema version",
+  "summary": "This record has a valid task shape but an unsupported schema version.",
+  "state": "open",
+  "owner": "human",
+  "created_at": "2026-11-26T15:30:00Z",
+  "updated_at": "2026-11-26T15:30:00Z",
+  "history": []
+}
