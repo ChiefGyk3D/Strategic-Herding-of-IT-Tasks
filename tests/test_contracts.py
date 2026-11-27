@@ -505,12 +505,11 @@ class TemplateTests(unittest.TestCase):
             self.assertRegex(text, rf"(?m)^(.*   )?{re.escape(label)}: ", label)
         self.assertEqual(code_of(evidence.validate_header, text), 3)
 
-    def test_handoff_and_decision_templates_carry_the_schema_vocabulary(self):
-        handoff = (TEMPLATES / "handoff.md").read_text(encoding="utf-8")
-        self.assertIn("Approval status", handoff)
-        decision = (TEMPLATES / "decision.md").read_text(encoding="utf-8")
-        for word in ("proposed", "accepted", "rejected", "superseded", "actor", "question", "choice", "rationale"):
-            self.assertIn(word, decision.lower())
+    def test_handoff_template_states_that_approval_is_not_a_file_claim(self):
+        # Field alignment and the filled-template round trip live in test_decision_handoff.py.
+        text = (TEMPLATES / "handoff.md").read_text(encoding="utf-8")
+        self.assertIn("approval:", text)
+        self.assertIn("never a line in a file", text)
 
     def test_templates_need_no_vendor_specific_field(self):
         checked = 0
