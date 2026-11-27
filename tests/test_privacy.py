@@ -224,9 +224,11 @@ class DenyPathResolution(Scan):
                 self.outside.symlink_to(self.repo)
             return real_open(name, *args, **kw)
 
-        with mock.patch.object(privacy.os, "open", swap):
-            with self.assertRaises(privacy.ShitError) as ctx:
-                privacy.load_deny(str(path), str(self.repo))
+        with (
+            mock.patch.object(privacy.os, "open", swap),
+            self.assertRaises(privacy.ShitError) as ctx,
+        ):
+            privacy.load_deny(str(path), str(self.repo))
         self.assertEqual(swapped, [1])
         self.assertEqual(ctx.exception.code, privacy.CONFINEMENT)
 
