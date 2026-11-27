@@ -1,0 +1,13 @@
+{
+  "schema": "report",
+  "schema_version": 1,
+  "id": "schema-design-report",
+  "task_id": "schema-design",
+  "created_at": "2026-11-26T16:00:00Z",
+  "actor": "model",
+  "outcome": "success",
+  "summary": "The version 1 design documents and fixtures were drafted.",
+  "evidence_ids": [
+    "schema-fixture-check"
+  ]
+}

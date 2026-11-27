@@ -1,0 +1,2 @@
+{"schema":"event-log","schema_version":1,"id":"event-0001","task_id":"schema-design","timestamp":"2026-11-26T15:30:00Z","actor":"human","event":"task_created","message":"Task record created.","record_id":"schema-design"}
+{"schema":"event-log","schema_version":1,"id":"event-0002","task_id":"schema-design","timestamp":"2026-11-26T15:31:00Z","actor":"human","event":"brief_recorded","message":"Brief record added.","record_id":"schema-design-brief"}

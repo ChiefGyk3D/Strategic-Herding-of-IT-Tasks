@@ -1,0 +1,18 @@
+{
+  "schema": "brief",
+  "schema_version": 1,
+  "id": "schema-design-brief",
+  "task_id": "schema-design",
+  "created_at": "2026-11-26T15:31:00Z",
+  "actor": "human",
+  "objective": "Specify stable version 1 record contracts.",
+  "scope": [
+    "Document task, brief, report, decision, and event-log records."
+  ],
+  "constraints": [
+    "Design only.",
+    "Use the Python standard library for later implementation."
+  ],
+  "cleanup_duty": "Remove only temporary artifacts created for this task.",
+  "local_llm": "used"
+}
