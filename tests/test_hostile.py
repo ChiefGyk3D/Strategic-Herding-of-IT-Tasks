@@ -18,6 +18,7 @@ import unittest
 from pathlib import Path
 
 import _netguard
+from _bootstrap import make_git_dir
 
 from shit import cli_tasks, commands, records
 from shit import task as task_mod
@@ -54,7 +55,7 @@ class Hostile(unittest.TestCase):
         base = Path(self._tmp.name).resolve()
         self.repo = base / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
         self.outside = base / "outside"
         self.outside.mkdir()
         self.secret = self.outside / "secret.txt"
@@ -619,7 +620,7 @@ class NetworkDenial(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name).resolve() / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
         self.before = len(GUARD.attempts)
 
     def cli(self, *argv):
