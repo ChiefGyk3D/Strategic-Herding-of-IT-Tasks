@@ -114,7 +114,9 @@ def load_deny(path, repo):
     if os.path.commonpath([root, real]) == root:
         raise ShitError(CONFINEMENT)
     try:
-        fd = open_regular(path)
+        # The deny file lives outside the repository, so it is opened below its own parent
+        # directory, named explicitly. The default base (the working directory) stays narrow.
+        fd = open_regular(path, os.path.dirname(os.path.join(os.getcwd(), os.fspath(path))))
     except _cli.EXPECTED as exc:
         raise ShitError(_cli.error_code(exc)) from None
     try:
