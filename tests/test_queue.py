@@ -438,9 +438,10 @@ class GraphOperations(QueueCase):
     def test_malformed_graph_changed_entries_are_refused(self):
         self.task("a")
         self.task("b")
+        self.task("c", enqueue=False)
         digests = {}
-        for tid in ("a", "b"):  # real, empty shards, so only the entry's own shape can make a case fail
-            data = dep.dump_shard(tid, [])
+        for tid in ("a", "b"):  # real shards, so only the entry's own shape can make a case fail
+            data = dep.dump_shard(tid, [{"needs_id": "c", "type": "apply"}])
             (self.shit / "deps" / f"{tid}.json").write_bytes(data)
             digests[tid] = hashlib.sha256(data).hexdigest()
         digest = digests["a"]
@@ -1612,6 +1613,27 @@ class WorkerKindProof(QueueCase):
         self.task("t1")
         self.claim("t1", kind="script")
         self.assertEqual(json.loads(self.queue_lines()[-1])["worker_kind"], "script")
+
+
+class GraphPopulation(QueueCase):
+    def test_the_task_cap_covers_queued_tasks_and_shard_owners_together(self):  # L2
+        for tid in ("a", "b", "c"):
+            self.task(tid, enqueue=False)
+        with mock.patch.object(dep, "MAX_TASKS", 2):
+            q.enqueue(self.proj, "a", "human", now=self.tick())
+            q.add_edge(self.proj, "b", "c", "draft", "human", now=self.tick())
+            self.assertEqual(self.code(q.enqueue, self.proj, "c", "human", now=self.tick()), 7)
+            self.assertEqual(self.code(q.add_edge, self.proj, "c", "a", "draft", "human", now=self.tick()), 7)
+
+    def test_a_persisted_empty_shard_is_refused(self):  # L2
+        self.task("t1")
+        data = dep.dump_shard("ghost", [])
+        entry = {"schema": "queue-entry", "schema_version": 1, "id": "queue-0002", "timestamp": self.tick(),
+                 "message": q.MESSAGE, "task_id": "ghost", "actor": "human", "kind": "graph_changed",
+                 "shards": [{"task_id": "ghost", "sha256": hashlib.sha256(data).hexdigest()}]}
+        self.rewrite_queue([*self.queue_lines(), qr.dump_entry(entry)])
+        (self.shit / "deps" / "ghost.json").write_bytes(data)
+        self.assertEqual(self.code(self.status), 8)
 
 
 if __name__ == "__main__":

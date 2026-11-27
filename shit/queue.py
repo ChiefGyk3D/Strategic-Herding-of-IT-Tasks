@@ -188,7 +188,7 @@ def _read_shard(project, task_id):
         raise
 
 
-def _load_graph(project, entries):
+def _load_graph(project, entries, tasks):
     """Assemble the graph from its shards, each proven by the chain, then check cycles and dangling edges."""
     proven = {t: d for t, d in qr.graph_digests(entries).items() if d != qr.ABSENT}
     if project.exists(LEGACY_GRAPH):
@@ -201,8 +201,8 @@ def _load_graph(project, entries):
         if not records.SLUG.fullmatch(task_id):
             raise ShitError(REJECTED)
         present.add(task_id)
-    if present != set(proven) or len(present) > dep.MAX_TASKS:
-        raise ShitError(REJECTED)  # a shard without a chain entry, or a proven shard that is gone
+    if present != set(proven) or len(present | set(tasks)) > dep.MAX_TASKS:
+        raise ShitError(REJECTED)  # a shard without a chain entry, a proven shard that is gone, or too many task ids
     edges = []
     for task_id in sorted(present):
         data = _read_shard(project, task_id)
@@ -214,6 +214,8 @@ def _load_graph(project, entries):
             if exc.code == INPUT_LIMIT:
                 raise ShitError(REJECTED) from None
             raise
+        if not shard["needs"]:
+            raise ShitError(REJECTED)  # an empty shard is never written: its owner would be a task with no record
         edges.extend(dep.edges_of(task_id, shard["needs"]))
     graph = dep.validate_graph({**dep.empty_graph(), "edges": edges})
     if dep.find_cycle(edges):
@@ -242,7 +244,7 @@ def _load(project, log):
         entries, lines, chain = _load_log(project, log)
         tasks = qr.replay(entries)
         _check_anchor(project, entries, chain, tasks)
-        graph = _load_graph(project, entries)
+        graph = _load_graph(project, entries, tasks)
         _check_agreement(project, tasks)
         return State(entries, lines, chain, tasks, graph)
 
@@ -721,8 +723,15 @@ def _task_id(value):
     return value
 
 
+def _check_population(state, owners, extra=()):
+    """Queued task ids and shard owners together never exceed the documented task cap."""
+    if len({*state.tasks, *owners, *extra}) > dep.MAX_TASKS:
+        raise ShitError(INPUT_LIMIT)
+
+
 def _graph_commit(ctx, state, graph, actor):
     """Write the shards that differ between the loaded graph and `graph`, with one chain entry covering them all."""
+    _check_population(state, {edge["task_id"] for edge in graph["edges"]})
     old, new = dep.group_by_task(state.graph["edges"]), dep.group_by_task(graph["edges"])
     changed = sorted(t for t in {*old, *new} if old.get(t) != new.get(t))
     shards, proof = [], []
@@ -783,8 +792,7 @@ def enqueue(project, task_id, actor, *, now=None, config=None):
         if task_id in state.tasks or any(e["task_id"] == task_id and e["kind"] != "graph_changed"
                                          for e in state.entries):
             raise ShitError(REJECTED)
-        if len(state.tasks) >= dep.MAX_TASKS:
-            raise ShitError(INPUT_LIMIT)  # the documented cap on queued tasks
+        _check_population(state, {edge["task_id"] for edge in state.graph["edges"]}, (task_id,))
         current = records.load_task(project.read(task_mod._task_path(task_id)))
         if current["state"] != "open":
             raise ShitError(ILLEGAL_TRANSITION)
