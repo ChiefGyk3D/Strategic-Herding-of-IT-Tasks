@@ -8,7 +8,6 @@ device is refused with exit code 5. Writes replace the file atomically in the sa
 import contextlib
 import errno
 import fcntl
-import hashlib
 import os
 import secrets
 import stat
@@ -17,7 +16,6 @@ from pathlib import Path
 
 from .errors import (
     CONFINEMENT,
-    FAILED_CLOSED,
     INPUT_LIMIT,
     INTERNAL,
     PRECONDITION,
@@ -470,59 +468,6 @@ class Project:
             for tmp, _sibling in pairs:
                 os.unlink(tmp, dir_fd=fd)
             os.fsync(fd)
-        except OSError:
-            raise ShitError(INTERNAL) from None
-        finally:
-            self._close(fd)
-
-    def quarantine_move(self, rel, dest_dir, expect_sha256, prefix):
-        """Move the regular single-link file `rel` into the single-component directory `dest_dir` by one rename.
-
-        The file is the same inode afterwards, and the move is refused (exit code 8) unless the file still has the
-        digest `expect_sha256` the caller proved, so a replacement swapped in after that proof is left alone.
-        Returns the new name. The check and the rename are separate system calls: a process that ignores the
-        advisory lock can still swap in the narrow gap between them (documented residual)."""
-        parts = self._split(rel)
-        dest = self._split(dest_dir)
-        if len(dest) != 1:
-            raise ShitError(CONFINEMENT)
-        before = self._read_identity(parts)
-        if hashlib.sha256(before[1]).hexdigest() != expect_sha256:
-            raise ShitError(FAILED_CLOSED)
-        src_fd = self._walk(parts[:-1])
-        dst_fd = self._walk(dest)
-        try:
-            name = f"{prefix}-{secrets.token_hex(8)}.json"
-            st = self._stat_leaf(src_fd, parts[-1])
-            if st is None or (st.st_dev, st.st_ino) != before[0] or self._stat_leaf(dst_fd, name) is not None:
-                raise ShitError(FAILED_CLOSED)
-            os.rename(parts[-1], name, src_dir_fd=src_fd, dst_dir_fd=dst_fd)
-            os.fsync(dst_fd)
-            os.fsync(src_fd)
-            return name
-        except OSError:
-            raise ShitError(INTERNAL) from None
-        finally:
-            self._close(src_fd)
-            self._close(dst_fd)
-
-    def _read_identity(self, parts, limit=4 * DEFAULT_LIMIT):
-        """((dev, ino), bytes) of a regular file, read through one descriptor."""
-        dirfd = self._walk(parts[:-1])
-        try:
-            try:
-                fd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC, dir_fd=dirfd)
-            except OSError as exc:
-                raise _os_error(exc) from None
-        finally:
-            self._close(dirfd)
-        try:
-            st = os.fstat(fd)
-            self._check_regular(st)
-            data = os.read(fd, limit + 1)
-            if len(data) > limit:
-                raise ShitError(INPUT_LIMIT)
-            return (st.st_dev, st.st_ino), data
         except OSError:
             raise ShitError(INTERNAL) from None
         finally:

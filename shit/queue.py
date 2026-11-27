@@ -48,7 +48,6 @@ CHAIN = "queue.chain"
 DEPS = "deps"
 LEGACY_GRAPH = "dependencies.json"  # the pre-shard single file: never written, refused when present
 PENDING = "queue-pending.json"
-QUARANTINE = "quarantine"  # refused pending records are kept here, never deleted without a copy
 ANCHOR = "queue-anchor.json"  # the queue tip and per-task generation high-water marks, kept apart from the queue files
 VIEW = "QUEUE.md"
 LEASES = "leases"
@@ -243,11 +242,13 @@ def _load_graph(project, entries, tasks, overrides=None):
     return graph
 
 
-def _check_agreement(project, tasks):
-    """Every queued task's lifecycle state must be one the queue state allows (Q-ST-01, Q-REC-04, Q-RES-02)."""
+def _check_agreement(project, tasks, overrides=None):
+    """Every queued task's lifecycle state must be one the queue state allows (Q-ST-01, Q-REC-04, Q-RES-02).
+
+    `overrides` maps a task id to the task image a proven, not yet applied task commit would write."""
     for task_id, queued in tasks.items():
         try:
-            current = records.load_task(project.read(task_mod._task_path(task_id)))
+            current = (overrides or {}).get(task_id) or records.load_task(project.read(task_mod._task_path(task_id)))
         except ShitError as exc:
             if exc.code in (PRECONDITION, REJECTED):
                 raise ShitError(REJECTED) from None
@@ -256,13 +257,13 @@ def _check_agreement(project, tasks):
             raise ShitError(REJECTED)
 
 
-def _load(project, log):
+def _load(project, log, overrides=None):
     def run():
         entries, lines, chain = _load_log(project, log)
         tasks = qr.replay(entries)
         _check_anchor(project, entries, chain, tasks)
         graph = _load_graph(project, entries, tasks)
-        _check_agreement(project, tasks)
+        _check_agreement(project, tasks, overrides)
         by_task = {}
         for edge in graph["edges"]:
             by_task.setdefault(edge["task_id"], []).append(edge)  # indexed once: readiness never rescans every edge
@@ -319,6 +320,16 @@ def _effective(state, met, task_id):
 
 
 def _read_pending(project, log):
+    """Parse and validate the pending record from its own bytes. Every failure, a size limit included, is a rejection."""
+    try:
+        return _read_pending_checked(project, log)
+    except ShitError as exc:
+        if exc.code == INPUT_LIMIT:
+            raise ShitError(REJECTED) from None
+        raise
+
+
+def _read_pending_checked(project, log):
     try:
         doc = json.loads(project.read(PENDING, limit=PENDING_LIMIT).decode("utf-8"), object_pairs_hook=records._pairs)
     except (UnicodeDecodeError, ValueError, RecursionError):
@@ -619,9 +630,8 @@ def _refusing(fn):
         raise
 
 
-def _plan_recovery(project, log):
-    """Prove the whole interrupted commit before the first write: record, healed tail, anchor, effects, lifecycle."""
-    task_plan = task_mod._plan_recovery(project, log)
+def _plan_queue_commit(project, log, task_plan):
+    """Prove a pending queue commit before the first write: record, healed tail, anchor, effects, lifecycle."""
     doc, line, entry = _read_pending(project, log)
     index = doc["index"]
     lines, torn = log._split(QUEUE)
@@ -643,97 +653,57 @@ def _plan_recovery(project, log):
                                   log._split(eventlog.CHAIN_PATH)[0][:task_plan["index"]])
     removal = _prove_tail(project, doc, line, entry, lines, chain, task_plan, events)
     _check_lease_effect(project, doc)
-    return task_plan, doc, line, removal
+    return doc, line, removal
 
 
 def _prepare_dirs(project):
-    """Phase-two housekeeping: the store directories, and the temp name of each interrupted exclusive publication."""
+    """The store directories, and the temp name of each interrupted exclusive publication."""
     project.ensure_dir(LEASES)
     project.ensure_dir(DEPS)
     project.finish_publications(LEASES)
 
 
-def _recover(project, log):
-    """Recover an interrupted commit in two phases. Phase one only reads and proves; phase two writes.
+def _plan(project, log):
+    """The single recovery planner for both subsystems. Reads only; raises (exit code 8) on any refusal.
 
-    Every write recovery can make, in order, and when it is proven:
-      1. the nested task commit (heal both event files, append event and chain, write the task, drop its record)
-         and the queue files' torn tails, the lease file, shards, queue and chain appends, the anchor, and the
-         removal of the queue record: all after `_plan_recovery` proved the whole operation, both subsystems
-         (anchor marks, lease to remove, effects, nested event and task image included);
-      2. the store directories and the removal of a publication temp name: after the same proof (the proof reads
-         such a pair as the pair it is, and a missing directory as an empty one). Neither changes any state the
-         proof reads.
-    With no pending record the event log and the whole queue state are verified read-only first.
-    A refusal in phase one writes nothing. A task-only pending record is recovered first, after its own full proof."""
-    if not project.exists(PENDING):
-        if project.exists(task_mod.PENDING):
-            task_mod._recover(project, log, queue_pending_ok=True)  # plans first, then writes
-        _closed(log.verify)
-        state = _load(project, log)  # the whole queue state is proven read-only before any normalizing write
-        _checkpoint("plan-proven")
-        _prepare_dirs(project)
-        return state
-    task_plan, doc, line, removal = _refusing(lambda: _plan_recovery(project, log))
+    It covers a pending task commit, a pending queue commit (the task commit nested in it included) and, when there
+    is no queue commit, the whole queue state, proven against the task image the pending task commit would write."""
+    task_plan = task_mod._plan_recovery(project, log) if project.exists(task_mod.PENDING) else None
+    if project.exists(PENDING):
+        return {"task": task_plan, "queue": _plan_queue_commit(project, log, task_plan), "state": None}
+    if task_plan is None:
+        _closed(log.verify)  # a task plan has proven the event prefix and its candidate already
+    overrides = {task_plan["task"]["id"]: task_plan["task"]} if task_plan else None
+    return {"task": task_plan, "queue": None, "state": _load(project, log, overrides)}
+
+
+def _recover(project, log):
+    """Recover an interrupted commit: one planner, then one write path. Returns the verified queue state.
+
+    Write order, all after `plan-proven`, and nothing before it:
+      1. the task commit (heal the event and chain tails, append the event and chain line, write the task image,
+         remove pending.json), whether or not a queue commit is nested in it;
+      2. the queue files' torn-tail rewrites;
+      3. the store directories and the removal of a publication temp name (the proof read such a pair as the pair
+         it is and a missing directory as an empty one; neither changes any state the proof reads);
+      4. the queue commit: lease file, shards, queue and chain appends, anchor, removal of queue-pending.json.
+    A refusal in the planner writes nothing and keeps every pending record."""
+    plan = _refusing(lambda: _plan(project, log))
     _checkpoint("plan-proven")
-    _prepare_dirs(project)
-    task_mod._recover(project, log, task_plan, queue_pending_ok=True)
+    if plan["task"]:
+        task_mod._recover(project, log, plan["task"], queue_pending_ok=True)
+    if plan["queue"] is None:
+        _prepare_dirs(project)
+        return plan["state"]
+    doc, line, removal = plan["queue"]
     index = doc["index"]
     lines, torn = log._split(QUEUE)
     chain, chain_torn = log._split(CHAIN)
     log.heal_torn_tail(QUEUE, lines, torn, index, line + b"\n")
     log.heal_torn_tail(CHAIN, chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
+    _prepare_dirs(project)
     _closed(lambda: _apply_pending(project, log, doc, line, removal))
     return _load(project, log)
-
-
-def _proven_bad(project):
-    """SHA-256 of the pending record if the record itself is proven unrecoverable, else None. Read-only.
-
-    Proven bad means either its own bytes fail strict parsing and validation (nothing external is consulted), or
-    the verified queue chain already holds a different entry at the record's index, so it can never apply.
-    Anything that depends on another file being repaired (event log, anchor, lease or shard state, a missing
-    prefix) is not proof: that record stays."""
-    data = project.read(PENDING, limit=PENDING_LIMIT)
-    log = EventLog(project)
-    try:
-        doc, line, _entry = _read_pending(project, log)
-    except ShitError as exc:
-        return _sha(data) if exc.code == REJECTED else None
-    try:
-        entries, lines, _chain = _load_log(project, log)
-        qr.replay(entries)
-    except ShitError:
-        return None
-    return _sha(data) if doc["index"] < len(lines) and lines[doc["index"]] != line else None
-
-
-def recover(project, *, quarantine=False, now=None, config=None):
-    """Try the ordinary recovery of an interrupted queue commit; optionally abandon a record proven unrecoverable.
-
-    Without `quarantine` this only attempts the recovery and, if it is refused, changes nothing (exit code 8).
-    With `quarantine=True` a record that is proven bad (see `_proven_bad`) is moved, by one rename and so as the
-    same file, into `.shit/quarantine/` and its new name is returned. This ABANDONS that commit: it is never
-    applied. A record that is refused for any other reason (a broken event log, anchor, lease or queue file)
-    stays, with exit code 8, until that cause is repaired. Returns None when there was nothing to move."""
-    log = EventLog(project)
-
-    def run():
-        with project.locked(LOCK_TIMEOUT):
-            try:
-                _recover(project, log)
-                return None
-            except ShitError as exc:
-                if not (quarantine and exc.code == FAILED_CLOSED and project.exists(PENDING)):
-                    raise
-            digest = _proven_bad(project)
-            if digest is None:
-                raise ShitError(FAILED_CLOSED)
-            _checkpoint("quarantine-proven")
-            project.ensure_dir(QUARANTINE)
-            return project.quarantine_move(PENDING, QUARANTINE, digest, "queue-pending")
-
-    return task_mod._guarded(run)
 
 
 def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, lifecycle=None, shards=()):
@@ -857,10 +827,10 @@ def _maintain_once(ctx):
         queued = state.tasks.get(task_id)
         expected = qr.expected_lease(task_id, queued) if queued else None
         if expected is None:
-            ctx.project.remove(f"{LEASES}/{name}")
-            if queued is not None:
+            if queued is not None:  # the audit entry commits (cap and chain checked) before the file is deleted
                 _commit(ctx, {"task_id": task_id, "actor": "wrapper", "kind": "orphan_removed",
                               "state_after": queued["state"]})
+            ctx.project.remove(f"{LEASES}/{name}")
             return True
         on_disk = _closed(partial(_read_lease, ctx.project, name))
         if {k: on_disk[k] for k in expected} != expected:
