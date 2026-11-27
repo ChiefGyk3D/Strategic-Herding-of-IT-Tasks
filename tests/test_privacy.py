@@ -263,6 +263,26 @@ class DenyPathResolution(Scan):
             privacy.load_deny(str(link), str(self.repo))
 
 
+    def test_malformed_paths_stay_inside_the_error_contract(self):
+        path = self.put(self.outside, "outside-term\n")
+        cases = {
+            "nul in path": ("\0", str(self.repo)),
+            "bytes path": (os.fsencode(path), str(self.repo)),
+            "bytes repo": (str(path), os.fsencode(self.repo)),
+            "int path": (5, str(self.repo)),
+        }
+        for name, (deny, repo) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(privacy.ShitError) as ctx:
+                    privacy.load_deny(deny, repo)
+                self.assertEqual(ctx.exception.code, privacy.CONFINEMENT)
+
+    def test_genuinely_missing_file_is_still_precondition(self):
+        with self.assertRaises(privacy.ShitError) as ctx:
+            privacy.load_deny(str(self.outside / "nope.txt"), str(self.repo))
+        self.assertEqual(ctx.exception.code, privacy.PRECONDITION)
+
+
 class HostileTrees(Scan):
     def test_symlink_in_tree_is_confinement(self):
         (self.repo / "link").symlink_to(self.outside)

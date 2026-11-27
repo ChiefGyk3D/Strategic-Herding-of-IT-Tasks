@@ -140,12 +140,19 @@ def load_deny(path, repo):
     symlink followed, so a link retargeted after the check cannot change what is read.
     """
     try:
-        final_is_link = stat.S_ISLNK(os.lstat(path).st_mode)
-    except OSError:
-        final_is_link = False  # a missing file is reported by the open below
-    real = os.path.realpath(path)
-    root = os.path.realpath(repo)
-    if final_is_link or os.path.commonpath([root, real]) == root:
+        path, repo = os.fspath(path), os.fspath(repo)
+        if not isinstance(path, str) or not isinstance(repo, str):
+            raise TypeError
+        try:
+            final_is_link = stat.S_ISLNK(os.lstat(path).st_mode)
+        except OSError:
+            final_is_link = False  # a missing file is reported by the open below
+        real = os.path.realpath(path)
+        root = os.path.realpath(repo)
+        inside = os.path.commonpath([root, real]) == root
+    except (TypeError, ValueError):
+        raise ShitError(CONFINEMENT) from None
+    if final_is_link or inside:
         raise ShitError(CONFINEMENT)
     fd = _walk_open(real)
     try:
