@@ -17,7 +17,7 @@ from unittest import mock
 
 from _bootstrap import ROOT, make_git_dir
 
-from shit import commands
+from shit import commands, yardstick
 from shit import dependencies as dep
 from shit import queue as q
 from shit import queue_records as qr
@@ -74,6 +74,9 @@ class QueueCase(unittest.TestCase):
         lease = self.claim(tid)
         q.start(self.proj, self.present(lease), now=self.tick())
         return lease
+
+    def recover(self):
+        return q.recover(self.proj)
 
     def status(self, **kw):
         return q.status(self.proj, now=kw.pop("now", None) or self.tick(), **kw)
@@ -573,6 +576,7 @@ class GraphCrash(QueueCase):
                 else:
                     with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(GraphCrash.Crash):
                         q.add_edges(proj, additions, "human", now=at(50))
+                q.recover(proj)
                 q.status(proj, now=at(60))
                 q.status(proj, now=at(60))
                 return {str(p.relative_to(repo / ".shit")): p.read_bytes() for p in sorted((repo / ".shit").rglob("*"))
@@ -983,8 +987,9 @@ class RetryAndHold(QueueCase):
         self.assertEqual(self.code(q.enqueue, self.proj, "t1", "human", now=self.tick()), 3)
         self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t1", title="T", summary="S",
                                    owner="human", actor="human", now=self.tick()), 2)
-        (self.shit / "tasks" / "t1.json").unlink()
-        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t1", title="T", summary="S",
+        self.task("t2", enqueue=False)
+        (self.shit / "tasks" / "t2.json").unlink()
+        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t2", title="T", summary="S",
                                    owner="human", actor="human", now=self.tick()), 3)
 
     def test_enqueue_requires_human_or_wrapper_and_an_open_task(self):
@@ -1173,7 +1178,7 @@ class CrashRecovery(QueueCase):
                             run()
                     else:
                         run()
-                    q.status(proj, now=at(8))  # any later locked operation finishes the commit
+                    q.recover(proj)  # the named operation finishes the commit; ordinary ones refuse on sight
                     q.status(proj, now=at(8))
                 return {str(p.relative_to(repo / ".shit")): p.read_bytes() for p in sorted((repo / ".shit").rglob("*"))
                         if p.is_file() and p.name != "lock"}
@@ -1236,6 +1241,7 @@ class CrashRecovery(QueueCase):
         pending = json.loads((self.shit / "queue-pending.json").read_text())
         with open(self.shit / "queue.jsonl", "ab") as handle:
             handle.write(pending["entry_line"].encode()[:20])  # a torn append
+        self.recover()
         self.assertEqual(self.status()["t1"]["state"], "dispatched")
 
     def test_pending_with_foreign_chain_line_fails_closed(self):
@@ -1294,7 +1300,7 @@ class PendingProof(QueueCase):
         life = q._life("t1", "review", "approved", "human", "forged", self.tick())
         self.forge("t1", "orphan_removed", "review", lifecycle=life)
         events, state = self.events(), self.snap()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(json.loads((self.shit / "tasks" / "t1.json").read_text())["state"], "review")
         self.assertEqual(self.events(), events)
         self.assertEqual(self.queue_lines(), [line for line in state["queue.jsonl"].splitlines()])
@@ -1304,7 +1310,7 @@ class PendingProof(QueueCase):
         self.to_review("t1")
         life = q._life("t1", "review", "approved", "human", "forged", self.tick())
         self.forge("t1", "reopened", "ready", actor="human", lifecycle=life)
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(json.loads((self.shit / "tasks" / "t1.json").read_text())["state"], "review")
 
     def test_a_stale_pending_record_applies_nothing(self):  # M1
@@ -1312,11 +1318,11 @@ class PendingProof(QueueCase):
             self.task(tid)
         self.crash_at("pending-written", q.add_edge, self.proj, "b", "a", "draft", "human", now=self.tick())
         old = (self.shit / "queue-pending.json").read_bytes()
-        self.status()
+        self.recover()
         q.add_edge(self.proj, "b", "c", "draft", "human", now=self.tick())
         shard = (self.shit / "deps" / "b.json").read_bytes()
         (self.shit / "queue-pending.json").write_bytes(old)
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual((self.shit / "deps" / "b.json").read_bytes(), shard)
 
     def test_a_renewal_pending_record_must_equal_the_replayed_lease_plus_one_renewal(self):  # round 2
@@ -1332,10 +1338,11 @@ class PendingProof(QueueCase):
                 doc["lease"][key] = value
                 path.write_text(json.dumps(doc))
                 before = self.snap()
-                self.assertEqual(self.code(self.status), 8)
+                self.assertEqual(self.code(self.recover), 8)
                 self.assertEqual(self.snap(), before)  # nothing applied, the record is kept
                 self.assertTrue(path.exists())
         path.write_bytes(good)
+        self.recover()
         self.assertEqual(self.status()["t1"]["state"], "running")  # the genuine record still recovers
 
     def test_a_lifecycle_reason_in_a_pending_record_must_be_the_fixed_one(self):  # round 2
@@ -1347,16 +1354,18 @@ class PendingProof(QueueCase):
         doc["lifecycle"]["reason"] = "something else"
         path.write_text(json.dumps(doc))
         before = self.snap()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.snap(), before)
 
-    def test_a_task_writer_recovers_a_proven_queue_commit_before_it_writes(self):  # round 3, revised in round 8
+    def test_a_task_writer_refuses_a_pending_queue_commit_until_it_is_recovered(self):  # round 3, revised in round 9
         self.task("t1")
         lease = self.run_to_running("t1")
         self.crash_at("pending-written", q.submit, self.proj, self.present(lease), now=self.tick())
+        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t2", title="T", summary="S",
+                                   owner="human", actor="human", now=self.tick(500)), 8)
+        self.recover()
         task_mod.create_task(self.proj, task_id="t2", title="T", summary="S", owner="human", actor="human",
                              now=self.tick(500))
-        self.assertFalse((self.shit / "queue-pending.json").exists())
         self.assertEqual(self.status(now=at(self.clock + 1))["t1"]["state"], "review")
 
     def test_a_pending_lifecycle_older_than_the_event_log_tip_changes_nothing(self):  # round 3
@@ -1370,7 +1379,7 @@ class PendingProof(QueueCase):
                              now=self.tick(500))
         path.write_bytes(held)
         before = self.snap()
-        self.assertEqual(self.code(self.status, now=at(self.clock + 1)), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.snap(), before)  # the lease is still there, nothing was removed
 
     def test_task_recovery_does_not_run_before_the_queue_record_is_proven(self):  # round 3
@@ -1389,7 +1398,7 @@ class PendingProof(QueueCase):
         doc["tip"] = "0" * 64
         path.write_text(json.dumps(doc))
         before = self.snap()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.snap(), before)
 
     def test_a_torn_tail_is_not_rewritten_when_the_pending_record_cannot_be_proven(self):  # round 3
@@ -1400,7 +1409,7 @@ class PendingProof(QueueCase):
         (self.shit / "queue.jsonl").write_bytes(lines[0][:-1] + b"X" + b"\n" + b"".join(l + b"\n" for l in lines[1:])
                                                 + pending["entry_line"].encode()[:20])
         before = self.snap()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.snap(), before)
 
     def test_a_lease_conflict_keeps_the_pending_record_and_changes_nothing(self):  # round 3
@@ -1410,7 +1419,7 @@ class PendingProof(QueueCase):
         other = {**pending["lease"], "lease_id": "f" * 32}
         (self.shit / "leases" / "t1.json").write_bytes(qr.dump_lease(other))
         before = self.snap()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.snap(), before)
         self.assertTrue((self.shit / "queue-pending.json").exists())
 
@@ -1428,7 +1437,7 @@ class PendingProof(QueueCase):
                "shards": [{"task_id": "b", "content": data.decode()}]}
         (self.shit / "queue-pending.json").write_text(json.dumps(doc))
         before = self.snap()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.snap(), before)
 
     def test_a_corrupt_anchor_is_found_before_recovery_changes_anything(self):  # round 2
@@ -1442,9 +1451,10 @@ class PendingProof(QueueCase):
                 doc[key] = value
                 path.write_text(json.dumps(doc))
                 before = self.snap()
-                self.assertEqual(self.code(self.status), 8)
+                self.assertEqual(self.code(self.recover), 8)
                 self.assertEqual(self.snap(), before)
                 path.write_bytes(good)
+        self.recover()
         self.assertEqual(self.status()["a"]["state"], "dispatched")
 
     def test_an_unverifiable_pending_record_is_kept_as_evidence(self):  # M1
@@ -1455,9 +1465,9 @@ class PendingProof(QueueCase):
         doc = json.loads(path.read_text())
         doc["chain_line"] = "zz"
         path.write_text(json.dumps(doc))
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertTrue(path.exists())
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertTrue(path.exists())
 
 
@@ -1488,22 +1498,22 @@ class ApplyMarkers(QueueCase):
     def test_a_finish_under_a_draft_lease_is_refused(self):  # H5
         lease = self.running("draft")
         self.extend(lease, "apply_started", "apply_finished")
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
     def test_a_finish_without_a_start_is_refused(self):  # H5
         lease = self.running("apply")
         self.extend(lease, "apply_finished")
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
     def test_a_repeated_start_or_finish_is_refused(self):  # H5
         lease = self.running("apply")
         self.extend(lease, "apply_started", "apply_started")
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
     def test_a_repeated_finish_is_refused(self):  # H5
         lease = self.running("apply")
         self.extend(lease, "apply_started", "apply_finished", "apply_finished")
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
 
 class ClockOrder(QueueCase):
@@ -1546,6 +1556,7 @@ class PublicationWindow(QueueCase):
         self.assertEqual(done.returncode, 9)
         leases = self.shit / "leases"
         self.assertEqual((leases / "t1.json").stat().st_nlink, 2)
+        self.recover()
         self.assertEqual(self.status(now=at(101))["t1"]["state"], "dispatched")
         self.assertEqual(self.status(now=at(102))["t1"]["state"], "dispatched")
         self.assertEqual(os.listdir(leases), ["t1.json"])
@@ -1567,7 +1578,7 @@ class TipAnchor(QueueCase):
         first = self.claim("t1")
         for name, data in prefix.items():
             (self.shit / name).write_bytes(data)
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertTrue((self.shit / "leases" / "t1.json").exists())  # the lease is not removed as an orphan
         self.assertEqual(self.code(self.claim, "t1"), 8)
         self.assertEqual(first["generation"], 1)
@@ -1575,7 +1586,7 @@ class TipAnchor(QueueCase):
     def test_a_missing_anchor_over_a_nonempty_queue_is_refused(self):  # H3
         self.task("t1")
         (self.shit / "queue-anchor.json").unlink()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
     def test_an_anchor_that_disagrees_with_the_queue_is_refused(self):  # H3
         self.task("t1")
@@ -1583,7 +1594,7 @@ class TipAnchor(QueueCase):
         doc = json.loads(path.read_text())
         doc["tip"] = "0" * 64
         path.write_text(json.dumps(doc))
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
     def test_a_crash_before_the_anchor_is_written_recovers(self):  # Q-REC-01
         self.task("a")
@@ -1594,6 +1605,7 @@ class TipAnchor(QueueCase):
 
         with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(PendingProof.Crash):
             self.claim("a")
+        self.recover()
         self.assertEqual(self.status()["a"]["state"], "dispatched")
         self.assertEqual(json.loads((self.shit / "queue-anchor.json").read_text())["generations"], {"a": 1})
 
@@ -1761,7 +1773,7 @@ class GraphPopulation(QueueCase):
                  "shards": [{"task_id": "ghost", "sha256": hashlib.sha256(data).hexdigest()}]}
         self.rewrite_queue([*self.queue_lines(), qr.dump_entry(entry)])
         (self.shit / "deps" / "ghost.json").write_bytes(data)
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
 
 
 class BoundedWork(QueueCase):
@@ -1868,7 +1880,7 @@ class RecoveryWrites(QueueCase):
         self.crashed_submit()
         self.forged_nested()
         before = self.tree()
-        self.assertEqual(self.code(self.status, now=at(self.clock + 1000)), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.tree(), before)
 
     def test_a_corrupt_event_prefix_during_nested_recovery_changes_nothing(self):  # round 4
@@ -1878,7 +1890,7 @@ class RecoveryWrites(QueueCase):
         data[3] = ord("0") if data[3] != ord("0") else ord("1")
         path.write_bytes(bytes(data))
         before = self.tree()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.tree(), before)
 
     def test_a_queue_only_commit_refuses_over_a_corrupt_event_chain(self):  # round 4
@@ -1897,13 +1909,13 @@ class RecoveryWrites(QueueCase):
         os.link(self.shit / "leases" / "t1.json", self.shit / "leases" / ".tmp-0123456789abcdef")
         (self.shit / "queue-pending.json").write_text("{}")
         before = self.tree()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.tree(), before)
         self.assertEqual(lease["generation"], 1)
 
     def test_no_write_precedes_the_proven_plan(self):  # round 4
         self.crashed_submit(nested=True)
-        log, code = self.record(lambda: q.status(self.proj, now=at(self.clock + 1)))
+        log, code = self.record(lambda: q.recover(self.proj))
         self.assertEqual(code, 0)
         self.assertIn("stage:plan-proven", log)
         marker = log.index("stage:plan-proven")
@@ -1918,14 +1930,14 @@ class RecoveryWrites(QueueCase):
     def test_a_refused_nested_recovery_performs_no_write_at_all(self):  # round 4
         self.crashed_submit()
         self.forged_nested()
-        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assert_no_writes(lambda: q.recover(self.proj))
 
     def test_a_refused_recovery_over_missing_directories_performs_no_write_at_all(self):  # round 4
         self.task("t1")
         (self.shit / "queue-pending.json").write_text("{}")
         for name in ("leases", "deps"):
             os.rmdir(self.shit / name)
-        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assert_no_writes(lambda: q.recover(self.proj))
         self.assertFalse((self.shit / "leases").exists())
 
     def test_a_refused_queue_commit_over_a_corrupt_event_chain_performs_no_write_at_all(self):  # round 4
@@ -1946,7 +1958,7 @@ class RecoveryWrites(QueueCase):
         doc["generations"]["b"] = 99
         path.write_text(json.dumps(doc))
         before = self.tree()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.tree(), before)
 
     def test_a_lease_to_remove_must_be_the_lease_the_replay_says_exists(self):  # round 5
@@ -1957,13 +1969,14 @@ class RecoveryWrites(QueueCase):
         other = {**json.loads(path.read_text()), "lease_id": "e" * 32}
         path.write_bytes(qr.dump_lease(other))
         before = self.tree()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.tree(), before)
 
     def test_a_lease_removal_that_matches_still_recovers(self):  # round 5 positive control
         self.task("t1")
         lease = self.claim("t1")
         self.crash_at("pending-written", q.release, self.proj, self.present(lease), now=self.tick())
+        self.recover()
         self.assertEqual(self.status()["t1"]["state"], "ready")
         self.assertFalse((self.shit / "leases" / "t1.json").exists())
 
@@ -1977,7 +1990,7 @@ class RecoveryWrites(QueueCase):
         doc["tip"] = "0" * 64
         path.write_text(json.dumps(doc))
         before = self.tree()
-        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assert_no_writes(lambda: q.recover(self.proj))
         self.assertEqual(self.tree(), before)
 
     def blocked_valid_commit(self):
@@ -2011,21 +2024,21 @@ class RecoveryWrites(QueueCase):
         doc["tip"] = "0" * 64
         path.write_text(json.dumps(doc))
         before = self.tree()
-        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assert_no_writes(lambda: q.recover(self.proj))
         self.assertEqual(self.tree(), before)
 
     def test_a_task_only_pending_record_that_would_break_queue_agreement_changes_nothing(self):  # round 7
         self.task("t1")
         self.crashed_task_transition("t1")
         before = self.tree()
-        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assert_no_writes(lambda: q.recover(self.proj))
         self.assertEqual(self.tree(), before)
 
     def test_a_task_only_pending_record_recovers_through_the_single_planner(self):  # round 7
         self.task("t1")
         self.task("x", enqueue=False)
         self.crashed_task_transition("x")
-        log, code = self.record(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        log, code = self.record(lambda: q.recover(self.proj))
         self.assertEqual(code, 0)
         marker = log.index("stage:plan-proven")
         self.assertEqual([n for n in log[:marker] if not n.startswith("stage:")], [])
@@ -2037,7 +2050,7 @@ class RecoveryWrites(QueueCase):
         pending = self.shit / "queue-pending.json"
         pending.write_bytes(b"x" * (q.PENDING_LIMIT + 1))
         before = self.tree()
-        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.code(self.recover), 8)
         self.assertEqual(self.tree(), before)
 
     def test_orphan_maintenance_keeps_the_file_when_its_entry_cannot_commit(self):  # round 7
@@ -2054,8 +2067,8 @@ class RecoveryWrites(QueueCase):
         self.assertEqual(json.loads(self.queue_lines()[-1])["kind"], "orphan_removed")
 
     def test_there_is_no_quarantine_feature(self):  # round 7
-        self.assertFalse(hasattr(q, "recover"))
         self.assertFalse(hasattr(Project, "quarantine_move"))
+        self.assertEqual(sorted(n for n in dir(q) if "quarantine" in n.lower()), [])
 
 
     # Round 8: every locked entry point of every subsystem runs the one recovery planner before any write.
@@ -2084,6 +2097,7 @@ class RecoveryWrites(QueueCase):
                                                   actor="human", now=t()),
             "close_task": lambda: commands.close_task(self.proj, "x", "human", "r", now=t()),
             "queue.status": lambda: q.status(self.proj, now=t()),
+            "yardstick": lambda: yardstick.compute(self.proj),
         }
 
     def corrupt_anchor_with_task_only_pending(self):
@@ -2117,10 +2131,16 @@ class RecoveryWrites(QueueCase):
                 marker = log.index("stage:plan-proven")
                 self.assertEqual([n for n in log[:marker] if not n.startswith("stage:")], [])
 
-    def test_a_stray_queue_pending_record_is_proven_and_recovered_not_refused_on_sight(self):  # round 8
+    def test_a_genuine_queue_pending_record_is_refused_on_sight_by_every_entry_point(self):  # round 9
         self.crashed_submit(nested=True)
-        task_mod.get_task(self.proj, "t1")  # a task entry point recovers the proven commit
-        self.assertFalse((self.shit / "queue-pending.json").exists())
+        before = self.tree()
+        for name, call in self.entry_points().items():
+            with self.subTest(entry=name):
+                log, code = self.record(call)
+                self.assertEqual(code, 8)
+                self.assertEqual([n for n in log if not n.startswith("stage:")], [])
+                self.assertEqual(self.tree(), before)
+        self.assertTrue(q.recover(self.proj))  # only the named operation applies it
         self.assertEqual(self.status()["t1"]["state"], "review")
 
     def test_an_unprovable_queue_pending_record_still_refuses_every_entry_point(self):  # round 8
@@ -2168,6 +2188,117 @@ class RecoveryWrites(QueueCase):
         self.assertFalse(planted.exists())
 
 
+    # Round 9 (option A2): refuse on sight, writers prove the queue, limits before effects, lock file, `shit check`.
+
+    def corrupt_anchor(self):
+        path = self.shit / "queue-anchor.json"
+        doc = json.loads(path.read_text())
+        doc["tip"] = "0" * 64
+        path.write_text(json.dumps(doc))
+
+    def test_writers_prove_the_queue_before_they_commit_even_with_nothing_pending(self):  # round 9
+        self.task("t1")
+        self.task("x", enqueue=False)
+        self.corrupt_anchor()
+        before = self.tree()
+        writers = ("create_task", "transition", "add_evidence", "add_report", "add_review", "add_decision",
+                   "new_task", "close_task", "queue.status")
+        calls = self.entry_points()
+        for name in writers:
+            with self.subTest(entry=name):
+                log, code = self.record(calls[name])
+                self.assertEqual(code, 8)
+                self.assertEqual([n for n in log if not n.startswith("stage:")], [])
+                self.assertEqual(self.tree(), before)
+
+    def test_readers_with_nothing_pending_do_not_need_a_proven_queue(self):  # round 9
+        self.task("t1")
+        self.task("x", enqueue=False)
+        self.corrupt_anchor()
+        before = self.tree()
+        self.assertEqual(task_mod.get_task(self.proj, "x")["state"], "open")
+        self.assertEqual(self.tree(), before)
+
+    def test_a_limit_invalid_pending_record_writes_no_effect(self):  # round 9
+        from shit import log as log_mod
+        self.task("t1")
+        self.crash_at("pending-written", self.claim, "t1")
+        before = self.tree()
+        with mock.patch.object(log_mod, "MAX_LOG_BYTES", self.sizes()["queue.jsonl"] + 10):
+            log, code = self.record(lambda: q.recover(self.proj))
+        self.assertEqual(code, 8)
+        self.assertEqual([n for n in log if not n.startswith("stage:")], [])
+        self.assertEqual(self.tree(), before)
+        self.assertFalse((self.shit / "leases" / "t1.json").exists())
+
+    def test_a_reader_never_creates_the_lock_file(self):  # round 9
+        self.task("x", enqueue=False)
+        (self.shit / "lock").unlink()
+        (self.shit / "queue-pending.json").write_text("{}")
+        self.assertEqual(self.code(task_mod.get_task, self.proj, "x"), 8)
+        self.assertEqual(self.code(commands.show, self.proj, "report", "r1"), 8)
+        self.assertFalse((self.shit / "lock").exists())
+
+    def test_init_creates_the_lock_file(self):  # round 9
+        self.assertTrue((self.shit / "lock").is_file())
+
+    def test_check_reports_the_queue_and_never_writes(self):  # round 9
+        from shit import check
+        self.task("t1")
+        self.claim("t1")
+        log, code = self.record(lambda: self.check_result(check))
+        self.assertEqual(code, 0)
+        self.assertEqual([n for n in log if not n.startswith("stage:")], [])
+        result = self.check_result(check)
+        self.assertEqual(result[0], 0)
+        self.assertTrue(any(line.startswith("queue: 2 entries") for line in result[1]))
+        self.corrupt_anchor()
+        before = self.tree()
+        result = self.check_result(check)
+        self.assertEqual(result[0], 8)
+        self.assertTrue(any("queue state does not verify" in line for line in result[1]))
+        self.assertEqual(self.tree(), before)
+
+    def check_result(self, check):
+        try:
+            return check.run_check(self.repo)
+        except ShitError as exc:
+            raise ShitError(exc.code) from None
+
+    def test_check_reports_a_pending_queue_record_without_recovering_it(self):  # round 9
+        from shit import check
+        self.crashed_submit()
+        before = self.tree()
+        code, lines = check.run_check(self.repo)
+        self.assertEqual(code, 8)
+        self.assertTrue(any("queue pending record present and provable" in line for line in lines))
+        self.assertEqual(self.tree(), before)
+        (self.shit / "queue-pending.json").write_text("{}")
+        code, lines = check.run_check(self.repo)
+        self.assertEqual(code, 8)
+        self.assertTrue(any("cannot be proven" in line for line in lines))
+
+    def test_the_orphan_audit_is_bound_to_the_file_it_deleted(self):  # round 9
+        self.task("t1")
+        planted = self.shit / "leases" / "t1.json"
+        planted.write_text("first")
+        real = Project.remove
+
+        def fail(project, rel):
+            if rel == "leases/t1.json":
+                raise ShitError(1)
+            return real(project, rel)
+
+        with mock.patch.object(Project, "remove", fail):
+            self.assertEqual(self.code(self.status), 1)
+        planted.write_text("a different file")  # replaced during the crash window
+        self.status()
+        kinds = [json.loads(x) for x in self.queue_lines() if json.loads(x)["kind"] == "orphan_removed"]
+        self.assertEqual(len(kinds), 2)
+        self.assertNotEqual(kinds[0]["orphan_sha256"], kinds[1]["orphan_sha256"])
+        self.assertFalse(planted.exists())
+
+
 def locked_blocks(tree):
     import ast
     return [n for n in ast.walk(tree) if isinstance(n, ast.With)
@@ -2182,7 +2313,7 @@ def locked_without_planner(source, writers):
     for block in locked_blocks(ast.parse(source)):
         calls = [(n.lineno, getattr(n.func, "attr", getattr(n.func, "id", ""))) for n in ast.walk(block)
                  if isinstance(n, ast.Call)]
-        planner = [ln for ln, name in calls if name == "_recover"]
+        planner = [ln for ln, name in calls if name in ("_recover", "_plan")]
         writes = [ln for ln, name in calls if name in writers]
         if not planner or (writes and min(writes) < min(planner)):
             problems.append(f"locked block at line {block.lineno} has no planner call before its first write")

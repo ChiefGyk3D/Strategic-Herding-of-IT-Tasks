@@ -141,12 +141,13 @@ def _prove_image(project, event, image):
         raise ShitError(REJECTED)
 
 
-def _recover(project, log):
+def _recover(project, log, mode="writer"):
     """Every locked entry point of this module runs recovery first. The planner lives with the queue, above this
-    module, so it is imported here at call time: one proof-then-write path for both subsystems."""
+    module, so it is imported here at call time: one proof-then-write path for both subsystems. `mode` is
+    `writer` (the default: proves the queue state before the caller commits) or `reader`."""
     from . import queue
 
-    queue._recover(project, log, queue_ops=False)
+    queue._recover(project, log, mode)
 
 
 def _apply_task_plan(project, log, plan):
@@ -198,7 +199,7 @@ def get_task(project, task_id):
 
     def run():
         with project.locked():
-            _recover(project, log)
+            _recover(project, log, "reader")
             return records.load_task(project.read(path))
 
     return _guarded(run)
@@ -220,7 +221,7 @@ def create_task(project, *, task_id, title, summary, owner, actor, now=None):
     log = EventLog(project)
 
     def run():
-        with project.locked():
+        with project.locked(create=True):
             _recover(project, log)
             if project.exists(path):
                 raise ShitError(USAGE)
@@ -268,7 +269,7 @@ def transition(project, task_id, to, actor, reason, *, now=None, blocked_reason=
     log = EventLog(project)
 
     def run():
-        with project.locked():
+        with project.locked(create=True):
             _recover(project, log)
             return _transition_locked(project, log, task_id, to, actor, reason, now, blocked_reason,
                                       blocking_item, precheck)

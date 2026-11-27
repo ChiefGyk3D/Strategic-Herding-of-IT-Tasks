@@ -172,6 +172,11 @@ class Project:
                     raise _os_error(exc) from None
                 finally:
                     proj._close(fd)
+            lock = os.open(LOCK_NAME, os.O_WRONLY | os.O_CREAT | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=proj._fd)
+            os.close(lock)  # created here so that locking never has to create it (see `locked`)
+        except OSError as exc:
+            proj.close()
+            raise _os_error(exc) from None
         except BaseException:
             proj.close()
             raise
@@ -502,8 +507,11 @@ class Project:
         return self._lock_fd is not None
 
     @contextlib.contextmanager
-    def locked(self, timeout=5.0):
+    def locked(self, timeout=5.0, create=False):
         """Hold the store's exclusive advisory lock. Contention past `timeout` is exit code 1.
+
+        `create` lets a write-capable caller create a missing `lock` file (a content-free file, a state-independent
+        step; `init` normally created it already). A read-only caller leaves a missing file missing.
 
         The lock is taken on a fresh descriptor of the store directory itself: a descriptor, not a pathname, so
         unlinking or replacing the `lock` file cannot admit a second holder. The `lock` file is still opened and
@@ -511,14 +519,18 @@ class Project:
         """
         if self._lock_fd is not None:
             raise ShitError(INTERNAL)
+        flags = os.O_RDWR | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC | (os.O_CREAT if create else 0)
         try:
-            check = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=self._fd)
+            check = os.open(LOCK_NAME, flags, FILE_MODE, dir_fd=self._fd)
+        except FileNotFoundError:
+            check = None
         except OSError as exc:
             raise _os_error(exc) from None
-        try:
-            self._check_regular(os.fstat(check))
-        finally:
-            self._close(check)
+        if check is not None:
+            try:
+                self._check_regular(os.fstat(check))
+            finally:
+                self._close(check)
         try:
             fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=self._fd)
         except OSError as exc:

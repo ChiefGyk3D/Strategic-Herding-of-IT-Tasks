@@ -36,7 +36,7 @@ def compute(project, weights=None):
 
     def run():
         with project.locked():
-            task_mod._recover(project, log)
+            task_mod._recover(project, log, "reader")
             events = log.verify()
             outcomes, verdicts = Counter(), Counter()
             first = {}  # (kind, record_id) -> first matching event, so each load is O(1), not a log scan

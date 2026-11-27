@@ -547,11 +547,12 @@ def _prove_tail(project, doc, line, entry, lines, chain, task_plan, events):
     qr.check_effects(doc, entry, tasks.get(entry["task_id"]), after.get(entry["task_id"]))
     removal = _prove_removal(project, doc, entry, tasks)
     life = doc["lifecycle"]
+    lifecycle_open = False
     if life is not None:
-        _prove_lifecycle(project, doc, entry, after, task_plan, events)
+        lifecycle_open = _prove_lifecycle(project, doc, entry, after, task_plan, events)
     if doc["shards"]:
         _load_graph(project, [*prior, entry], after, {item["task_id"]: item["content"] for item in doc["shards"]})
-    return removal
+    return removal, lifecycle_open
 
 
 def _held(tasks):
@@ -606,7 +607,7 @@ def _prove_lifecycle(project, doc, entry, after, task_plan, events):
     current = records.load_task(project.read(task_mod._task_path(life["task_id"])))
     done = {"from": life["from"], "to": life["to"], "actor": life["actor"], "at": life["at"], "reason": life["reason"]}
     if current["state"] == life["to"] and current["history"] and current["history"][-1] == done:
-        return  # already applied
+        return False  # already applied
     if current["state"] != life["from"] or life["at"] < current["updated_at"]:
         raise ShitError(REJECTED)
     check_transition(life["from"], life["to"], life["actor"])
@@ -618,14 +619,17 @@ def _prove_lifecycle(project, doc, entry, after, task_plan, events):
             raise ShitError(REJECTED)
     if events and life["at"] < events[-1]["timestamp"]:
         raise ShitError(REJECTED)  # the event would precede the tip of the verified event log
+    return True
 
 
-def _refusing(fn):
-    """Run a validation pass: anything that does not verify is a fail-closed refusal (exit code 8), nothing written."""
+def _refusing(fn, limits=False):
+    """Run a validation pass: anything that does not verify is a fail-closed refusal (exit code 8), nothing written.
+
+    With `limits` a size or capacity failure is a refusal too (proving a pending record); elsewhere it keeps exit 7."""
     try:
         return fn()
     except ShitError as exc:
-        if exc.code in (REJECTED, ILLEGAL_TRANSITION, HUMAN_APPROVAL, PRECONDITION):
+        if exc.code in (REJECTED, ILLEGAL_TRANSITION, HUMAN_APPROVAL, PRECONDITION) or (limits and exc.code == INPUT_LIMIT):
             raise ShitError(FAILED_CLOSED) from None
         raise
 
@@ -651,9 +655,22 @@ def _plan_queue_commit(project, log, task_plan):
     else:
         events = log.verify_lines(task_plan["log_lines"][:task_plan["index"]],
                                   log._split(eventlog.CHAIN_PATH)[0][:task_plan["index"]])
-    removal = _prove_tail(project, doc, line, entry, lines, chain, task_plan, events)
+    removal, lifecycle_open = _prove_tail(project, doc, line, entry, lines, chain, task_plan, events)
     _check_lease_effect(project, doc)
+    _preflight_room(log, doc, line, lines, chain, task_plan, lifecycle_open)
     return doc, line, removal
+
+
+def _preflight_room(log, doc, line, lines, chain, task_plan, lifecycle_open):
+    """Every append the commit still has to make must fit before the first write (a limit failure is a refusal)."""
+    index = doc["index"]
+    log.check_room(len(line) + 1 if len(lines) == index else 0, CHAIN_LINE_BYTES if len(chain) == index else 0,
+                   data=QUEUE, chain=CHAIN)
+    if task_plan is not None:
+        if len(task_plan["log_lines"]) == task_plan["index"]:
+            log.check_room(len(task_plan["line"]) + 1, CHAIN_LINE_BYTES)
+    elif lifecycle_open:
+        log.check_room(records.MAX_RECORD_BYTES + 1, CHAIN_LINE_BYTES)  # the event is built later: assume the largest
 
 
 def _prepare_dirs(project):
@@ -663,52 +680,67 @@ def _prepare_dirs(project):
     project.finish_publications(LEASES)
 
 
-def _plan(project, log, queue_ops):
+MODES = ("queue", "recover", "writer", "reader")
+
+
+def _plan(project, log, mode, verified=False):
     """The single recovery planner for both subsystems. Reads only; raises on any refusal.
 
     It covers a pending task commit, a pending queue commit (the task commit nested in it included) and, when no
     queue commit is pending, the whole queue state, proven against the task image a pending task commit would
-    write. Returns None for a task entry point when nothing is pending (nothing to prove, nothing to write).
-    A queue operation reports every refusal as exit code 8; a task entry point keeps the task module's own codes
-    for its own record and reports a queue fault as exit code 8."""
+    write. `mode` says who asks: a queue operation or the explicit `recover` (every refusal is exit code 8), a task
+    or artifact `writer` (always proves the queue state before it commits; the task module's own codes are kept for
+    the event log and its own record) or a `reader` (proves only when a pending record forces a write). Returns None
+    when a reader has nothing to prove."""
+    strict = mode in ("queue", "recover")
     task_plan = None
     if project.exists(task_mod.PENDING):
-        if queue_ops:
-            task_plan = _refusing(lambda: task_mod._plan_recovery(project, log))
-        else:
-            task_plan = task_mod._plan_recovery(project, log)
-    if project.exists(PENDING):
-        return {"task": task_plan, "queue": _refusing(lambda: _plan_queue_commit(project, log, task_plan)),
+        task_plan = _refusing(lambda: task_mod._plan_recovery(project, log)) if strict \
+            else task_mod._plan_recovery(project, log)
+    if project.exists(PENDING):  # only `recover` is ever asked to plan a queue commit
+        return {"task": task_plan, "queue": _refusing(lambda: _plan_queue_commit(project, log, task_plan), True),
                 "state": None}
     if task_plan is None:
-        if not queue_ops:
+        if mode == "reader":
             return None
-        _closed(log.verify)
+        if verified:
+            pass  # the caller (`shit check`) verified the event log in this same pass
+        elif strict:
+            _closed(log.verify)
+        else:
+            log.verify()  # raw codes, as the writer's own later verification would report them
     overrides = {task_plan["task"]["id"]: task_plan["task"]} if task_plan else None
     return {"task": task_plan, "queue": None, "state": _load(project, log, overrides)}
 
 
-def _recover(project, log, *, queue_ops=True):
+def _recover(project, log, mode="queue"):
     """Recover an interrupted commit: one planner, then one write path. Returns the verified queue state.
 
-    Every locked entry point of the task, evidence, report, review, decision and queue commands calls this first
-    (tests/test_queue.py enumerates them). Write order, all after `plan-proven`, and nothing before it:
+    A pending QUEUE commit is never recovered by an ordinary entry point: any mode but `recover` refuses on sight
+    (exit code 8) and writes nothing, so a record that is merely present, genuine or planted, is never applied by
+    whichever command happens to run next. Only `recover` (the named operation) plans and applies it.
+    Every locked entry point of the task, evidence, report, review, decision, yardstick and queue commands calls
+    this first (tests/test_queue.py enumerates them). Write order, all after `plan-proven`, and nothing before it:
       1. the task commit (heal the event and chain tails, append the event and chain line, write the task image,
          remove pending.json), whether or not a queue commit is nested in it;
       2. the queue files' torn-tail rewrites;
-      3. for queue operations, the store directories and the removal of a publication temp name (the proof read
-         such a pair as the pair it is and a missing directory as an empty one; neither changes any state the
-         proof reads);
+      3. the store directories and the removal of a publication temp name (the proof read such a pair as the pair
+         it is and a missing directory as an empty one; neither changes any state the proof reads);
       4. the queue commit: lease file, shards, queue and chain appends, anchor, removal of queue-pending.json.
     A refusal in the planner writes nothing and keeps every pending record."""
-    plan = _refusing(lambda: _plan(project, log, queue_ops)) if queue_ops else _plan(project, log, queue_ops)
+    if mode not in MODES:
+        raise ShitError(USAGE)
+    if mode != "recover" and project.exists(PENDING):
+        raise ShitError(FAILED_CLOSED)
+    strict = mode in ("queue", "recover")
+    plan = _refusing(lambda: _plan(project, log, mode)) if strict else _plan(project, log, mode)
     if plan is None:
         return None
     _checkpoint("plan-proven")
     if plan["task"]:
         task_mod._apply_task_plan(project, log, plan["task"])
     if plan["queue"] is None:
-        if queue_ops:
+        if strict:
             _prepare_dirs(project)
         return plan["state"]
     doc, line, removal = plan["queue"]
@@ -720,6 +752,47 @@ def _recover(project, log, *, queue_ops=True):
     _prepare_dirs(project)
     _closed(lambda: _apply_pending(project, log, doc, line, removal))
     return _load(project, log)
+
+
+def recover(project, *, now=None, config=None):
+    """The one named operation that may finish a pending queue commit. Proves the whole commit read-only first.
+
+    Returns True when a queue commit was finished, False when none was pending. A record it cannot prove stays,
+    exit code 8, nothing written; the operator procedure is in docs/queue-spec.md (Q-REC-02)."""
+    log = EventLog(project)
+
+    def run():
+        with project.locked(LOCK_TIMEOUT, create=True):
+            had = project.exists(PENDING)
+            _recover(project, log, "recover")
+            return had
+
+    return task_mod._guarded(run)
+
+
+def diagnose(project, events_verified=False):
+    """Read-only report for `shit check`: [(exit code, text)] and the queue summary line, or ([], None) when the
+    queue has never been used. Takes the store lock without creating anything and never recovers."""
+    log = EventLog(project)
+    findings = []
+
+    def run():
+        with project.locked(LOCK_TIMEOUT):
+            had = project.exists(PENDING)
+            try:
+                plan = _refusing(lambda: _plan(project, log, "recover", events_verified))  # reads only
+            except ShitError:
+                findings.append((FAILED_CLOSED, "queue pending record cannot be proven; see Q-REC-02" if had
+                                 else "queue state does not verify"))
+                return None
+            if had:
+                findings.append((FAILED_CLOSED, "queue pending record present and provable; run queue.recover"))
+            return plan["state"]
+
+    state = task_mod._guarded(run)
+    if state is not None and state.entries:
+        return findings, f"queue: {len(state.entries)} entries, chain, anchor and lifecycle agreement verified"
+    return findings, None
 
 
 def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, lifecycle=None, shards=()):
@@ -843,13 +916,15 @@ def _maintain_once(ctx):
         queued = state.tasks.get(task_id)
         expected = qr.expected_lease(task_id, queued) if queued else None
         if expected is None:
+            observed = _sha(ctx.project.read(f"{LEASES}/{name}", limit=records.MAX_RECORD_BYTES)) \
+                if queued is not None else None
             last = state.entries[-1] if state.entries else None
             repeat = (last is not None and last["kind"] == "orphan_removed" and last["task_id"] == task_id
-                      and queued is not None and last["state_after"] == queued["state"])
-            if queued is not None and not repeat:  # the audit entry commits (cap, chain) before the file goes;
-
+                      and last.get("orphan_sha256") == observed and observed is not None)
+            if queued is not None and not repeat:  # the audit entry names the file's digest and commits (cap, chain)
+                # before the file goes; a repeat after a crash between the two is skipped only for that same file
                 _commit(ctx, {"task_id": task_id, "actor": "wrapper", "kind": "orphan_removed",
-                              "state_after": queued["state"]})
+                              "state_after": queued["state"], "orphan_sha256": observed})
             ctx.project.remove(f"{LEASES}/{name}")
             return True
         on_disk = _closed(partial(_read_lease, ctx.project, name))
@@ -876,7 +951,7 @@ def _operate(project, now, config, body):
     log = EventLog(project)
 
     def run():
-        with project.locked(LOCK_TIMEOUT):
+        with project.locked(LOCK_TIMEOUT, create=True):
             ctx = _Ctx(project, log, now, config)
             ctx._state = _recover(project, log)
             state = ctx.load()

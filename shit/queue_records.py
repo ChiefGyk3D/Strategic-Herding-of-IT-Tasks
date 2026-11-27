@@ -75,7 +75,7 @@ KINDS = {
     "failed": (set(), _LEASE, HW, ("failed",)),
     "reopened": (set(), set(), ("human",), ("ready", "waiting")),
     "done": (set(), set(), HW, ("done",)),
-    "orphan_removed": (set(), {"lease_id"}, W, STATES),
+    "orphan_removed": (set(), {"lease_id", "orphan_sha256"}, W, STATES),
     # A change to the dependency graph. It carries no queue state: a task need not be enqueued to have edges.
     "graph_changed": ({"shards"}, set(), HW, ()),
 }
@@ -150,6 +150,8 @@ def validate_entry(obj):
     if "message" in obj:
         records._text(obj, "message", MAX_MESSAGE)
     if "lease_id" in obj and (not isinstance(obj["lease_id"], str) or not LEASE_ID.fullmatch(obj["lease_id"])):
+        raise reject()
+    if "orphan_sha256" in obj and (not isinstance(obj["orphan_sha256"], str) or not HEX64.fullmatch(obj["orphan_sha256"])):
         raise reject()
     if "generation" in obj and (type(obj["generation"]) is not int or obj["generation"] < 1):
         raise reject()
