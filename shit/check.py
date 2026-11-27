@@ -18,10 +18,11 @@ import os
 import re
 import stat
 
-from . import _cli, brief, config, evidence, records
+from . import _cli, brief, config, evidence, queue, records
 from ._text import check_text, decode
 from .errors import (
     CONFINEMENT,
+    FAILED_CLOSED,
     ILLEGAL_TRANSITION,
     INPUT_LIMIT,
     PRECONDITION,
@@ -38,7 +39,7 @@ MAX_TASKS = 5000
 NEEDS_BRIEF = {"running", "review", "approved", "closed", "blocked", "failed"}
 NEEDS_REPORT = {"review", "approved", "closed"}
 NEEDS_DISPOSITION = {"approved", "closed"}
-PRIORITY = (CONFINEMENT, INPUT_LIMIT, REJECTED, ILLEGAL_TRANSITION, PRECONDITION)
+PRIORITY = (CONFINEMENT, INPUT_LIMIT, REJECTED, FAILED_CLOSED, ILLEGAL_TRANSITION, PRECONDITION)
 DISPOSITION_KEYS = {
     "schema", "schema_version", "id", "task_id", "created_at", "actor", "status", "question", "choice",
     "rationale", "supersedes_id",
@@ -275,6 +276,7 @@ def run_check(repo, task=None):
         if not stat.S_ISDIR(st.st_mode):
             raise ShitError(CONFINEMENT)
         failures = _Failures()
+        queue_line = None
         ids, bad_names = _task_ids(project)
         if bad_names:
             failures.add(REJECTED, "tasks", "unexpected entry")
@@ -284,8 +286,10 @@ def run_check(repo, task=None):
             ids = [task]
         for task_id in ids:
             _check_task(project, task_id, failures)
+        events_ok = False
         try:
             EventLog(project).verify()
+            events_ok = True
         except _cli.EXPECTED as exc:
             failures.add(_code(exc), "events", "log rejected")
         if _root_unchanged(repo, repo_fd, project, failures):
@@ -293,11 +297,16 @@ def run_check(repo, task=None):
             _root_unchanged(repo, repo_fd, project, failures)
         if project.exists("pending.json"):
             failures.add(REJECTED, "store", "unfinished commit; run any task command to recover")
+        findings, queue_line = queue.diagnose(project, events_ok)  # read-only: the queue state and any queue pending record
+        for code, text in findings:
+            failures.add(code, "queue", text)
     finally:
         project.close()
         os.close(repo_fd)
     code = failures.code()
     lines = [line for _, line in failures.items] + failures.warnings
+    if queue_line:
+        lines.append(queue_line)
     lines.append(f"check: {'failed' if code else 'ok'} ({len(ids)} task{'s' if len(ids) != 1 else ''})")
     return code, lines
 

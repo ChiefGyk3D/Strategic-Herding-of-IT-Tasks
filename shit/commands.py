@@ -163,7 +163,7 @@ def show(project, kind, rid):
 
     def run():
         with project.locked():
-            task_mod._recover(project, log)
+            task_mod._recover(project, log, "reader")
             return _load(project, log.verify(), kind, rid)
 
     return task_mod._guarded(run)
@@ -179,7 +179,7 @@ def _add(project, kind, record, check):
     log = EventLog(project)
 
     def run():
-        with project.locked():
+        with project.locked(create=True):
             task_mod._recover(project, log)
             current = records.load_task(project.read(task_mod._task_path(task_id)))
             if current["state"] == "closed":

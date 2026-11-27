@@ -14,7 +14,13 @@ import stat
 import time
 from pathlib import Path
 
-from .errors import CONFINEMENT, INPUT_LIMIT, INTERNAL, PRECONDITION, ShitError
+from .errors import (
+    CONFINEMENT,
+    INPUT_LIMIT,
+    INTERNAL,
+    PRECONDITION,
+    ShitError,
+)
 
 STORE_NAME = ".shit"
 SUBDIRS = ("tasks",)
@@ -166,6 +172,11 @@ class Project:
                     raise _os_error(exc) from None
                 finally:
                     proj._close(fd)
+            lock = os.open(LOCK_NAME, os.O_WRONLY | os.O_CREAT | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=proj._fd)
+            os.close(lock)  # created here so that locking never has to create it (see `locked`)
+        except OSError as exc:
+            proj.close()
+            raise _os_error(exc) from None
         except BaseException:
             proj.close()
             raise
@@ -219,7 +230,7 @@ class Project:
             os.close(fd)
             raise
 
-    def _stat_leaf(self, dirfd, name):
+    def _stat_leaf(self, dirfd, name, links=1):
         """lstat the leaf: None when absent, else its stat result after type and link checks."""
         try:
             st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
@@ -227,21 +238,22 @@ class Project:
             return None
         except OSError as exc:
             raise _os_error(exc) from None
-        self._check_regular(st)
+        self._check_regular(st, links)
         return st
 
     @staticmethod
-    def _check_regular(st):
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+    def _check_regular(st, links=1):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != links:
             raise ShitError(CONFINEMENT)
 
     # -- reading and writing --------------------------------------------------
 
-    def read(self, rel, limit=DEFAULT_LIMIT):
+    def read(self, rel, limit=DEFAULT_LIMIT, links=1):
+        """Read a regular file. `links` is the link count it must have: 2 only for a proven publication pair."""
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])
         try:
-            before = self._stat_leaf(dirfd, parts[-1])
+            before = self._stat_leaf(dirfd, parts[-1]) if links == 1 else self._stat_leaf(dirfd, parts[-1], links)
             if before is None:
                 raise ShitError(PRECONDITION)
             try:
@@ -252,7 +264,7 @@ class Project:
             self._close(dirfd)
         try:
             after = os.fstat(fd)
-            self._check_regular(after)
+            self._check_regular(after, links)
             if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
                 raise ShitError(CONFINEMENT)
             chunks, total = [], 0
@@ -305,8 +317,20 @@ class Project:
                     os.unlink(tmp, dir_fd=dirfd)
             self._close(dirfd)
 
-    def append(self, rel, data):
-        """Append `data` to a regular single-link file, creating it with mode 0600."""
+    def size(self, rel):
+        """Byte size of the regular single-link file `rel`, or 0 when it does not exist."""
+        parts = self._split(rel)
+        dirfd = self._walk(parts[:-1])
+        try:
+            st = self._stat_leaf(dirfd, parts[-1])
+            return 0 if st is None else st.st_size
+        finally:
+            self._close(dirfd)
+
+    def append(self, rel, data, limit=None):
+        """Append `data` to a regular single-link file, creating it with mode 0600.
+
+        With `limit`, an append that would make the file longer than `limit` is refused before any byte is written."""
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])
         try:
@@ -317,7 +341,10 @@ class Project:
             except OSError as exc:
                 raise _os_error(exc) from None
             try:
-                self._check_regular(os.fstat(fd))
+                after = os.fstat(fd)
+                self._check_regular(after)
+                if limit is not None and after.st_size + len(data) > limit:
+                    raise ShitError(INPUT_LIMIT)
                 view = memoryview(data)
                 while view:
                     view = view[os.write(fd, view):]
@@ -341,6 +368,115 @@ class Project:
         except OSError as exc:
             raise _os_error(exc) from None
         self._close(self._walk(parts))
+
+    def list_dir(self, name):
+        """Return the sorted entry names of the single-component directory `name` below the store."""
+        parts = self._split(name)
+        if len(parts) != 1:
+            raise ShitError(CONFINEMENT)
+        fd = self._walk(parts)
+        try:
+            return sorted(os.listdir(fd))
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            self._close(fd)
+
+    def create_exclusive(self, rel, data, limit=DEFAULT_LIMIT):
+        """Create `rel` with `data` only if it does not exist; return False when something is already there.
+
+        The content is written to a temp file and hard-linked into place, so the file appears complete or
+        not at all, and an existing entry (even a symlink) is never opened or followed.
+        """
+        parts = self._split(rel)
+        if len(data) > limit:
+            raise ShitError(INPUT_LIMIT)
+        dirfd = self._walk(parts[:-1])
+        tmp = f".tmp-{secrets.token_hex(8)}"
+        created = False
+        try:
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=dirfd)
+            except OSError as exc:
+                raise _os_error(exc) from None
+            created = True
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                self._close(fd)
+            try:
+                os.link(tmp, parts[-1], src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+            except FileExistsError:
+                return False
+            os.unlink(tmp, dir_fd=dirfd)
+            created = False
+            os.fsync(dirfd)
+            return True
+        except ShitError:
+            raise
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            if created:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=dirfd)
+            self._close(dirfd)
+
+    def publication_pairs(self, name):
+        """Read-only: the `(temp name, sibling name)` pairs an interrupted exclusive publication left in `name`.
+
+        An exact pair is a `.tmp-` regular file with two links whose other link is one non-temp sibling in the same
+        directory. Returns [] when the directory is absent. Nothing is written."""
+        parts = self._split(name)
+        if len(parts) != 1:
+            raise ShitError(CONFINEMENT)
+        try:
+            fd = self._walk(parts)
+        except ShitError as exc:
+            if exc.code == PRECONDITION:
+                return []
+            raise
+        try:
+            names = os.listdir(fd)
+            seen, temps = {}, []
+            for entry in names:
+                try:
+                    st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and st.st_nlink == 2:
+                    seen.setdefault((st.st_dev, st.st_ino), []).append(entry)
+                    if entry.startswith(".tmp-"):
+                        temps.append((entry, (st.st_dev, st.st_ino)))
+            out = []
+            for tmp, key in temps:
+                group = seen[key]
+                other = [n for n in group if n != tmp]
+                if len(group) == 2 and len(other) == 1 and not other[0].startswith(".tmp-"):
+                    out.append((tmp, other[0]))
+            return sorted(out)
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            self._close(fd)
+
+    def finish_publications(self, name):
+        """Remove the temp name of each exact pair (`publication_pairs`). Caller holds the lock."""
+        pairs = self.publication_pairs(name)
+        if not pairs:
+            return
+        fd = self._walk(self._split(name))
+        try:
+            for tmp, _sibling in pairs:
+                os.unlink(tmp, dir_fd=fd)
+            os.fsync(fd)
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            self._close(fd)
 
     def exists(self, rel):
         parts = self._split(rel)
@@ -371,16 +507,35 @@ class Project:
         return self._lock_fd is not None
 
     @contextlib.contextmanager
-    def locked(self, timeout=5.0):
-        """Hold the store's exclusive advisory lock. Contention past `timeout` is exit code 1."""
+    def locked(self, timeout=5.0, create=False):
+        """Hold the store's exclusive advisory lock. Contention past `timeout` is exit code 1.
+
+        `create` lets a write-capable caller create a missing `lock` file (a content-free file, a state-independent
+        step; `init` normally created it already). A read-only caller leaves a missing file missing.
+
+        The lock is taken on a fresh descriptor of the store directory itself: a descriptor, not a pathname, so
+        unlinking or replacing the `lock` file cannot admit a second holder. The `lock` file is still opened and
+        checked (a special file there is refused) but exclusion does not depend on it.
+        """
         if self._lock_fd is not None:
             raise ShitError(INTERNAL)
+        flags = os.O_RDWR | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC | (os.O_CREAT if create else 0)
         try:
-            fd = os.open(LOCK_NAME, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=self._fd)
+            check = os.open(LOCK_NAME, flags, FILE_MODE, dir_fd=self._fd)
+        except FileNotFoundError:
+            check = None
+        except OSError as exc:
+            raise _os_error(exc) from None
+        if check is not None:
+            try:
+                self._check_regular(os.fstat(check))
+            finally:
+                self._close(check)
+        try:
+            fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=self._fd)
         except OSError as exc:
             raise _os_error(exc) from None
         try:
-            self._check_regular(os.fstat(fd))
             deadline = time.monotonic() + timeout
             while True:
                 try:
