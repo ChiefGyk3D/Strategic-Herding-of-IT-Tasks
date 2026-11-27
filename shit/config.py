@@ -13,6 +13,7 @@ is rejected. Errors are fixed strings and never echo the rejected value.
 """
 
 import re
+
 import tomllib
 
 from shit._text import check_size, check_text, decode, has_placeholder, read_bounded
@@ -27,9 +28,14 @@ _CONTEXT_WINDOWS = (32768, 65536)
 _MAX_TEXT = 500
 _MAX_ROLES = 16
 
+# Event kinds the yardstick report (shit/yardstick.py) can weight, in docs/schemas.md event order.
+WEIGHT_KEYS = ("task_created", "state_transition", "brief_recorded", "report_recorded", "decision_recorded",
+               "evidence_recorded", "review_recorded", "command_failed")
+_MAX_WEIGHT = 1000
+
 # table -> {key: kind}. Kinds: "int1" exact schema version, "text" bounded string, "slug" lowercase slug,
 # "repo" owner/repo reference, "log" path under .shit, "root" the fixed storage root, "bool", "window"
-# context size in tokens, "slugs" list of slugs. The top level has only schema_version.
+# context size in tokens, "slugs" list of slugs, "weight" integer 0 to 1000. The top level has only schema_version.
 SCHEMA = {
     "": {"schema_version": "int1"},
     "project": {"name": "slug"},
@@ -40,6 +46,7 @@ SCHEMA = {
     "log": {"file": "log"},
     "privacy": {"scan": "bool"},
     "local_model": {"context_tokens": "window"},
+    "yardstick": {name: "weight" for name in WEIGHT_KEYS},
 }
 REQUIRED = {
     "": ["schema_version"],
@@ -54,6 +61,7 @@ REQUIRED = {
 DEFAULTS = {
     "roles": {"names": ["implementer", "reviewer", "researcher", "planner"]},
     "privacy": {"scan": True},
+    "yardstick": {name: 1 for name in WEIGHT_KEYS},
 }
 
 
@@ -81,6 +89,10 @@ def _check_value(kind, value):
     if kind == "window":
         if type(value) is not int or value not in _CONTEXT_WINDOWS:
             raise rejected("context_tokens: must be 32768 or 65536")
+        return value
+    if kind == "weight":
+        if type(value) is not int or not 0 <= value <= _MAX_WEIGHT:
+            raise rejected("yardstick: weight must be an integer from 0 to 1000")
         return value
     if kind == "slugs":
         if not isinstance(value, list) or not value or len(value) > _MAX_ROLES:
