@@ -209,6 +209,18 @@ An `accepted` decision that grants approval must have `actor` equal to `human`. 
 }
 ```
 
+## Evidence record
+
+An evidence record names one regular file under the repository and pins it by digest. Common fields are as in the other records (`schema` `evidence`, `schema_version` 1, `id`, `task_id`, `created_at`, `actor`). Added fields, all required: `description` (nonempty, at most 1,000 characters), `path` (repository-relative, at most 500 characters, no empty, `.` or `..` component, never under `.shit`), `sha256` (64 lowercase hex digits) and `size` (integer, bytes). The file must be a regular, single-link file reached without a symlink and at most 16 MiB. `close` re-reads the file and rejects the task with exit code 3 if the digest or size changed.
+
+## Review record
+
+A review records a verdict on one report. Common fields as above (`schema` `review`), plus `report_id` (slug of a report of the same task), `verdict` (`pass`, `changes` or `fail`) and `summary` (nonempty, at most 4,000 characters). A review is accepted only while the task is in `review`. A review is not an approval: only an accepted decision by a human, followed by the human transition into `approved`, grants approval.
+
+## Recording and closing rules
+
+Report, evidence, review and decision files live under `.shit/reports`, `.shit/evidence`, `.shit/reviews` and `.shit/decisions`. Each is recorded by an event whose `message` carries the sha256 of the file bytes (`<Kind> record added; sha256 <hex>.`). A reader trusts a file only when that event exists and the digest matches, so an edited, dropped or crash-orphaned file is never treated as recorded. Every string in these records is refused if it holds a control, bidirectional, zero-width or separator character. A decision with status `accepted` recorded by a non-human actor is refused with exit code 10. `close` requires, in one locked step: a task in `approved`, a report with outcome `success`, a latest review with verdict `pass` on a successful report, that report's evidence unchanged, and a latest effective decision that is `accepted` by a human (a decision named by a later `supersedes_id` is not effective). A missing record is exit code 9; a missing human decision is exit code 10.
+
 ## Event-log record
 
 ### Purpose
