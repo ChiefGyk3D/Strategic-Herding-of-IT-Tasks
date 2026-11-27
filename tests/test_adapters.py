@@ -8,7 +8,6 @@ Every guard has an accepted case and a refused case, so a guard that stops bitin
 import os
 import tempfile
 import unittest
-from pathlib import Path
 
 import _bootstrap
 
@@ -125,8 +124,8 @@ class ArgvTests(unittest.TestCase):
 class HostileTitleTests(unittest.TestCase):
     """A malicious task title cannot become shell syntax: it stays inside one prompt text."""
 
-    PAYLOADS = ["$(touch pwned)", "`touch pwned`", "; rm -rf / ;", "x' && touch pwned #", "| cat /etc/passwd",
-                "--dangerously-skip-permissions", "-s danger-full-access", "${IFS}pwned", "&& echo hi"]
+    PAYLOADS = ("$(touch pwned)", "`touch pwned`", "; rm -rf / ;", "x' && touch pwned #", "| cat /etc/passwd",
+                "--dangerously-skip-permissions", "-s danger-full-access", "${IFS}pwned", "&& echo hi")
 
     def test_payload_never_becomes_an_argument_or_flag(self):
         for payload in self.PAYLOADS:
@@ -177,7 +176,7 @@ class InputGuardTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 7)
 
     def test_hostile_characters_refused(self):
-        for bad in ("\x1b[31m", "‮", "\x00", "​"):
+        for bad in ("\x1b[31m", chr(0x202E), "\x00", chr(0x200B)):
             with self.assertRaises(ContractError):
                 adapters.get("prompt").prepare(brief_text() + bad)
 
@@ -302,7 +301,7 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 7)
 
     def test_hostile_output_refused(self):
-        for bad in ("\x1b]0;title\x07", "‮", "\x00", "​"):
+        for bad in ("\x1b]0;title\x07", chr(0x202E), "\x00", chr(0x200B)):
             with self.assertRaises(ContractError):
                 adapters.get("copilot").parse_output(GOOD_REPORT + bad)
 

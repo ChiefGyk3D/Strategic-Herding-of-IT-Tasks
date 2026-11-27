@@ -28,7 +28,7 @@ MAX_ARG_CHARS = 200
 ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ")
 CONFIG_KEYS = ("extra_args", "timeout")
 
-_ARG = re.compile(r"[ -~]{1,%d}" % MAX_ARG_CHARS)  # printable ASCII only; no control character, no newline
+_ARG = re.compile(rf"[ -~]{{1,{MAX_ARG_CHARS}}}")  # printable ASCII only; no control character, no newline
 
 _REPORT_LINES = """ROLE: <your role>   MODEL: <exact model id, or n/a - done by hand>
 HEAD: <short sha>   BASE: <short sha>
