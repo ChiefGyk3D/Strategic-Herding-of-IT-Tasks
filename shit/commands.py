@@ -282,7 +282,7 @@ def _check_closable(project, log, task_id):
     reports = {r["id"]: r for r in loaded["report"]}
     if not any(r["outcome"] == "success" for r in reports.values()):
         raise ShitError(PRECONDITION)
-    if not loaded["review"] or loaded["review"][-1]["verdict"] != "pass":
+    if not loaded["review"] or loaded["review"][-1]["verdict"] != "pass" or loaded["review"][-1]["actor"] != "human":
         raise ShitError(PRECONDITION)
     reviewed = reports.get(loaded["review"][-1]["report_id"])
     if reviewed is None or reviewed["outcome"] != "success":

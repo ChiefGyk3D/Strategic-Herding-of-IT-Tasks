@@ -175,6 +175,31 @@ class Preconditions(Base):
 
 
 class CloseGates(Base):
+    def _reviewed(self, first, second):
+        self.new()
+        self.move("running", "wrapper")
+        self.evidence()
+        self.report()
+        self.move("review", "wrapper")
+        self.review("v1", verdict=first[0], actor=first[1])
+        self.review("v2", verdict=second[0], actor=second[1])
+        self.decision()
+        self.move("approved", "human")
+
+    def test_automated_pass_cannot_override_human_fail(self):
+        self._reviewed(("fail", "human"), ("pass", "model"))
+        before = self.snapshot()
+        self.assertEqual(self.code(commands.close_task, self.proj, "t1", "human", "r", now=self.tick()), 9)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_wrapper_pass_alone_cannot_close(self):
+        self._reviewed(("changes", "human"), ("pass", "wrapper"))
+        self.assertEqual(self.code(commands.close_task, self.proj, "t1", "human", "r", now=self.tick()), 9)
+
+    def test_human_pass_after_human_fail_closes(self):
+        self._reviewed(("fail", "human"), ("pass", "human"))
+        self.assertEqual(commands.close_task(self.proj, "t1", "human", "r", now=self.tick())["state"], "closed")
+
     def test_close_not_approved_is_4(self):
         self.new()
         self.assertEqual(self.code(commands.close_task, self.proj, "t1", "human", "r", now=self.tick()), 4)
