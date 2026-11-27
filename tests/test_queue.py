@@ -1804,7 +1804,9 @@ class BoundedWork(QueueCase):
 class RecoveryWrites(QueueCase):
     """Recovery proves the whole interrupted operation, both subsystems included, before its first write."""
 
-    WRITERS = ("write_atomic", "append", "remove", "create_exclusive", "ensure_dir", "finish_publications")
+    WRITERS = ("write_atomic", "append", "remove", "create_exclusive", "ensure_dir", "finish_publications",
+               "quarantine_move")
+    crash_at = PendingProof.crash_at
 
     def crashed_submit(self, nested=False):
         self.task("t1")
@@ -1957,6 +1959,125 @@ class RecoveryWrites(QueueCase):
         q.recover(self.proj, now=self.tick())
         self.assertFalse((self.shit / "queue-pending.json").exists())
         self.assertEqual(self.status()["t1"]["state"], "review")
+
+
+    # Round 5: anchor generations and removal targets are proven before any write; quarantine is a proven rename.
+
+    def test_anchor_generations_are_proven_before_recovery_writes(self):  # round 5
+        for tid in ("a", "b"):
+            self.task(tid)
+            q.release(self.proj, self.present(self.claim(tid)), now=self.tick())
+        self.crash_at("pending-written", self.claim, "a")
+        path = self.shit / "queue-anchor.json"
+        doc = json.loads(path.read_text())
+        doc["generations"]["b"] = 99
+        path.write_text(json.dumps(doc))
+        before = self.tree()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_lease_to_remove_must_be_the_lease_the_replay_says_exists(self):  # round 5
+        self.task("t1")
+        lease = self.claim("t1")
+        self.crash_at("pending-written", q.release, self.proj, self.present(lease), now=self.tick())
+        path = self.shit / "leases" / "t1.json"
+        other = {**json.loads(path.read_text()), "lease_id": "e" * 32}
+        path.write_bytes(qr.dump_lease(other))
+        before = self.tree()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_lease_removal_that_matches_still_recovers(self):  # round 5 positive control
+        self.task("t1")
+        lease = self.claim("t1")
+        self.crash_at("pending-written", q.release, self.proj, self.present(lease), now=self.tick())
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+        self.assertFalse((self.shit / "leases" / "t1.json").exists())
+
+    def test_a_queue_that_does_not_verify_is_not_normalized_first(self):  # round 5
+        self.task("t1")
+        self.claim("t1")
+        os.link(self.shit / "leases" / "t1.json", self.shit / "leases" / ".tmp-0123456789abcdef")
+        os.rmdir(self.shit / "deps")
+        path = self.shit / "queue-anchor.json"
+        doc = json.loads(path.read_text())
+        doc["tip"] = "0" * 64
+        path.write_text(json.dumps(doc))
+        before = self.tree()
+        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assertEqual(self.tree(), before)
+
+    def blocked_valid_commit(self):
+        self.task("t1")
+        self.crash_at("pending-written", self.claim, "t1")
+        path = self.shit / "events.chain"
+        good = path.read_bytes()
+        data = bytearray(good)
+        data[3] = ord("0") if data[3] != ord("0") else ord("1")
+        path.write_bytes(bytes(data))
+        return path, good
+
+    def test_quarantine_is_refused_when_the_record_itself_is_not_proven_bad(self):  # round 5
+        path, good = self.blocked_valid_commit()
+        before = self.tree()
+        self.assertEqual(self.code(q.recover, self.proj, quarantine=True, now=self.tick()), 8)
+        self.assertEqual(self.tree(), before)
+        path.write_bytes(good)
+        self.assertEqual(self.status()["t1"]["state"], "dispatched")  # the committed claim was not abandoned
+
+    def test_quarantine_moves_the_same_inode_and_names_it(self):  # round 5
+        self.task("t1")
+        pending = self.shit / "queue-pending.json"
+        pending.write_text("{not json")
+        inode = pending.stat().st_ino
+        name = q.recover(self.proj, quarantine=True, now=self.tick())
+        self.assertFalse(pending.exists())
+        moved = self.shit / "quarantine" / name
+        self.assertEqual((moved.read_bytes(), moved.stat().st_ino), (b"{not json", inode))
+        self.assertIsNone(q.recover(self.proj, quarantine=True, now=self.tick()))  # idempotent: nothing left to move
+
+    def test_a_record_whose_slot_is_taken_by_another_committed_entry_is_proven_stale(self):  # round 5
+        for tid in ("a", "b", "c"):
+            self.task(tid)
+        self.crash_at("pending-written", q.add_edge, self.proj, "b", "a", "draft", "human", now=self.tick())
+        path = self.shit / "queue-pending.json"
+        held = path.read_bytes()
+        path.unlink()
+        self.claim("c")  # a different entry now occupies the slot
+        (self.shit / "queue-pending.json").write_bytes(held)
+        self.assertEqual(self.code(self.status), 8)
+        name = q.recover(self.proj, quarantine=True, now=self.tick())
+        self.assertEqual((self.shit / "quarantine" / name).read_bytes(), held)
+        self.assertEqual(self.status()["c"]["state"], "dispatched")
+
+    def test_a_record_swapped_in_after_the_proof_is_not_moved(self):  # round 5
+        self.task("t1")
+        pending = self.shit / "queue-pending.json"
+        pending.write_text("{not json")
+        real = Project.ensure_dir
+        swapped = {}
+
+        def swap(project, name):
+            if name == "quarantine" and not swapped:
+                swapped["done"] = True
+                pending.unlink()
+                pending.write_text("{\"replacement\": true}")
+            return real(project, name)
+
+        with mock.patch.object(Project, "ensure_dir", swap):
+            self.assertEqual(self.code(q.recover, self.proj, quarantine=True, now=self.tick()), 8)
+        self.assertEqual(pending.read_text(), "{\"replacement\": true}")
+        self.assertEqual(os.listdir(self.shit / "quarantine"), [])
+
+    def test_quarantine_writes_only_after_its_proof(self):  # round 5
+        self.task("t1")
+        (self.shit / "queue-pending.json").write_text("{not json")
+        log, code = self.record(lambda: q.recover(self.proj, quarantine=True, now=self.tick()))
+        self.assertEqual(code, 0)
+        self.assertIn("stage:quarantine-proven", log)
+        marker = log.index("stage:quarantine-proven")
+        self.assertEqual([n for n in log[:marker] if not n.startswith("stage:")], [])
+        self.assertTrue([n for n in log[marker:] if not n.startswith("stage:")])
 
 
 if __name__ == "__main__":

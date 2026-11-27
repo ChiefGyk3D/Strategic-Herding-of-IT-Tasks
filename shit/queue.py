@@ -180,6 +180,16 @@ def _task_exists(project, task_id):
     return project.exists(task_mod._task_path(task_id))
 
 
+def _list(project, name):
+    """Directory listing for a read-only proof: an absent directory is an empty one (it is created after the proof)."""
+    try:
+        return project.list_dir(name)
+    except ShitError as exc:
+        if exc.code == PRECONDITION:
+            return []
+        raise
+
+
 def _read_shard(project, task_id):
     try:
         return project.read(f"{DEPS}/{task_id}.json", limit=records.MAX_RECORD_BYTES)
@@ -195,7 +205,7 @@ def _load_graph(project, entries, tasks, overrides=None):
     if project.exists(LEGACY_GRAPH):
         raise ShitError(REJECTED)
     present = set()
-    for name in project.list_dir(DEPS):
+    for name in _list(project, DEPS):
         if name.startswith(".tmp-"):
             continue  # a crash leftover; maintenance removes it
         task_id = name[:-5] if name.endswith(".json") else ""
@@ -386,8 +396,14 @@ def _apply_shards(project, shards):
             project.write_atomic(path, item["content"].encode("ascii"))
 
 
-def _apply_lease(project, doc, entry):
-    """Step one: write, replace or remove the lease file. Returns False on a conflict nothing was applied for."""
+_UNPROVEN = object()  # a commit applied right after it was written, from state the operation itself just verified
+
+
+def _apply_lease(project, doc, removal=_UNPROVEN):
+    """Step one: write, replace or remove the lease file. Returns False on a conflict nothing was applied for.
+
+    In recovery `removal` is the digest phase one proved for the lease to remove (None: it was absent); the file is
+    removed only if it still has that digest."""
     lease = doc["lease"]
     if lease is not None:
         path = _lease_path(lease["task_id"])
@@ -402,7 +418,17 @@ def _apply_lease(project, doc, entry):
             return True
         return False
     if doc["remove_lease"] is not None:
-        project.remove(_lease_path(doc["remove_lease"]))
+        path = _lease_path(doc["remove_lease"])
+        if removal is not _UNPROVEN:
+            try:
+                current = _sha(project.read(path, limit=records.MAX_RECORD_BYTES))
+            except ShitError as exc:
+                if exc.code == PRECONDITION:
+                    return removal is None
+                raise
+            if current != removal:
+                return False
+        project.remove(path)
     return True
 
 
@@ -430,9 +456,9 @@ def _append_one(project, rel, lines, index, line):
         raise ShitError(FAILED_CLOSED)
 
 
-def _apply_pending(project, log, doc, line):
+def _apply_pending(project, log, doc, line, removal=_UNPROVEN):
     """Apply a pending commit step by step. Every step is idempotent, so it is safe to repeat after a crash."""
-    if not _apply_lease(project, doc, None):
+    if not _apply_lease(project, doc, removal):
         raise ShitError(FAILED_CLOSED)  # defensive: recovery proves the lease path first; the record is never removed here
     _checkpoint("lease-applied")
     _apply_lifecycle(project, log, doc["lifecycle"])
@@ -506,12 +532,56 @@ def _prove_tail(project, doc, line, entry, lines, chain, task_plan, events):
         raise ShitError(REJECTED)
     tasks = qr.replay(prior)
     after = qr.replay([*prior, entry])
+    _prove_anchor_state(project, doc, tasks, after)
     qr.check_effects(doc, entry, tasks.get(entry["task_id"]), after.get(entry["task_id"]))
+    removal = _prove_removal(project, doc, entry, tasks)
     life = doc["lifecycle"]
     if life is not None:
         _prove_lifecycle(project, doc, entry, after, task_plan, events)
     if doc["shards"]:
         _load_graph(project, [*prior, entry], after, {item["task_id"]: item["content"] for item in doc["shards"]})
+    return removal
+
+
+def _held(tasks):
+    return {t: v["generation"] for t, v in tasks.items() if v["generation"]}
+
+
+def _prove_anchor_state(project, doc, tasks, after):
+    """The anchor's generation marks must equal the replayed state it claims to be at: the prefix, or the commit."""
+    anchor = _read_anchor(project)
+    index = doc["index"]
+    if anchor is None:
+        if index != 0 or _held(tasks):
+            raise ShitError(REJECTED)
+        return
+    want = _held(after) if anchor["count"] == index + 1 else _held(tasks)
+    if anchor["generations"] != want:
+        raise ShitError(REJECTED)
+
+
+def _prove_removal(project, doc, entry, tasks):
+    """A lease to remove must be absent (already removed) or exactly the lease the replay says is live.
+
+    Returns the SHA-256 of the proven file, or None when it is absent. Read-only."""
+    task_id = doc["remove_lease"]
+    if task_id is None:
+        return None
+    expected = qr.expected_lease(task_id, tasks[task_id]) if task_id in tasks else None
+    path = _lease_path(task_id)
+    pair = any(sibling == f"{task_id}.json" for _tmp, sibling in project.publication_pairs(LEASES))
+    try:
+        data = project.read(path, limit=records.MAX_RECORD_BYTES, links=2 if pair else 1)
+    except ShitError as exc:
+        if exc.code == PRECONDITION:
+            return None
+        raise
+    if expected is None:
+        raise ShitError(REJECTED)
+    on_disk = qr.load_lease(data)
+    if {k: on_disk.get(k) for k in expected} != expected:
+        raise ShitError(REJECTED)
+    return _sha(data)
 
 
 def _prove_lifecycle(project, doc, entry, after, task_plan, events):
@@ -571,9 +641,9 @@ def _plan_recovery(project, log):
     else:
         events = log.verify_lines(task_plan["log_lines"][:task_plan["index"]],
                                   log._split(eventlog.CHAIN_PATH)[0][:task_plan["index"]])
-    _prove_tail(project, doc, line, entry, lines, chain, task_plan, events)
+    removal = _prove_tail(project, doc, line, entry, lines, chain, task_plan, events)
     _check_lease_effect(project, doc)
-    return task_plan, doc, line
+    return task_plan, doc, line, removal
 
 
 def _prepare_dirs(project):
@@ -589,19 +659,22 @@ def _recover(project, log):
     Every write recovery can make, in order, and when it is proven:
       1. the nested task commit (heal both event files, append event and chain, write the task, drop its record)
          and the queue files' torn tails, the lease file, shards, queue and chain appends, the anchor, and the
-         removal of the queue record: all after `_plan_recovery` proved the whole operation, both subsystems;
+         removal of the queue record: all after `_plan_recovery` proved the whole operation, both subsystems
+         (anchor marks, lease to remove, effects, nested event and task image included);
       2. the store directories and the removal of a publication temp name: after the same proof (the proof reads
-         such a pair as the pair it is);
-    A refusal in phase one writes nothing. With no pending record the event log is verified (read-only) first."""
+         such a pair as the pair it is, and a missing directory as an empty one). Neither changes any state the
+         proof reads.
+    With no pending record the event log and the whole queue state are verified read-only first.
+    A refusal in phase one writes nothing. A task-only pending record is recovered first, after its own full proof."""
     if not project.exists(PENDING):
         if project.exists(task_mod.PENDING):
             task_mod._recover(project, log, queue_pending_ok=True)  # plans first, then writes
-        else:
-            _closed(log.verify)
+        _closed(log.verify)
+        state = _load(project, log)  # the whole queue state is proven read-only before any normalizing write
         _checkpoint("plan-proven")
         _prepare_dirs(project)
-        return
-    task_plan, doc, line = _refusing(lambda: _plan_recovery(project, log))
+        return state
+    task_plan, doc, line, removal = _refusing(lambda: _plan_recovery(project, log))
     _checkpoint("plan-proven")
     _prepare_dirs(project)
     task_mod._recover(project, log, task_plan, queue_pending_ok=True)
@@ -610,32 +683,55 @@ def _recover(project, log):
     chain, chain_torn = log._split(CHAIN)
     log.heal_torn_tail(QUEUE, lines, torn, index, line + b"\n")
     log.heal_torn_tail(CHAIN, chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
-    _closed(lambda: _apply_pending(project, log, doc, line))
-    _load(project, log)
+    _closed(lambda: _apply_pending(project, log, doc, line, removal))
+    return _load(project, log)
+
+
+def _proven_bad(project):
+    """SHA-256 of the pending record if the record itself is proven unrecoverable, else None. Read-only.
+
+    Proven bad means either its own bytes fail strict parsing and validation (nothing external is consulted), or
+    the verified queue chain already holds a different entry at the record's index, so it can never apply.
+    Anything that depends on another file being repaired (event log, anchor, lease or shard state, a missing
+    prefix) is not proof: that record stays."""
+    data = project.read(PENDING, limit=PENDING_LIMIT)
+    log = EventLog(project)
+    try:
+        doc, line, _entry = _read_pending(project, log)
+    except ShitError as exc:
+        return _sha(data) if exc.code == REJECTED else None
+    try:
+        entries, lines, _chain = _load_log(project, log)
+        qr.replay(entries)
+    except ShitError:
+        return None
+    return _sha(data) if doc["index"] < len(lines) and lines[doc["index"]] != line else None
 
 
 def recover(project, *, quarantine=False, now=None, config=None):
-    """The one supported way out of a queue pending record that cannot be recovered (exit code 8 everywhere).
+    """Try the ordinary recovery of an interrupted queue commit; optionally abandon a record proven unrecoverable.
 
-    Without `quarantine` this only tries the ordinary recovery and, if it is refused, changes nothing. With
-    `quarantine=True` (the explicit confirmation) the refused record is first copied byte for byte to
-    `.shit/quarantine/queue-pending-<sha256 prefix>.json` and only then removed, under the store lock. Nothing
-    else is touched; later operations verify the remaining state as usual and fail closed if it is inconsistent."""
+    Without `quarantine` this only attempts the recovery and, if it is refused, changes nothing (exit code 8).
+    With `quarantine=True` a record that is proven bad (see `_proven_bad`) is moved, by one rename and so as the
+    same file, into `.shit/quarantine/` and its new name is returned. This ABANDONS that commit: it is never
+    applied. A record that is refused for any other reason (a broken event log, anchor, lease or queue file)
+    stays, with exit code 8, until that cause is repaired. Returns None when there was nothing to move."""
     log = EventLog(project)
 
     def run():
         with project.locked(LOCK_TIMEOUT):
             try:
                 _recover(project, log)
-                return False
+                return None
             except ShitError as exc:
                 if not (quarantine and exc.code == FAILED_CLOSED and project.exists(PENDING)):
                     raise
-            data = project.read(PENDING, limit=PENDING_LIMIT)
+            digest = _proven_bad(project)
+            if digest is None:
+                raise ShitError(FAILED_CLOSED)
+            _checkpoint("quarantine-proven")
             project.ensure_dir(QUARANTINE)
-            project.write_atomic(f"{QUARANTINE}/queue-pending-{_sha(data)[:16]}.json", data, limit=PENDING_LIMIT)
-            project.remove(PENDING)
-            return True
+            return project.quarantine_move(PENDING, QUARANTINE, digest, "queue-pending")
 
     return task_mod._guarded(run)
 
@@ -791,8 +887,8 @@ def _operate(project, now, config, body):
 
     def run():
         with project.locked(LOCK_TIMEOUT):
-            _recover(project, log)
             ctx = _Ctx(project, log, now, config)
+            ctx._state = _recover(project, log)
             state = ctx.load()
             _check_clock(ctx, state)
             _maintain(ctx)
