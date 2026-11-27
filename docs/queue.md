@@ -2,6 +2,8 @@
 
 **SELF-REVIEW:** like `docs/queue-spec.md`, this is the implementer's own account. A human peer review is still required. The spec is the authority; this file says what was built, how it maps to the spec, what was left out and what still needs a human decision.
 
+**Scope of the protection (read first).** The queue, leases and recovery in issue 17 protect against crashes, races and mistakes of cooperating workers that run as the same operating-system user. They do not protect against a hostile process of that user (it can read every lease id, plant or rewrite any file under `.shit`, and ignore the advisory lock), nor against a rewrite or restore of the whole store. Multi-tenant or adversarial use needs an operating-system identity boundary, a credential service that holds the secrets outside the workers' reach (issue #48). Every "proves", "refuses" and "fails closed" below is meant inside that scope.
+
 ## What exists
 
 | Module | Content |
@@ -35,7 +37,7 @@ The graph is stored as one `dependency-shard` record per dependent task, `deps/<
 - Caps: 200 `needs` per task (`dependencies.MAX_NEEDS_PER_TASK`, about 12 KB at the cap, far under the 65,536-byte record limit) and 2,000 queued tasks and shards in total (`dependencies.MAX_TASKS`). A breach is exit code 7 (adding an edge, or enqueueing past the total). Both are constants in one module; raising them is a code change plus a test.
 - Chain proof: every graph change appends one `graph_changed` entry carrying the SHA-256 of each shard it wrote (64 zeros for a deleted one). The loader requires the shard files to equal the chain's set exactly and each file's digest to match.
 - Fail closed (exit code 8, nothing written): a shard deleted, edited or added without a chain entry; a record whose `task_id` differs from its file name (two shards disagreeing about an edge); an oversize or malformed shard even when its digest was rechained; a cycle, self edge or dangling edge; a stray file name; a leftover `dependencies.json` from the single-file layout (never released, so there is nothing to migrate).
-- Atomicity: the commit point `queue-pending.json` lists every shard to write or delete with its exact content and the entry that records their digests. Recovery proves the whole commit read-only first, nested task commit included (Q-REC-02), and only then applies it idempotently; a refusal in the proof writes nothing and keeps the record. An unrecoverable pending record has no API: the operator procedure is in Q-REC-02. `add_edges` changes several shards in one commit or none.
+- Atomicity: the commit point `queue-pending.json` lists every shard to write or delete with its exact content and the entry that records their digests. Recovery proves the whole commit read-only first, nested task commit included (Q-REC-02), and only then applies it idempotently; a refusal in the proof writes nothing and keeps the record. An unrecoverable pending record has no API to discard it: the operator procedure is in Q-REC-02. `add_edges` changes several shards in one commit or none.
 - A shard is written with an atomic replace. Edge add and remove stay human or wrapper only, and a task with a live lease cannot lose an edge.
 
 ## Accepted gaps (owner accepted these on 2026-11-27)
@@ -58,7 +60,7 @@ The spec text now matches the code.
 - An append that would cross the 64 MiB log cap is refused with exit code 7 before anything is written. The check for a lifecycle event assumes the largest record, so it refuses slightly early.
 - The task cap (2,000) counts queued ids and shard owners together. An empty persisted shard is refused.
 - Maintenance removes every temporary leftover in one pass, and readiness reads an index of edges by task.
-- Every locked entry point of every command runs the recovery planner first. A provable pending record is recovered by whichever command runs first; a record the planner cannot prove makes every locked entry point refuse with exit code 8 until an operator follows the procedure in Q-REC-02.
+- Entry points refuse on sight: any locked entry point (queue operation, task, evidence, report, review, decision, yardstick) that finds `queue-pending.json` returns exit code 8 and writes nothing, whether the record is genuine or planted. Only `queue.recover(project)` plans and applies it, after proving it read-only (Q-REC-02). Task and artifact writers prove the whole queue state before they commit, even with nothing pending; readers do so only when a pending task record forces a write. `shit check` reports the queue state and any pending record read-only (exit code 8).
 - Not done (follow-up): privacy-scan directory width and cumulative byte budgets, an operation deadline while holding the lock, and `scandir`-based bounded listings (M4).
 
 ## Still open

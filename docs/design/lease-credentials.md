@@ -8,6 +8,8 @@ A lease is proved today by a `lease_id` (128 random bits) plus a generation. Bot
 
 ## Limits (read first)
 
+The queue of issue 17 protects against crashes, races and cooperating workers of one operating-system user, not against a hostile process of that user or a rewrite or restore of the whole store. Multi-tenant or adversarial use needs an operating-system identity boundary and a credential service (issue #48); this note does not provide that.
+
 Per-worker credentials do not stop a hostile process running as the same operating-system user. Memory, environment variables and mode 0600 files are all readable by that user. Without a broker running under a different OS identity (authenticated IPC with peer credentials), or a distinct OS identity per worker, this design only protects against passive disclosure of the `.shit` store (a copied file, a screenshot, a logged listing). The claims in the sections below are read in that narrower sense.
 
 Unresolved items from the Daybreak round 1 review:
