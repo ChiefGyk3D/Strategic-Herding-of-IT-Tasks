@@ -1,0 +1,12 @@
+{
+  "schema": "task",
+  "schema_version": 1,
+  "id": "hostile-task",
+  "title": "evil\u202egnp.exe",
+  "summary": "A right-to-left override in the title makes the name read backwards.",
+  "state": "open",
+  "owner": "human",
+  "created_at": "2026-11-26T15:30:00Z",
+  "updated_at": "2026-11-26T15:30:00Z",
+  "history": []
+}

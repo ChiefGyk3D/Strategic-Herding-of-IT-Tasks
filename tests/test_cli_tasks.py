@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _bootstrap import make_git_dir
+
 from shit import artifacts, cli_tasks, commands
 
 
@@ -15,7 +17,7 @@ class Cli(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name).resolve() / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
 
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()

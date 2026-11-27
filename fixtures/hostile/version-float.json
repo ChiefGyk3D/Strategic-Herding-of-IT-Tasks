@@ -1,0 +1,12 @@
+{
+  "schema": "task",
+  "schema_version": 1.0,
+  "id": "hostile-task",
+  "title": "Hostile fixture",
+  "summary": "JSON 1.0 equals 1 in Python; the version check must still reject it.",
+  "state": "open",
+  "owner": "human",
+  "created_at": "2026-11-26T15:30:00Z",
+  "updated_at": "2026-11-26T15:30:00Z",
+  "history": []
+}
