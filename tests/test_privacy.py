@@ -177,6 +177,92 @@ class DenyList(Scan):
         self.assertEqual(self.scan("--deny-file", str(path))[0], 3)
 
 
+class DenyPathResolution(Scan):
+    """The deny path is resolved once; the open never follows a symlink (no check/open race)."""
+
+    def put(self, directory, text):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "deny.txt"
+        path.write_text(text, encoding="utf-8")
+        os.chmod(path, 0o600)
+        return path
+
+    def test_race_retarget_to_repo_never_reads_the_repo_file(self):
+        self.put(self.outside, "outside-term\n")
+        self.put(self.repo / "inner", "repo-term\n")
+        race = self.base / "race"
+        race.symlink_to(self.outside)
+        real_realpath = os.path.realpath
+        calls = []
+
+        def retarget(target, *args, **kw):
+            result = real_realpath(target, *args, **kw)
+            if not calls and str(target).startswith(str(race)):
+                calls.append(1)  # the check has resolved the path; now swing the link
+                race.unlink()
+                race.symlink_to(self.repo / "inner")
+            return result
+
+        with mock.patch.object(os.path, "realpath", retarget):
+            try:
+                terms = privacy.load_deny(str(race / "deny.txt"), str(self.repo))
+            except privacy.ShitError:
+                terms = ()
+        self.assertEqual(calls, [1])
+        self.assertNotIn("repo-term", terms)
+
+    def test_component_swapped_for_symlink_at_open_time_is_refused(self):
+        path = self.put(self.outside, "outside-term\n")
+        moved = self.base / "moved"
+        real_open = os.open
+        swapped = []
+
+        def swap(name, *args, **kw):
+            if not swapped and name == "outside" and kw.get("dir_fd") is not None:
+                swapped.append(1)
+                os.rename(self.outside, moved)
+                self.outside.symlink_to(self.repo)
+            return real_open(name, *args, **kw)
+
+        with mock.patch.object(privacy.os, "open", swap):
+            with self.assertRaises(privacy.ShitError) as ctx:
+                privacy.load_deny(str(path), str(self.repo))
+        self.assertEqual(swapped, [1])
+        self.assertEqual(ctx.exception.code, privacy.CONFINEMENT)
+
+    def test_static_symlinked_parent_into_repo_refused(self):
+        self.put(self.repo / "inner", "repo-term\n")
+        link = self.base / "link"
+        link.symlink_to(self.repo / "inner")
+        with self.assertRaises(privacy.ShitError) as ctx:
+            privacy.load_deny(str(link / "deny.txt"), str(self.repo))
+        self.assertEqual(ctx.exception.code, privacy.CONFINEMENT)
+
+    def test_stable_symlinked_parent_outside_the_repo_works(self):
+        self.put(self.outside, "outside-term\n")
+        link = self.base / "link"
+        link.symlink_to(self.outside)
+        self.assertEqual(privacy.load_deny(str(link / "deny.txt"), str(self.repo)), ["outside-term"])
+
+    def test_relative_path_with_changed_cwd(self):
+        self.put(self.outside, "outside-term\n")
+        old = os.getcwd()
+        os.chdir(self.base)
+        self.addCleanup(os.chdir, old)
+        terms = privacy.load_deny("outside/deny.txt", str(self.repo))
+        os.chdir(self.repo)
+        self.assertEqual(terms, ["outside-term"])
+        with self.assertRaises(privacy.ShitError):
+            privacy.load_deny("../outside/../repo/.shit", str(self.repo))
+
+    def test_final_symlink_refused(self):
+        real = self.put(self.outside, "outside-term\n")
+        link = self.outside / "alias.txt"
+        link.symlink_to(real)
+        with self.assertRaises(privacy.ShitError):
+            privacy.load_deny(str(link), str(self.repo))
+
+
 class HostileTrees(Scan):
     def test_symlink_in_tree_is_confinement(self):
         (self.repo / "link").symlink_to(self.outside)
