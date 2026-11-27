@@ -1,0 +1,49 @@
+# Project configuration (minimal). Read by shit/config.py. Copy to the project root as config.toml and
+# replace every <placeholder>; the validator refuses the file until each one is filled. Unknown keys,
+# unknown tables, wrong types and duplicate keys are refused. Keep this file free of host identifiers, serial
+# numbers, personal identifiers, employer names and personal paths. It holds no secrets.
+
+# Version of this configuration format. Must be the integer 1. Any other value is refused.
+schema_version = 1
+
+[project]
+# Lowercase slug naming the project. Default: none, required.
+# Example: "example-project"
+name = "<project name>"
+
+[tracker]
+# Issue tracker reference as owner/repo. Used to build issue lines in briefs and reports.
+# Default: none, required.
+repository = "<owner/repo>"
+
+[roles]
+# Role names a brief may use, each a lowercase slug, no duplicates, at most 16.
+# Default when this table is absent: implementer, reviewer, researcher, planner.
+names = ["implementer", "reviewer", "researcher", "planner"]
+
+[review]
+# Who or what reviews the work and where the report goes, in plain text, at most 500 characters.
+# Default: none, required.
+destination = "<who reviews, and where the report goes>"
+
+[storage]
+# Storage root for local state. Must be exactly ".shit", a path relative to the project root.
+# A different value is refused, so state can never be redirected outside the project.
+root = ".shit"
+
+[log]
+# Confined diagnostic log file. Must start with ".shit/" and must not contain "..".
+# Raw subprocess output is written here only, never to model-visible output.
+# Default: .shit/events.jsonl
+file = ".shit/events.jsonl"
+
+[privacy]
+# Privacy scanning of records and outputs. true scans; false turns scanning off.
+# Fails closed: when this key is absent, scanning is on.
+scan = true
+
+[local_model]
+# Context window in tokens for the local model tier. Only 32768 (32K, the default profile) or
+# 65536 (64K, a documented opt-in for capable hardware) is accepted. Any other value is refused.
+# Default: 32768. The window must match the window the local server actually loaded.
+context_tokens = 32768
