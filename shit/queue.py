@@ -24,6 +24,7 @@ from functools import partial
 
 from . import commands, records
 from . import dependencies as dep
+from . import log as eventlog
 from . import queue_records as qr
 from . import task as task_mod
 from ._text import check_text
@@ -40,7 +41,6 @@ from .errors import (
     ShitError,
 )
 from .lifecycle import check_transition
-from . import log as eventlog
 from .log import CHAIN_LINE_BYTES, GENESIS, EventLog, chain_hash
 
 QUEUE = "queue.jsonl"

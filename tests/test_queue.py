@@ -1413,7 +1413,8 @@ class PublicationWindow(QueueCase):
             "p = Project.open(sys.argv[2]);"
             "os.unlink = lambda *a, **k: os._exit(9);"  # die right after the link, before the temp name is removed
             "q.claim(p, {'task_id': 't1', 'step': 'draft', 'worker': 'w', 'worker_kind': 'ai'}, now=sys.argv[3])")
-        done = subprocess.run([sys.executable, "-I", "-c", script, str(ROOT), str(self.repo), at(100)], timeout=60)
+        done = subprocess.run([sys.executable, "-I", "-c", script, str(ROOT), str(self.repo), at(100)], timeout=60,
+                              check=False)
         self.assertEqual(done.returncode, 9)
         leases = self.shit / "leases"
         self.assertEqual((leases / "t1.json").stat().st_nlink, 2)
@@ -1485,9 +1486,8 @@ class LockIdentity(QueueCase):
     def test_a_second_holder_waits_for_the_first(self):  # H2 positive control
         other = Project.open(self.repo)
         self.addCleanup(other.close)
-        with self.proj.locked():
-            with self.assertRaises(ShitError), other.locked(0.2):
-                pass
+        with self.proj.locked(), self.assertRaises(ShitError), other.locked(0.2):
+            pass
 
 
 class ReplayCeilings(QueueCase):
@@ -1542,8 +1542,8 @@ class ReplayCeilings(QueueCase):
         late = {**entries[-1], "id": f"queue-{len(entries) + 1:04d}", "kind": "renewed", "state_after": "running",
                 "worker": lease["worker"], "step": lease["step"], "lease_id": lease["lease_id"],
                 "generation": lease["generation"], "timestamp": expiry,
-                "expires_at": (datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ") + timedelta(seconds=60)).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ")}
+                "expires_at": (datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+                               + timedelta(seconds=60)).strftime("%Y-%m-%dT%H:%M:%SZ")}
         for key in ("attempt", "worker_kind"):
             late.pop(key, None)
         with self.assertRaises(ShitError):

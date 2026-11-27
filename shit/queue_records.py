@@ -8,7 +8,7 @@ No file is read here; `queue.py` does the storage.
 
 import json
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 
 from . import records
 from .errors import INPUT_LIMIT, REJECTED, ShitError
@@ -100,9 +100,13 @@ def reject():
     return ShitError(REJECTED)
 
 
+def _parse(stamp):
+    return datetime.strptime(stamp, STAMP).replace(tzinfo=UTC)
+
+
 def _seconds(later, earlier):
     """Whole seconds from `earlier` to `later`, both fixed-width UTC stamps."""
-    return int((datetime.strptime(later, STAMP) - datetime.strptime(earlier, STAMP)).total_seconds())
+    return int((_parse(later) - _parse(earlier)).total_seconds())
 
 
 def make_config(**overrides):
