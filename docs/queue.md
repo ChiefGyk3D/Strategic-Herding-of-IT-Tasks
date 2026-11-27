@@ -14,7 +14,7 @@
 
 Files under `.shit`: `queue.jsonl` with the sidecar `queue.chain`, `deps/<task-id>.json` (one dependency shard per dependent task), `leases/<task-id>.json`, `queue-pending.json` (the commit point, present only during a mutation) and the generated `QUEUE.md`.
 
-Every operation takes the store lock, finishes an interrupted commit, loads and verifies everything (chain, replay, graph, lifecycle agreement), runs maintenance (orphan leases, missing lease files, expiry, waiting to ready) and then does its own step. A queue state that the recovery planner cannot verify is exit code 8 and nothing is written before the planner's proof (Q-REC-02); maintenance steps after it are separate committed steps, and an orphan lease file is deleted only after its `orphan_removed` entry has committed.
+Every operation takes the store lock, finishes an interrupted commit, loads and verifies everything (chain, replay, graph, lifecycle agreement), runs maintenance (orphan leases, missing lease files, expiry, waiting to ready) and then does its own step. A queue state that the recovery planner cannot verify is exit code 8 and nothing is written before the planner's proof (Q-REC-02); maintenance steps after it are separate committed steps, and an orphan lease file is deleted only after its `orphan_removed` entry has committed, and the entry is not repeated after a crash between the two.
 
 ## Decisions recorded by the owner (2026-11-27)
 
@@ -58,7 +58,7 @@ The spec text now matches the code.
 - An append that would cross the 64 MiB log cap is refused with exit code 7 before anything is written. The check for a lifecycle event assumes the largest record, so it refuses slightly early.
 - The task cap (2,000) counts queued ids and shard owners together. An empty persisted shard is refused.
 - Maintenance removes every temporary leftover in one pass, and readiness reads an index of edges by task.
-- While a queue pending record exists, event writers refuse with exit code 8 (one unrecoverable record therefore blocks task, evidence, report and decision commands until the cause is repaired or an operator removes the record by the procedure in Q-REC-02).
+- Every locked entry point of every command runs the recovery planner first. A provable pending record is recovered by whichever command runs first; a record the planner cannot prove makes every locked entry point refuse with exit code 8 until an operator follows the procedure in Q-REC-02.
 - Not done (follow-up): privacy-scan directory width and cumulative byte budgets, an operation deadline while holding the lock, and `scandir`-based bounded listings (M4).
 
 ## Still open

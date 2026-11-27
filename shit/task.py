@@ -12,7 +12,6 @@ from datetime import UTC, datetime
 
 from . import records
 from .errors import (
-    FAILED_CLOSED,
     HUMAN_APPROVAL,
     INTERNAL,
     REJECTED,
@@ -60,9 +59,6 @@ def _guarded(fn):
 
 
 # -- recovery ---------------------------------------------------------------
-
-
-QUEUE_PENDING = "queue-pending.json"  # owned by shit/queue.py
 
 
 def _plan_recovery(project, log):
@@ -145,16 +141,16 @@ def _prove_image(project, event, image):
         raise ShitError(REJECTED)
 
 
-def _recover(project, log, plan=None, *, queue_pending_ok=False):
-    """Finish an interrupted commit. Every check runs before the first write (`_plan_recovery`).
+def _recover(project, log):
+    """Every locked entry point of this module runs recovery first. The planner lives with the queue, above this
+    module, so it is imported here at call time: one proof-then-write path for both subsystems."""
+    from . import queue
 
-    A queue commit that is still pending also holds back every event writer: its lifecycle event has to be
-    proven against the event log as it is now, so the queue recovers first (exit code 8 until it does)."""
-    if not queue_pending_ok and project.exists(QUEUE_PENDING):
-        raise ShitError(FAILED_CLOSED)
-    plan = plan or _plan_recovery(project, log)
-    if plan is None:
-        return
+    queue._recover(project, log, queue_ops=False)
+
+
+def _apply_task_plan(project, log, plan):
+    """Write a task commit that `_plan_recovery` proved (and the queue planner proved the store around)."""
     index, line, chain_line, task = plan["index"], plan["line"], plan["chain_line"], plan["task"]
     log_lines, log_torn = log._split(LOG_PATH)
     chain_lines, chain_torn = log._split(CHAIN_PATH)

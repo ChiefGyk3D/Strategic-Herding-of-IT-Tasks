@@ -1350,15 +1350,14 @@ class PendingProof(QueueCase):
         self.assertEqual(self.code(self.status), 8)
         self.assertEqual(self.snap(), before)
 
-    def test_a_task_writer_refuses_while_a_queue_commit_is_pending(self):  # round 3
+    def test_a_task_writer_recovers_a_proven_queue_commit_before_it_writes(self):  # round 3, revised in round 8
         self.task("t1")
         lease = self.run_to_running("t1")
         self.crash_at("pending-written", q.submit, self.proj, self.present(lease), now=self.tick())
-        before = self.snap()
-        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t2", title="T", summary="S",
-                                   owner="human", actor="human", now=self.tick(500)), 8)
-        self.assertEqual(self.snap(), before)
-        self.assertEqual(self.status(now=at(self.clock + 1))["t1"]["state"], "review")  # the commit still recovers
+        task_mod.create_task(self.proj, task_id="t2", title="T", summary="S", owner="human", actor="human",
+                             now=self.tick(500))
+        self.assertFalse((self.shit / "queue-pending.json").exists())
+        self.assertEqual(self.status(now=at(self.clock + 1))["t1"]["state"], "review")
 
     def test_a_pending_lifecycle_older_than_the_event_log_tip_changes_nothing(self):  # round 3
         self.task("t1")
@@ -2057,6 +2056,137 @@ class RecoveryWrites(QueueCase):
     def test_there_is_no_quarantine_feature(self):  # round 7
         self.assertFalse(hasattr(q, "recover"))
         self.assertFalse(hasattr(Project, "quarantine_move"))
+
+
+    # Round 8: every locked entry point of every subsystem runs the one recovery planner before any write.
+
+    def entry_points(self):
+        pdir = self.repo / "note.txt"
+        pdir.write_text("x")
+        t = lambda: self.tick(2000)  # a later stamp each call
+        return {
+            "get_task": lambda: task_mod.get_task(self.proj, "x"),
+            "create_task": lambda: task_mod.create_task(self.proj, task_id="n1", title="T", summary="S", owner="human",
+                                                        actor="human", now=t()),
+            "transition": lambda: task_mod.transition(self.proj, "x", "blocked", "human", "r", now=t(),
+                                                      blocked_reason="b", blocking_item="i"),
+            "show": lambda: commands.show(self.proj, "report", "r1"),
+            "add_evidence": lambda: commands.add_evidence(self.proj, task_id="x", evidence_id="e1", path="note.txt",
+                                                          description="d", actor="human", now=t()),
+            "add_report": lambda: commands.add_report(self.proj, task_id="x", report_id="r1", outcome="success",
+                                                      summary="s", evidence_ids=[], actor="human", now=t()),
+            "add_review": lambda: commands.add_review(self.proj, task_id="x", review_id="v1", report_id="r1",
+                                                      verdict="pass", summary="s", actor="human", now=t()),
+            "add_decision": lambda: commands.add_decision(self.proj, task_id="x", decision_id="d1", status="proposed",
+                                                          question="q", choice="c", rationale="r", actor="human",
+                                                          now=t()),
+            "new_task": lambda: commands.new_task(self.proj, task_id="n2", title="T", summary="S", owner="human",
+                                                  actor="human", now=t()),
+            "close_task": lambda: commands.close_task(self.proj, "x", "human", "r", now=t()),
+            "queue.status": lambda: q.status(self.proj, now=t()),
+        }
+
+    def corrupt_anchor_with_task_only_pending(self):
+        self.task("t1")
+        self.task("x", enqueue=False)
+        self.crashed_task_transition("x")
+        path = self.shit / "queue-anchor.json"
+        doc = json.loads(path.read_text())
+        doc["tip"] = "0" * 64
+        path.write_text(json.dumps(doc))
+
+    def test_every_entry_point_refuses_without_a_write_when_the_queue_does_not_verify(self):  # round 8
+        self.corrupt_anchor_with_task_only_pending()
+        before = self.tree()
+        for name, call in self.entry_points().items():
+            with self.subTest(entry=name):
+                log, code = self.record(call)
+                self.assertEqual(code, 8)
+                self.assertEqual([n for n in log if not n.startswith("stage:")], [])
+                self.assertEqual(self.tree(), before)
+
+    def test_task_entry_points_recover_a_proven_pending_record_through_the_planner(self):  # round 8
+        for name in ("get_task", "create_task", "transition", "show", "add_report"):
+            with self.subTest(entry=name):
+                self.setUp()
+                self.task("x", enqueue=False)
+                self.crashed_task_transition("x")
+                log, _code = self.record(self.entry_points()[name])
+                if "stage:plan-proven" not in log:
+                    self.fail(f"{name} did not run the planner")
+                marker = log.index("stage:plan-proven")
+                self.assertEqual([n for n in log[:marker] if not n.startswith("stage:")], [])
+
+    def test_a_stray_queue_pending_record_is_proven_and_recovered_not_refused_on_sight(self):  # round 8
+        self.crashed_submit(nested=True)
+        task_mod.get_task(self.proj, "t1")  # a task entry point recovers the proven commit
+        self.assertFalse((self.shit / "queue-pending.json").exists())
+        self.assertEqual(self.status()["t1"]["state"], "review")
+
+    def test_an_unprovable_queue_pending_record_still_refuses_every_entry_point(self):  # round 8
+        self.task("x", enqueue=False)
+        (self.shit / "queue-pending.json").write_text("{}")
+        before = self.tree()
+        for name, call in self.entry_points().items():
+            with self.subTest(entry=name):
+                self.assertEqual(self.code(call), 8)
+                self.assertEqual(self.tree(), before)
+
+    def test_every_locked_entry_point_calls_the_planner_before_any_write(self):  # round 8, by introspection
+        import ast
+        writers = set(self.WRITERS) | {"heal_torn_tail", "apply", "append"}
+        found = []
+        for path in sorted((ROOT / "shit").glob("*.py")):
+            problems = locked_without_planner(path.read_text(), writers)
+            found.extend(f"{path.name}: {p}" for p in problems)
+            found.extend([f"{path.name}:ok"] * len(locked_blocks(ast.parse(path.read_text()))))
+        self.assertEqual([f for f in found if not f.endswith(":ok")], [])
+        self.assertGreaterEqual(len([f for f in found if f.endswith(":ok")]), 6)  # something was collected
+
+    def test_the_entry_point_check_bites(self):  # round 8 negative control
+        source = "def f(project):\n    with project.locked():\n        project.write_atomic('x', b'')\n"
+        self.assertTrue(locked_without_planner(source, {"write_atomic"}))
+        good = "def f(project):\n    with project.locked():\n        _recover(project, 1)\n        project.write_atomic('x', b'')\n"
+        self.assertEqual(locked_without_planner(good, {"write_atomic"}), [])
+
+    def test_repeated_orphan_removal_crashes_do_not_grow_the_log(self):  # round 8
+        self.task("t1")
+        planted = self.shit / "leases" / "t1.json"
+        planted.write_text("planted")
+        real = Project.remove
+
+        def fail(project, rel):
+            if rel == "leases/t1.json":
+                raise ShitError(1)
+            return real(project, rel)
+
+        with mock.patch.object(Project, "remove", fail):
+            for _ in range(4):
+                self.assertEqual(self.code(self.status), 1)
+        self.assertEqual([json.loads(x)["kind"] for x in self.queue_lines()].count("orphan_removed"), 1)
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+        self.assertFalse(planted.exists())
+
+
+def locked_blocks(tree):
+    import ast
+    return [n for n in ast.walk(tree) if isinstance(n, ast.With)
+            and any(isinstance(i.context_expr, ast.Call) and getattr(i.context_expr.func, "attr", "") == "locked"
+                    for i in n.items)]
+
+
+def locked_without_planner(source, writers):
+    """Names the locked blocks whose first write precedes (or lacks) a call to `_recover`."""
+    import ast
+    problems = []
+    for block in locked_blocks(ast.parse(source)):
+        calls = [(n.lineno, getattr(n.func, "attr", getattr(n.func, "id", ""))) for n in ast.walk(block)
+                 if isinstance(n, ast.Call)]
+        planner = [ln for ln, name in calls if name == "_recover"]
+        writes = [ln for ln, name in calls if name in writers]
+        if not planner or (writes and min(writes) < min(planner)):
+            problems.append(f"locked block at line {block.lineno} has no planner call before its first write")
+    return problems
 
 
 if __name__ == "__main__":

@@ -663,37 +663,53 @@ def _prepare_dirs(project):
     project.finish_publications(LEASES)
 
 
-def _plan(project, log):
-    """The single recovery planner for both subsystems. Reads only; raises (exit code 8) on any refusal.
+def _plan(project, log, queue_ops):
+    """The single recovery planner for both subsystems. Reads only; raises on any refusal.
 
-    It covers a pending task commit, a pending queue commit (the task commit nested in it included) and, when there
-    is no queue commit, the whole queue state, proven against the task image the pending task commit would write."""
-    task_plan = task_mod._plan_recovery(project, log) if project.exists(task_mod.PENDING) else None
+    It covers a pending task commit, a pending queue commit (the task commit nested in it included) and, when no
+    queue commit is pending, the whole queue state, proven against the task image a pending task commit would
+    write. Returns None for a task entry point when nothing is pending (nothing to prove, nothing to write).
+    A queue operation reports every refusal as exit code 8; a task entry point keeps the task module's own codes
+    for its own record and reports a queue fault as exit code 8."""
+    task_plan = None
+    if project.exists(task_mod.PENDING):
+        if queue_ops:
+            task_plan = _refusing(lambda: task_mod._plan_recovery(project, log))
+        else:
+            task_plan = task_mod._plan_recovery(project, log)
     if project.exists(PENDING):
-        return {"task": task_plan, "queue": _plan_queue_commit(project, log, task_plan), "state": None}
+        return {"task": task_plan, "queue": _refusing(lambda: _plan_queue_commit(project, log, task_plan)),
+                "state": None}
     if task_plan is None:
-        _closed(log.verify)  # a task plan has proven the event prefix and its candidate already
+        if not queue_ops:
+            return None
+        _closed(log.verify)
     overrides = {task_plan["task"]["id"]: task_plan["task"]} if task_plan else None
     return {"task": task_plan, "queue": None, "state": _load(project, log, overrides)}
 
 
-def _recover(project, log):
+def _recover(project, log, *, queue_ops=True):
     """Recover an interrupted commit: one planner, then one write path. Returns the verified queue state.
 
-    Write order, all after `plan-proven`, and nothing before it:
+    Every locked entry point of the task, evidence, report, review, decision and queue commands calls this first
+    (tests/test_queue.py enumerates them). Write order, all after `plan-proven`, and nothing before it:
       1. the task commit (heal the event and chain tails, append the event and chain line, write the task image,
          remove pending.json), whether or not a queue commit is nested in it;
       2. the queue files' torn-tail rewrites;
-      3. the store directories and the removal of a publication temp name (the proof read such a pair as the pair
-         it is and a missing directory as an empty one; neither changes any state the proof reads);
+      3. for queue operations, the store directories and the removal of a publication temp name (the proof read
+         such a pair as the pair it is and a missing directory as an empty one; neither changes any state the
+         proof reads);
       4. the queue commit: lease file, shards, queue and chain appends, anchor, removal of queue-pending.json.
     A refusal in the planner writes nothing and keeps every pending record."""
-    plan = _refusing(lambda: _plan(project, log))
+    plan = _refusing(lambda: _plan(project, log, queue_ops)) if queue_ops else _plan(project, log, queue_ops)
+    if plan is None:
+        return None
     _checkpoint("plan-proven")
     if plan["task"]:
-        task_mod._recover(project, log, plan["task"], queue_pending_ok=True)
+        task_mod._apply_task_plan(project, log, plan["task"])
     if plan["queue"] is None:
-        _prepare_dirs(project)
+        if queue_ops:
+            _prepare_dirs(project)
         return plan["state"]
     doc, line, removal = plan["queue"]
     index = doc["index"]
@@ -827,7 +843,11 @@ def _maintain_once(ctx):
         queued = state.tasks.get(task_id)
         expected = qr.expected_lease(task_id, queued) if queued else None
         if expected is None:
-            if queued is not None:  # the audit entry commits (cap and chain checked) before the file is deleted
+            last = state.entries[-1] if state.entries else None
+            repeat = (last is not None and last["kind"] == "orphan_removed" and last["task_id"] == task_id
+                      and queued is not None and last["state_after"] == queued["state"])
+            if queued is not None and not repeat:  # the audit entry commits (cap, chain) before the file goes;
+
                 _commit(ctx, {"task_id": task_id, "actor": "wrapper", "kind": "orphan_removed",
                               "state_after": queued["state"]})
             ctx.project.remove(f"{LEASES}/{name}")
