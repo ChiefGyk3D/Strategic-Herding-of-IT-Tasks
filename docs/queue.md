@@ -35,7 +35,7 @@ The graph is stored as one `dependency-shard` record per dependent task, `deps/<
 - Caps: 200 `needs` per task (`dependencies.MAX_NEEDS_PER_TASK`, about 12 KB at the cap, far under the 65,536-byte record limit) and 2,000 queued tasks and shards in total (`dependencies.MAX_TASKS`). A breach is exit code 7 (adding an edge, or enqueueing past the total). Both are constants in one module; raising them is a code change plus a test.
 - Chain proof: every graph change appends one `graph_changed` entry carrying the SHA-256 of each shard it wrote (64 zeros for a deleted one). The loader requires the shard files to equal the chain's set exactly and each file's digest to match.
 - Fail closed (exit code 8, nothing written): a shard deleted, edited or added without a chain entry; a record whose `task_id` differs from its file name (two shards disagreeing about an edge); an oversize or malformed shard even when its digest was rechained; a cycle, self edge or dangling edge; a stray file name; a leftover `dependencies.json` from the single-file layout (never released, so there is nothing to migrate).
-- Atomicity: the commit point `queue-pending.json` lists every shard to write or delete with its exact content and the entry that records their digests. Recovery proves the whole commit read-only first (Q-REC-02) and only then applies it idempotently; a refusal changes nothing and keeps the record. `add_edges` changes several shards in one commit or none.
+- Atomicity: the commit point `queue-pending.json` lists every shard to write or delete with its exact content and the entry that records their digests. Recovery proves the whole commit read-only first, nested task commit included (Q-REC-02), and only then applies it idempotently; a refusal in the proof writes nothing and keeps the record. `queue.recover(project, quarantine=True)` is the supported way out of a record that cannot be recovered. `add_edges` changes several shards in one commit or none.
 - A shard is written with an atomic replace. Edge add and remove stay human or wrapper only, and a task with a live lease cannot lose an edge.
 
 ## Accepted gaps (owner accepted these on 2026-11-27)
@@ -58,6 +58,7 @@ The spec text now matches the code.
 - An append that would cross the 64 MiB log cap is refused with exit code 7 before anything is written. The check for a lifecycle event assumes the largest record, so it refuses slightly early.
 - The task cap (2,000) counts queued ids and shard owners together. An empty persisted shard is refused.
 - Maintenance removes every temporary leftover in one pass, and readiness reads an index of edges by task.
+- While a queue pending record exists, event writers refuse with exit code 8 (one unrecoverable record therefore blocks task, evidence, report and decision commands until `queue.recover(project, quarantine=True)` keeps a copy and removes it).
 - Not done (follow-up): privacy-scan directory width and cumulative byte budgets, an operation deadline while holding the lock, and `scandir`-based bounded listings (M4).
 
 ## Still open

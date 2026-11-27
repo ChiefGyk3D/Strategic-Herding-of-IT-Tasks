@@ -219,7 +219,7 @@ class Project:
             os.close(fd)
             raise
 
-    def _stat_leaf(self, dirfd, name):
+    def _stat_leaf(self, dirfd, name, links=1):
         """lstat the leaf: None when absent, else its stat result after type and link checks."""
         try:
             st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
@@ -227,21 +227,22 @@ class Project:
             return None
         except OSError as exc:
             raise _os_error(exc) from None
-        self._check_regular(st)
+        self._check_regular(st, links)
         return st
 
     @staticmethod
-    def _check_regular(st):
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+    def _check_regular(st, links=1):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != links:
             raise ShitError(CONFINEMENT)
 
     # -- reading and writing --------------------------------------------------
 
-    def read(self, rel, limit=DEFAULT_LIMIT):
+    def read(self, rel, limit=DEFAULT_LIMIT, links=1):
+        """Read a regular file. `links` is the link count it must have: 2 only for a proven publication pair."""
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])
         try:
-            before = self._stat_leaf(dirfd, parts[-1])
+            before = self._stat_leaf(dirfd, parts[-1]) if links == 1 else self._stat_leaf(dirfd, parts[-1], links)
             if before is None:
                 raise ShitError(PRECONDITION)
             try:
@@ -252,7 +253,7 @@ class Project:
             self._close(dirfd)
         try:
             after = os.fstat(fd)
-            self._check_regular(after)
+            self._check_regular(after, links)
             if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
                 raise ShitError(CONFINEMENT)
             chunks, total = [], 0
@@ -413,22 +414,23 @@ class Project:
                     os.unlink(tmp, dir_fd=dirfd)
             self._close(dirfd)
 
-    def finish_publications(self, name):
-        """Finish an exclusive publication interrupted between its link and its unlink.
+    def publication_pairs(self, name):
+        """Read-only: the `(temp name, sibling name)` pairs an interrupted exclusive publication left in `name`.
 
-        Only an exact pair is touched: a `.tmp-` name that is a regular file with two links whose other link is
-        a sibling in the same directory. Anything else keeps the ordinary link rejection. Caller holds the lock.
-        """
+        An exact pair is a `.tmp-` regular file with two links whose other link is one non-temp sibling in the same
+        directory. Returns [] when the directory is absent. Nothing is written."""
         parts = self._split(name)
         if len(parts) != 1:
             raise ShitError(CONFINEMENT)
-        fd = self._walk(parts)
+        try:
+            fd = self._walk(parts)
+        except ShitError as exc:
+            if exc.code == PRECONDITION:
+                return []
+            raise
         try:
             names = os.listdir(fd)
-            temps = [n for n in names if n.startswith(".tmp-")]
-            if not temps:
-                return
-            seen = {}
+            seen, temps = {}, []
             for entry in names:
                 try:
                     st = os.stat(entry, dir_fd=fd, follow_symlinks=False)
@@ -436,23 +438,34 @@ class Project:
                     continue
                 if stat.S_ISREG(st.st_mode) and st.st_nlink == 2:
                     seen.setdefault((st.st_dev, st.st_ino), []).append(entry)
-            for tmp in temps:
-                pair = [n for n in seen.get(self._ident(fd, tmp), []) if n != tmp]
-                if len(seen.get(self._ident(fd, tmp), [])) == 2 and len(pair) == 1 and not pair[0].startswith(".tmp-"):
-                    os.unlink(tmp, dir_fd=fd)
-                    os.fsync(fd)
+                    if entry.startswith(".tmp-"):
+                        temps.append((entry, (st.st_dev, st.st_ino)))
+            out = []
+            for tmp, key in temps:
+                group = seen[key]
+                other = [n for n in group if n != tmp]
+                if len(group) == 2 and len(other) == 1 and not other[0].startswith(".tmp-"):
+                    out.append((tmp, other[0]))
+            return sorted(out)
         except OSError:
             raise ShitError(INTERNAL) from None
         finally:
             self._close(fd)
 
-    @staticmethod
-    def _ident(fd, name):
+    def finish_publications(self, name):
+        """Remove the temp name of each exact pair (`publication_pairs`). Caller holds the lock."""
+        pairs = self.publication_pairs(name)
+        if not pairs:
+            return
+        fd = self._walk(self._split(name))
         try:
-            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        return (st.st_dev, st.st_ino)
+            for tmp, _sibling in pairs:
+                os.unlink(tmp, dir_fd=fd)
+            os.fsync(fd)
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            self._close(fd)
 
     def exists(self, rel):
         parts = self._split(rel)

@@ -1801,5 +1801,163 @@ class BoundedWork(QueueCase):
         self.assertLessEqual(max(widest), 4)
 
 
+class RecoveryWrites(QueueCase):
+    """Recovery proves the whole interrupted operation, both subsystems included, before its first write."""
+
+    WRITERS = ("write_atomic", "append", "remove", "create_exclusive", "ensure_dir", "finish_publications")
+
+    def crashed_submit(self, nested=False):
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        target = task_mod if nested else q
+
+        def crash(stage):
+            if stage == "pending-written":
+                raise PendingProof.Crash
+
+        with mock.patch.object(target, "_checkpoint", crash), self.assertRaises(PendingProof.Crash):
+            q.submit(self.proj, self.present(lease), now=self.tick())
+
+    def tree(self):
+        out = {}
+        for path in sorted(self.shit.rglob("*")):
+            rel = str(path.relative_to(self.shit))
+            if rel in ("lock", "QUEUE.md"):
+                continue
+            out[rel] = path.read_bytes() if path.is_file() else None
+            if path.is_file():
+                out[rel + "#links"] = path.stat().st_nlink
+        return out
+
+    def record(self, call):
+        log = []
+        real = {name: getattr(Project, name) for name in self.WRITERS}
+
+        def wrap(name):
+            def inner(project, *args, **kwargs):
+                log.append(name)
+                return real[name](project, *args, **kwargs)
+            return inner
+
+        def stage(name):
+            log.append(f"stage:{name}")
+
+        with mock.patch.multiple(Project, **{name: wrap(name) for name in self.WRITERS}), \
+                mock.patch.object(q, "_checkpoint", stage):
+            try:
+                call()
+            except ShitError as exc:
+                return log, exc.code
+        return log, 0
+
+    def forged_nested(self):
+        events = (self.shit / "events.jsonl").read_bytes().splitlines()
+        chain = (self.shit / "events.chain").read_bytes().splitlines()
+        from shit import records
+        from shit.log import EventLog
+        stamp = json.loads((self.shit / "queue-pending.json").read_text())["lifecycle"]["at"]
+        event = task_mod._event(EventLog(self.proj), "t1", "human", "task_created", "Task record created.", stamp)
+        line = records.dump_event(event)
+        image = json.loads((self.shit / "tasks" / "t1.json").read_text())
+        doc = {"index": len(events), "event_line": line.decode(), "chain_line": chain_hash(chain[-1].decode(), line),
+               "task": image}
+        (self.shit / "pending.json").write_text(json.dumps(doc))
+
+    def test_a_forged_nested_task_record_changes_nothing(self):  # round 4
+        self.crashed_submit()
+        self.forged_nested()
+        before = self.tree()
+        self.assertEqual(self.code(self.status, now=at(self.clock + 1000)), 8)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_corrupt_event_prefix_during_nested_recovery_changes_nothing(self):  # round 4
+        self.crashed_submit(nested=True)
+        path = self.shit / "events.chain"
+        data = bytearray(path.read_bytes())
+        data[3] = ord("0") if data[3] != ord("0") else ord("1")
+        path.write_bytes(bytes(data))
+        before = self.tree()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_queue_only_commit_refuses_over_a_corrupt_event_chain(self):  # round 4
+        self.task("t1")
+        path = self.shit / "events.chain"
+        data = bytearray(path.read_bytes())
+        data[3] = ord("0") if data[3] != ord("0") else ord("1")
+        path.write_bytes(bytes(data))
+        before = self.tree()
+        self.assertEqual(self.code(self.claim, "t1"), 8)
+        self.assertEqual(self.tree(), before)
+
+    def test_a_refusal_creates_no_directory_and_removes_no_link(self):  # round 4
+        self.task("t1")
+        lease = self.claim("t1")
+        os.link(self.shit / "leases" / "t1.json", self.shit / "leases" / ".tmp-0123456789abcdef")
+        (self.shit / "queue-pending.json").write_text("{}")
+        before = self.tree()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.tree(), before)
+        self.assertEqual(lease["generation"], 1)
+
+    def test_no_write_precedes_the_proven_plan(self):  # round 4
+        self.crashed_submit(nested=True)
+        log, code = self.record(lambda: q.status(self.proj, now=at(self.clock + 1)))
+        self.assertEqual(code, 0)
+        self.assertIn("stage:plan-proven", log)
+        marker = log.index("stage:plan-proven")
+        self.assertEqual([n for n in log[:marker] if not n.startswith("stage:")], [])
+        self.assertTrue([n for n in log[marker:] if not n.startswith("stage:")])
+
+    def assert_no_writes(self, call):
+        log, code = self.record(call)
+        self.assertEqual(code, 8)
+        self.assertEqual([n for n in log if not n.startswith("stage:")], [])
+
+    def test_a_refused_nested_recovery_performs_no_write_at_all(self):  # round 4
+        self.crashed_submit()
+        self.forged_nested()
+        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+
+    def test_a_refused_recovery_over_missing_directories_performs_no_write_at_all(self):  # round 4
+        self.task("t1")
+        (self.shit / "queue-pending.json").write_text("{}")
+        for name in ("leases", "deps"):
+            os.rmdir(self.shit / name)
+        self.assert_no_writes(lambda: q.status(self.proj, now=at(self.clock + 1000)))
+        self.assertFalse((self.shit / "leases").exists())
+
+    def test_a_refused_queue_commit_over_a_corrupt_event_chain_performs_no_write_at_all(self):  # round 4
+        self.task("t1")
+        path = self.shit / "events.chain"
+        data = bytearray(path.read_bytes())
+        data[3] = ord("0") if data[3] != ord("0") else ord("1")
+        path.write_bytes(bytes(data))
+        self.assert_no_writes(lambda: self.claim("t1"))
+
+    def test_a_pending_record_that_cannot_be_recovered_has_one_supported_way_out(self):  # round 4
+        self.task("t1")
+        pending = self.shit / "queue-pending.json"
+        pending.write_text("{not json")
+        before = self.tree()
+        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t2", title="T", summary="S",
+                                   owner="human", actor="human", now=self.tick()), 8)
+        self.assertEqual(self.code(q.recover, self.proj, now=self.tick()), 8)
+        self.assertEqual(self.tree(), before)  # without the explicit request nothing is touched
+        q.recover(self.proj, quarantine=True, now=self.tick())
+        self.assertFalse(pending.exists())
+        kept = list((self.shit / "quarantine").iterdir())
+        self.assertEqual([p.read_bytes() for p in kept], [b"{not json"])
+        task_mod.create_task(self.proj, task_id="t2", title="T", summary="S", owner="human", actor="human",
+                             now=self.tick())
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+
+    def test_recover_finishes_a_pending_record_that_proves(self):  # round 4
+        self.crashed_submit(nested=True)
+        q.recover(self.proj, now=self.tick())
+        self.assertFalse((self.shit / "queue-pending.json").exists())
+        self.assertEqual(self.status()["t1"]["state"], "review")
+
+
 if __name__ == "__main__":
     unittest.main()

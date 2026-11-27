@@ -113,6 +113,11 @@ class EventLog:
     def verify(self):
         """Validate every event and the whole chain; return the parsed events in order."""
         log_lines, chain_lines = self._raw()
+        return self.verify_lines(log_lines, chain_lines)
+
+    @staticmethod
+    def verify_lines(log_lines, chain_lines):
+        """`verify` over lines already read (for example the lines left after a torn tail is dropped). Pure."""
         if len(chain_lines) != len(log_lines):
             raise ShitError(REJECTED)
         previous, events, seen = GENESIS, [], set()
@@ -138,11 +143,6 @@ class EventLog:
         self.check_room(len(line) + 1, CHAIN_LINE_BYTES)
         previous = GENESIS if not events else self._last_chain()
         return Prepared(len(events), line, chain_hash(previous, line))
-
-    def last_timestamp(self):
-        """Timestamp of the final event line, or None for an empty log. Used only to refuse an earlier clock."""
-        lines = self._lines(LOG_PATH)
-        return records.load_event(lines[-1])["timestamp"] if lines else None
 
     def _last_chain(self):
         return self._lines(CHAIN_PATH)[-1].decode("ascii")

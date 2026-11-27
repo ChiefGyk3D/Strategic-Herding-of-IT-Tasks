@@ -20,7 +20,15 @@ from .errors import (
     ShitError,
 )
 from .lifecycle import LEGAL, check_transition
-from .log import CHAIN_PATH, GENESIS, LOG_PATH, EventLog, Prepared, chain_hash
+from .log import (
+    CHAIN_PATH,
+    GENESIS,
+    LOG_PATH,
+    EventLog,
+    Prepared,
+    _check_lifecycle,
+    chain_hash,
+)
 
 PENDING = "pending.json"
 PENDING_LIMIT = 4 * records.MAX_RECORD_BYTES
@@ -85,13 +93,56 @@ def _plan_recovery(project, log):
     chain_lines, chain_torn = log._split(CHAIN_PATH)
     log_lines = log.healed(log_lines, log_torn, index, line + b"\n")
     chain_lines = log.healed(chain_lines, chain_torn, index, chain_line.encode("ascii") + b"\n")
-    if len(chain_lines) < index or len(log_lines) < index:
+    if len(log_lines) not in (index, index + 1) or len(chain_lines) not in (index, index + 1) \
+            or len(chain_lines) > len(log_lines):
         raise ShitError(REJECTED)
+    events = log.verify_lines(log_lines[:index], chain_lines[:index])  # the whole existing prefix and its chain
     previous = GENESIS if index == 0 else chain_lines[index - 1].decode("ascii", "replace")
     if chain_hash(previous, line) != chain_line:
         raise ShitError(REJECTED)
+    if (len(log_lines) == index + 1 and log_lines[index] != line) or (
+            len(chain_lines) == index + 1 and chain_lines[index].decode("ascii", "replace") != chain_line):
+        raise ShitError(REJECTED)
+    if event["id"] != f"event-{index + 1:04d}" or any(e["id"] == event["id"] for e in events):
+        raise ShitError(REJECTED)
+    _check_lifecycle([*events, event])  # the candidate is the legal next event of the verified prefix
+    _prove_image(project, event, task)
     return {"index": index, "line": line, "chain_line": chain_line, "task": task, "event": event,
             "log_lines": log_lines, "torn": (log_torn, chain_torn)}
+
+
+def _prove_image(project, event, image):
+    """The pending task image must be exactly what the event does to the task file as it is now (or already is)."""
+    path = _task_path(image["id"])
+    exists = project.exists(path)
+    current = records.load_task(project.read(path)) if exists else None
+    if current is not None and records.dump_task(current) == records.dump_task(image):
+        applied = True
+    else:
+        applied = False
+    kind = event["event"]
+    if kind == "task_created":
+        if (current is not None and not applied) or image["state"] != "open" or image["history"] \
+                or not image["created_at"] == image["updated_at"] == event["timestamp"]:
+            raise ShitError(REJECTED)
+        return
+    if kind != "state_transition" or not image["history"]:
+        raise ShitError(REJECTED)
+    step = image["history"][-1]
+    if (step["from"] != event["from_state"] or step["to"] != event["to_state"] or step["actor"] != event["actor"]
+            or step["at"] != event["timestamp"] or image["state"] != event["to_state"]
+            or image["updated_at"] != event["timestamp"]):
+        raise ShitError(REJECTED)
+    if applied:
+        return
+    if current is None or current["state"] != event["from_state"]:
+        raise ShitError(REJECTED)
+    check_transition(event["from_state"], event["to_state"], event["actor"])
+    fixed = ("blocked_reason", "blocking_item", "state", "updated_at", "history")
+    if {k: v for k, v in current.items() if k not in fixed} != {k: v for k, v in image.items() if k not in fixed}:
+        raise ShitError(REJECTED)
+    if image["history"][:-1] != current["history"] or event["timestamp"] < current["updated_at"]:
+        raise ShitError(REJECTED)
 
 
 def _recover(project, log, plan=None, *, queue_pending_ok=False):

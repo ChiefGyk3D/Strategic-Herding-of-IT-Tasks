@@ -48,6 +48,7 @@ CHAIN = "queue.chain"
 DEPS = "deps"
 LEGACY_GRAPH = "dependencies.json"  # the pre-shard single file: never written, refused when present
 PENDING = "queue-pending.json"
+QUARANTINE = "quarantine"  # refused pending records are kept here, never deleted without a copy
 ANCHOR = "queue-anchor.json"  # the queue tip and per-task generation high-water marks, kept apart from the queue files
 VIEW = "QUEUE.md"
 LEASES = "leases"
@@ -263,7 +264,7 @@ def _load(project, log):
 # -- milestones and readiness ------------------------------------------------
 
 
-def _meter(project, log):
+def _meter(project, get_events):
     """Return `met(edge)`: is the prerequisite's milestone reached, read from verified records only."""
     cache, events = {}, []
 
@@ -271,7 +272,7 @@ def _meter(project, log):
         key = (kind, task_id)
         if key not in cache:
             if not events:
-                events.append(log.verify())  # read lazily: a queue without typed edges never parses the event log
+                events.append(get_events())  # read lazily: a queue without typed edges never parses the event log
             cache[key] = [commands._load(project, events[0], kind, rid, task_id)
                           for rid in commands._for_task(events[0], kind, task_id)]
         return cache[key]
@@ -467,18 +468,27 @@ def _check_anchor_for_pending(project, doc, chain):
 
 
 def _check_lease_effect(project, doc):
-    """A lease effect needs the path free, already holding this lease, or holding the one it replaces."""
+    """A lease effect needs the path free, already holding this lease, or holding the one it replaces. Read-only.
+
+    A leftover publication temp name (an exact pair, see `Project.publication_pairs`) is read as the pair it is;
+    its cleanup is a phase-two write."""
     lease = doc["lease"]
-    path = _lease_path(lease["task_id"]) if lease is not None else None
-    if path is None or not project.exists(path):
+    if lease is None:
         return
-    existing = project.read(path, limit=records.MAX_RECORD_BYTES)
+    path = _lease_path(lease["task_id"])
+    pair = any(sibling == f"{lease['task_id']}.json" for _tmp, sibling in project.publication_pairs(LEASES))
+    try:
+        existing = project.read(path, limit=records.MAX_RECORD_BYTES, links=2 if pair else 1)
+    except ShitError as exc:
+        if exc.code == PRECONDITION:
+            return  # the file, or the directory that would hold it, is absent: the effect creates it
+        raise
     if existing != qr.dump_lease(lease) and not (doc["lease_replaces"] is not None
                                                  and _sha(existing) == doc["lease_replaces"]):
         raise ShitError(REJECTED)
 
 
-def _prove_tail(project, doc, line, entry, lines, chain, task_plan):
+def _prove_tail(project, doc, line, entry, lines, chain, task_plan, events):
     """The pending commit must be the next step of the verified chain (or its already-appended last step).
 
     `lines` and `chain` are the queue files as they would be once a torn tail is dropped. Pure: nothing is written."""
@@ -499,12 +509,12 @@ def _prove_tail(project, doc, line, entry, lines, chain, task_plan):
     qr.check_effects(doc, entry, tasks.get(entry["task_id"]), after.get(entry["task_id"]))
     life = doc["lifecycle"]
     if life is not None:
-        _prove_lifecycle(project, doc, entry, after, task_plan)
+        _prove_lifecycle(project, doc, entry, after, task_plan, events)
     if doc["shards"]:
         _load_graph(project, [*prior, entry], after, {item["task_id"]: item["content"] for item in doc["shards"]})
 
 
-def _prove_lifecycle(project, doc, entry, after, task_plan):
+def _prove_lifecycle(project, doc, entry, after, task_plan, events):
     """The lifecycle step must be applicable now: legal, in time order against task and event log, and in agreement."""
     life = doc["lifecycle"]
     for text in (life["reason"], life["blocked_reason"], life["blocking_item"]):
@@ -519,13 +529,14 @@ def _prove_lifecycle(project, doc, entry, after, task_plan):
     if current["state"] != life["from"] or life["at"] < current["updated_at"]:
         raise ShitError(REJECTED)
     check_transition(life["from"], life["to"], life["actor"])
-    tip = task_plan["event"]["timestamp"] if task_plan else None
-    lines = task_plan["log_lines"] if task_plan else EventLog(project)._lines(eventlog.LOG_PATH)
-    if lines:
-        last = records.load_event(lines[-1])["timestamp"]
-        tip = last if tip is None else max(tip, last)
-    if tip is not None and life["at"] < tip:
-        raise ShitError(REJECTED)  # the event would precede the event log's tip
+    if task_plan:  # the nested task commit must be exactly this lifecycle step
+        event = task_plan["event"]
+        if (event["event"] != "state_transition" or event["task_id"] != life["task_id"]
+                or event["from_state"] != life["from"] or event["to_state"] != life["to"]
+                or event["actor"] != life["actor"] or event["timestamp"] != life["at"]):
+            raise ShitError(REJECTED)
+    if events and life["at"] < events[-1]["timestamp"]:
+        raise ShitError(REJECTED)  # the event would precede the tip of the verified event log
 
 
 def _refusing(fn):
@@ -553,17 +564,46 @@ def _plan_recovery(project, log):
     previous = GENESIS if index == 0 else chain[index - 1].decode("ascii", "replace")
     if chain_hash(previous, line) != doc["chain_line"]:
         raise ShitError(REJECTED)
-    _prove_tail(project, doc, line, entry, lines, chain, task_plan)
+    if task_plan is not None and doc["lifecycle"] is None:
+        raise ShitError(REJECTED)  # a task commit beside a queue commit must be that commit's own lifecycle step
+    if task_plan is None:
+        events = log.verify()  # the event log is proven too, even when this commit leaves it alone
+    else:
+        events = log.verify_lines(task_plan["log_lines"][:task_plan["index"]],
+                                  log._split(eventlog.CHAIN_PATH)[0][:task_plan["index"]])
+    _prove_tail(project, doc, line, entry, lines, chain, task_plan, events)
     _check_lease_effect(project, doc)
     return task_plan, doc, line
 
 
+def _prepare_dirs(project):
+    """Phase-two housekeeping: the store directories, and the temp name of each interrupted exclusive publication."""
+    project.ensure_dir(LEASES)
+    project.ensure_dir(DEPS)
+    project.finish_publications(LEASES)
+
+
 def _recover(project, log):
-    """Validate everything first, then write. A refusal leaves every file as it was, the pending records included."""
+    """Recover an interrupted commit in two phases. Phase one only reads and proves; phase two writes.
+
+    Every write recovery can make, in order, and when it is proven:
+      1. the nested task commit (heal both event files, append event and chain, write the task, drop its record)
+         and the queue files' torn tails, the lease file, shards, queue and chain appends, the anchor, and the
+         removal of the queue record: all after `_plan_recovery` proved the whole operation, both subsystems;
+      2. the store directories and the removal of a publication temp name: after the same proof (the proof reads
+         such a pair as the pair it is);
+    A refusal in phase one writes nothing. With no pending record the event log is verified (read-only) first."""
     if not project.exists(PENDING):
-        task_mod._recover(project, log, queue_pending_ok=True)
+        if project.exists(task_mod.PENDING):
+            task_mod._recover(project, log, queue_pending_ok=True)  # plans first, then writes
+        else:
+            _closed(log.verify)
+        _checkpoint("plan-proven")
+        _prepare_dirs(project)
         return
     task_plan, doc, line = _refusing(lambda: _plan_recovery(project, log))
+    _checkpoint("plan-proven")
+    _prepare_dirs(project)
     task_mod._recover(project, log, task_plan, queue_pending_ok=True)
     index = doc["index"]
     lines, torn = log._split(QUEUE)
@@ -572,6 +612,32 @@ def _recover(project, log):
     log.heal_torn_tail(CHAIN, chain, chain_torn, index, doc["chain_line"].encode("ascii") + b"\n")
     _closed(lambda: _apply_pending(project, log, doc, line))
     _load(project, log)
+
+
+def recover(project, *, quarantine=False, now=None, config=None):
+    """The one supported way out of a queue pending record that cannot be recovered (exit code 8 everywhere).
+
+    Without `quarantine` this only tries the ordinary recovery and, if it is refused, changes nothing. With
+    `quarantine=True` (the explicit confirmation) the refused record is first copied byte for byte to
+    `.shit/quarantine/queue-pending-<sha256 prefix>.json` and only then removed, under the store lock. Nothing
+    else is touched; later operations verify the remaining state as usual and fail closed if it is inconsistent."""
+    log = EventLog(project)
+
+    def run():
+        with project.locked(LOCK_TIMEOUT):
+            try:
+                _recover(project, log)
+                return False
+            except ShitError as exc:
+                if not (quarantine and exc.code == FAILED_CLOSED and project.exists(PENDING)):
+                    raise
+            data = project.read(PENDING, limit=PENDING_LIMIT)
+            project.ensure_dir(QUARANTINE)
+            project.write_atomic(f"{QUARANTINE}/queue-pending-{_sha(data)[:16]}.json", data, limit=PENDING_LIMIT)
+            project.remove(PENDING)
+            return True
+
+    return task_mod._guarded(run)
 
 
 def _commit(ctx, fields, *, lease=None, lease_replaces=None, remove_lease=None, lifecycle=None, shards=()):
@@ -627,6 +693,7 @@ class _Ctx:
         self.mutated = False
         self._state = None
         self._met = None
+        self._events = None
 
     def load(self):
         if self._state is None:
@@ -635,19 +702,25 @@ class _Ctx:
 
     def met(self):
         if self._met is None:
-            self._met = _meter(self.project, self.log)
+            self._met = _meter(self.project, self.events)
         return self._met
 
+    def events(self):
+        """The event log, verified (chain and lifecycle continuity) once per state; a broken log fails closed."""
+        if self._events is None:
+            self._events = _closed(self.log.verify)
+        return self._events
+
     def invalidate(self):
-        self._state = self._met = None
+        self._state = self._met = self._events = None
 
 
 def _check_clock(ctx, state):
     if state.entries and ctx.now < state.entries[-1]["timestamp"]:
         raise ShitError(FAILED_CLOSED)  # the clock is earlier than a recorded time: no claim, no expiry (Q-LEASE-08)
-    tip = _closed(ctx.log.last_timestamp)
-    if tip is not None and ctx.now < tip:
-        raise ShitError(FAILED_CLOSED)  # the same holds for the event log: a lifecycle event must not precede its tip
+    events = ctx.events()
+    if events and ctx.now < events[-1]["timestamp"]:
+        raise ShitError(FAILED_CLOSED)  # the same holds for the verified event log: an event must not precede its tip
 
 
 def _expire(ctx, task_id, state):
@@ -718,9 +791,6 @@ def _operate(project, now, config, body):
 
     def run():
         with project.locked(LOCK_TIMEOUT):
-            project.ensure_dir(LEASES)
-            project.ensure_dir(DEPS)
-            project.finish_publications(LEASES)
             _recover(project, log)
             ctx = _Ctx(project, log, now, config)
             state = ctx.load()
