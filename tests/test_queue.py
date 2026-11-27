@@ -1636,5 +1636,41 @@ class GraphPopulation(QueueCase):
         self.assertEqual(self.code(self.status), 8)
 
 
+class BoundedWork(QueueCase):
+    def test_stale_temporary_files_are_removed_in_one_pass(self):  # M4
+        self.task("t1")
+        for n in range(40):
+            (self.shit / "deps" / f".tmp-{n:04d}").write_text("x")
+            (self.shit / "leases" / f".tmp-{n:04d}").write_text("x")
+        listings = []
+        real = Project.list_dir
+
+        def counting(project, name):
+            listings.append(name)
+            return real(project, name)
+
+        with mock.patch.object(Project, "list_dir", counting):
+            self.status()
+        self.assertEqual(os.listdir(self.shit / "deps"), [])
+        self.assertEqual(os.listdir(self.shit / "leases"), [])
+        self.assertLess(len(listings), 12)
+
+    def test_readiness_looks_only_at_the_edges_of_the_task_asked_about(self):  # M4
+        for n in range(4):
+            self.task(f"p{n}", enqueue=False)
+        for n in range(10):
+            self.task(f"d{n}", enqueue=False)
+        q.add_edges(self.proj, [(f"d{n}", f"p{m}", "draft") for n in range(10) for m in range(4)], "human",
+                    now=self.tick())
+        for n in range(10):
+            q.enqueue(self.proj, f"d{n}", "human", now=self.tick())
+        widest = []
+        real = dep.unmet_blocking
+        with mock.patch.object(dep, "unmet_blocking", lambda edges, *a: (widest.append(len(edges)), real(edges, *a))[1]):
+            self.status()
+        self.assertTrue(widest)
+        self.assertLessEqual(max(widest), 4)
+
+
 if __name__ == "__main__":
     unittest.main()

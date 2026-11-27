@@ -59,7 +59,7 @@ MESSAGE = "Queue entry recorded."
 PENDING_KEYS = {"index", "entry_line", "chain_line", "lease", "lease_replaces", "remove_lease", "lifecycle", "shards"}
 LIFE_KEYS = {"task_id", "from", "to", "actor", "reason", "at", "blocked_reason", "blocking_item"}
 
-State = namedtuple("State", "entries lines chain tasks graph")
+State = namedtuple("State", "entries lines chain tasks graph by_task")
 
 
 def _checkpoint(stage):
@@ -246,7 +246,10 @@ def _load(project, log):
         _check_anchor(project, entries, chain, tasks)
         graph = _load_graph(project, entries, tasks)
         _check_agreement(project, tasks)
-        return State(entries, lines, chain, tasks, graph)
+        by_task = {}
+        for edge in graph["edges"]:
+            by_task.setdefault(edge["task_id"], []).append(edge)  # indexed once: readiness never rescans every edge
+        return State(entries, lines, chain, tasks, graph, by_task)
 
     return _closed(run)
 
@@ -285,7 +288,7 @@ def _meter(project, log):
 
 
 def _unmet(state, met, task_id):
-    return dep.unmet_blocking(state.graph["edges"], task_id, met)
+    return dep.unmet_blocking(state.by_task.get(task_id, ()), task_id, met)
 
 
 def _effective(state, met, task_id):
@@ -594,12 +597,11 @@ def _maintain_once(ctx):
     _check_clock(ctx, state)
     for name in ctx.project.list_dir(DEPS):
         if name.startswith(".tmp-"):
-            ctx.project.remove(f"{DEPS}/{name}")
-            return True
+            ctx.project.remove(f"{DEPS}/{name}")  # one pass removes every leftover: state is unchanged
     for name in ctx.project.list_dir(LEASES):
         if name.startswith(".tmp-"):
             ctx.project.remove(f"{LEASES}/{name}")
-            return True
+            continue
         task_id = name[:-5] if name.endswith(".json") else ""
         if not records.SLUG.fullmatch(task_id):
             raise ShitError(FAILED_CLOSED)
@@ -796,7 +798,7 @@ def enqueue(project, task_id, actor, *, now=None, config=None):
         current = records.load_task(project.read(task_mod._task_path(task_id)))
         if current["state"] != "open":
             raise ShitError(ILLEGAL_TRANSITION)
-        unmet = dep.unmet_blocking(state.graph["edges"], task_id, ctx.met())
+        unmet = dep.unmet_blocking(state.by_task.get(task_id, ()), task_id, ctx.met())
         _commit(ctx, {"task_id": task_id, "actor": actor, "kind": "enqueued",
                       "state_after": "waiting" if unmet else "ready"})
 
