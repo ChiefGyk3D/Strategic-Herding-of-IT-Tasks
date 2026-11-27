@@ -239,3 +239,47 @@ class Locking(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListAndExclusive(Base):
+    """list_dir and create_exclusive, added for the queue lease files (issue #17)."""
+
+    def test_list_dir_returns_sorted_names(self):
+        self.proj.ensure_dir("leases")
+        self.proj.write_atomic("leases/b.json", b"{}")
+        self.proj.write_atomic("leases/a.json", b"{}")
+        self.assertEqual(self.proj.list_dir("leases"), ["a.json", "b.json"])
+
+    def test_list_dir_refuses_symlinked_directory(self):
+        os.symlink(self.outside, self.shit / "leases")
+        self.assertEqual(self.code(self.proj.list_dir, "leases"), 5)
+
+    def test_list_dir_refuses_traversal_and_nested(self):
+        self.assertEqual(self.code(self.proj.list_dir, "../outside"), 5)
+        self.assertEqual(self.code(self.proj.list_dir, "tasks/x"), 5)
+
+    def test_list_dir_missing_is_precondition(self):
+        self.assertEqual(self.code(self.proj.list_dir, "leases"), 9)
+
+    def test_create_exclusive_creates_once(self):
+        self.proj.ensure_dir("leases")
+        self.assertTrue(self.proj.create_exclusive("leases/a.json", b"one"))
+        self.assertFalse(self.proj.create_exclusive("leases/a.json", b"two"))
+        self.assertEqual(self.proj.read("leases/a.json"), b"one")
+        self.assertEqual(stat.S_IMODE((self.shit / "leases" / "a.json").stat().st_mode), 0o600)
+        self.assertEqual((self.shit / "leases" / "a.json").stat().st_nlink, 1)
+        self.assertEqual(self.proj.list_dir("leases"), ["a.json"])
+
+    def test_create_exclusive_never_follows_a_planted_symlink(self):
+        self.proj.ensure_dir("leases")
+        os.symlink(self.secret, self.shit / "leases" / "a.json")
+        self.assertEqual(self.code(self.proj.create_exclusive, "leases/a.json", b"new"), 5)
+        self.assertEqual(self.secret.read_bytes(), b"outside-data")
+        os.unlink(self.shit / "leases" / "a.json")
+        os.symlink(self.shit / "tasks", self.shit / "leases" / "a.json")  # inside the store: still not followed
+        self.assertFalse(self.proj.create_exclusive("leases/a.json", b"new"))
+        self.assertEqual(os.listdir(self.shit / "tasks"), [])
+
+    def test_create_exclusive_limit(self):
+        self.proj.ensure_dir("leases")
+        self.assertEqual(self.code(self.proj.create_exclusive, "leases/a.json", b"x" * 70000), 7)

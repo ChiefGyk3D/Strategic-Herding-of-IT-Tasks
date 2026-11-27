@@ -1,0 +1,322 @@
+"""Queue records and the pure replay of the queue log (docs/queue-spec.md).
+
+`queue-entry` and `lease` records follow the common rules of docs/schemas.md. `replay` rebuilds every
+task's queue state from the entries and rejects any sequence the transition table does not allow, a
+lease that does not match, a generation that does not rise by one, or a clock that goes backwards.
+No file is read here; `queue.py` does the storage.
+"""
+
+import json
+import re
+
+from . import records
+from .errors import INPUT_LIMIT, REJECTED, ShitError
+
+STATES = ("waiting", "ready", "dispatched", "running", "review", "hold-owner", "hold-ci", "failed", "done")
+STEPS = ("draft", "apply", "review")
+WORKER_KINDS = ("ai", "script", "human")
+HOLD_KINDS = ("owner", "ci")
+LEASE_ID = re.compile(r"[0-9a-f]{32}")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+MAX_MESSAGE = 500
+
+HOLDS = ("hold-owner", "hold-ci")
+
+# Queue state -> lifecycle states it may sit in (docs/queue-spec.md, "Queue states").
+LIFECYCLE = {
+    "waiting": ("open",), "ready": ("open",), "dispatched": ("open",), "running": ("running",),
+    "review": ("review", "approved"), "hold-owner": ("blocked",), "hold-ci": ("blocked",),
+    "failed": ("failed",), "done": ("closed",),
+}
+
+# "Allowed queue transitions" of the spec, exactly. Every other pair, including a repeat, is illegal.
+ALLOWED = frozenset({
+    ("waiting", "ready"), ("ready", "waiting"), ("ready", "dispatched"),
+    ("dispatched", "ready"), ("dispatched", "running"), ("dispatched", "hold-owner"),
+    ("dispatched", "hold-ci"), ("dispatched", "failed"),
+    ("running", "review"), ("running", "hold-owner"), ("running", "hold-ci"), ("running", "failed"),
+    ("review", "ready"), ("review", "hold-owner"), ("review", "hold-ci"), ("review", "failed"),
+    ("review", "done"),
+    ("hold-owner", "ready"), ("hold-ci", "ready"), ("hold-owner", "running"), ("hold-ci", "running"),
+    ("hold-owner", "failed"), ("hold-ci", "failed"),
+    ("failed", "ready"),
+})
+# A task re-entering `ready` from review, a hold or failed lands in `waiting` when an edge is unmet.
+REENTER_WAITING = frozenset({("review", "waiting"), ("hold-owner", "waiting"), ("hold-ci", "waiting"),
+                             ("failed", "waiting")})
+
+HW = ("human", "wrapper")
+W = ("wrapper",)
+
+_COMMON = {"schema", "schema_version", "id", "task_id", "timestamp", "actor", "kind", "state_after", "message"}
+_LEASE = {"lease_id", "generation"}
+
+# kind -> (required extra fields, optional extra fields, allowed actors, allowed state_after)
+KINDS = {
+    "enqueued": (set(), set(), HW, ("waiting", "ready")),
+    "ready": (set(), set(), W, ("ready",)),
+    "claimed": (_LEASE | {"worker", "step", "expires_at"}, set(), W, ("dispatched",)),
+    "started": (_LEASE | {"worker", "step", "attempt"}, set(), W, ("running",)),
+    "renewed": (_LEASE | {"worker", "step", "expires_at"}, set(), W, ("dispatched", "running")),
+    "released": (_LEASE, set(), W, ("ready",)),
+    "expired": (_LEASE, set(), W, ("ready", "failed")),
+    "dispatch_failed": (_LEASE | {"not_before"}, set(), W, ("ready",)),
+    "apply_started": (_LEASE, set(), W, ("running",)),
+    "apply_finished": (_LEASE, set(), W, ("running",)),
+    "submitted": (_LEASE, set(), W, ("review",)),
+    "held": ({"hold_kind"}, _LEASE, HW, HOLDS),
+    "failed": (set(), _LEASE, HW, ("failed",)),
+    "reopened": (set(), set(), ("human",), ("ready", "waiting")),
+    "done": (set(), set(), HW, ("done",)),
+    "orphan_removed": (set(), {"lease_id"}, W, STATES),
+}
+
+CONFIG_RANGES = {
+    "lease_ttl_seconds": (60, 86400),
+    "lease_max_seconds": (60, 604800),
+    "lease_max_renewals": (0, 1000),
+    "max_attempts": (1, 20),
+    "max_dispatch_failures": (1, 20),
+    "dispatch_backoff_seconds": (1, 3600),
+}
+CONFIG_DEFAULTS = {
+    "lease_ttl_seconds": 900, "lease_max_seconds": 14400, "lease_max_renewals": 100,
+    "max_attempts": 3, "max_dispatch_failures": 3, "dispatch_backoff_seconds": 30,
+}
+
+
+def reject():
+    return ShitError(REJECTED)
+
+
+def make_config(**overrides):
+    """Validate configuration values against their ranges (docs/queue-spec.md, "Configuration values")."""
+    unknown = set(overrides) - set(CONFIG_DEFAULTS)
+    if unknown:
+        raise reject()
+    config = {**CONFIG_DEFAULTS, **overrides}
+    for key, (low, high) in CONFIG_RANGES.items():
+        value = config[key]
+        if type(value) is not int or not low <= value <= high:
+            raise reject()
+    if config["lease_max_seconds"] < config["lease_ttl_seconds"]:
+        raise reject()
+    return config
+
+
+# -- entries -----------------------------------------------------------------
+
+
+def validate_entry(obj):
+    if not isinstance(obj, dict):
+        raise reject()
+    kind = obj.get("kind")
+    if not isinstance(kind, str) or kind not in KINDS:
+        raise reject()
+    required, optional, actors, states = KINDS[kind]
+    records._keys(obj, _COMMON - {"message"} | required, optional | {"message"})
+    records._version(obj, "queue-entry")
+    records._slug(obj, "id")
+    records._slug(obj, "task_id")
+    records._stamp(obj, "timestamp")
+    records._choice(obj, "actor", actors)
+    records._choice(obj, "state_after", states)
+    if "message" in obj:
+        records._text(obj, "message", MAX_MESSAGE)
+    if "lease_id" in obj and (not isinstance(obj["lease_id"], str) or not LEASE_ID.fullmatch(obj["lease_id"])):
+        raise reject()
+    if "generation" in obj and (type(obj["generation"]) is not int or obj["generation"] < 1):
+        raise reject()
+    if kind in ("held", "failed") and ("lease_id" in obj) != ("generation" in obj):
+        raise reject()
+    if "worker" in obj:
+        records._slug(obj, "worker")
+    if "step" in obj:
+        records._choice(obj, "step", STEPS)
+    for key in ("expires_at", "not_before"):
+        if key in obj:
+            records._stamp(obj, key)
+    if "attempt" in obj and (type(obj["attempt"]) is not int or obj["attempt"] < 1):
+        raise reject()
+    if kind == "held":
+        records._choice(obj, "hold_kind", HOLD_KINDS)
+        if f"hold-{obj['hold_kind']}" != obj["state_after"]:
+            raise reject()
+    return obj
+
+
+def load_entry(data):
+    return validate_entry(records.parse(data))
+
+
+def dump_entry(obj):
+    """One JSON Lines line without the trailing newline."""
+    validate_entry(obj)
+    data = json.dumps(obj, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+    if len(data) > records.MAX_RECORD_BYTES:
+        raise ShitError(INPUT_LIMIT)
+    return data
+
+
+# -- leases ------------------------------------------------------------------
+
+LEASE_KEYS = {"schema", "schema_version", "task_id", "step", "worker", "worker_kind", "lease_id", "generation",
+              "claimed_at", "expires_at", "renewals"}
+
+
+def validate_lease(obj):
+    if not isinstance(obj, dict):
+        raise reject()
+    records._keys(obj, LEASE_KEYS, set())
+    records._version(obj, "lease")
+    records._slug(obj, "task_id")
+    records._choice(obj, "step", STEPS)
+    records._slug(obj, "worker")
+    records._choice(obj, "worker_kind", WORKER_KINDS)
+    if not isinstance(obj["lease_id"], str) or not LEASE_ID.fullmatch(obj["lease_id"]):
+        raise reject()
+    if type(obj["generation"]) is not int or obj["generation"] < 1:
+        raise reject()
+    if type(obj["renewals"]) is not int or obj["renewals"] < 0:
+        raise reject()
+    claimed, expires = records._stamp(obj, "claimed_at"), records._stamp(obj, "expires_at")
+    if expires <= claimed:
+        raise reject()
+    return obj
+
+
+def load_lease(data):
+    return validate_lease(records.parse(data))
+
+
+def dump_lease(obj):
+    validate_lease(obj)
+    data = (json.dumps(obj, indent=2, ensure_ascii=True, allow_nan=False) + "\n").encode("ascii")
+    if len(data) > records.MAX_RECORD_BYTES:
+        raise ShitError(INPUT_LIMIT)
+    return data
+
+
+# -- replay ------------------------------------------------------------------
+
+
+def _new_task(state):
+    return {"state": state, "generation": 0, "lease": None, "attempts": 0, "not_before": None,
+            "apply_finished": False, "last_failure": None, "last_stamp": None}
+
+
+def _lease_matches(task, entry):
+    lease = task["lease"]
+    return (lease is not None and lease["lease_id"] == entry["lease_id"]
+            and lease["generation"] == entry["generation"])
+
+
+def _step(task, entry, before):
+    """Apply one entry to `task`, raising when the sequence is not allowed. `before` is the prior state."""
+    kind, after, stamp = entry["kind"], entry["state_after"], entry["timestamp"]
+    pair = (before, after)
+    if kind in ("renewed", "apply_started", "apply_finished", "orphan_removed"):
+        if kind == "orphan_removed":
+            if after != before:
+                raise reject()
+            return
+        if not _lease_matches(task, entry) or before not in ("dispatched", "running") or after != before:
+            raise reject()
+        if kind == "renewed":
+            lease = task["lease"]
+            if entry["worker"] != lease["worker"] or entry["step"] != lease["step"] or entry["expires_at"] <= lease["expires_at"]:
+                raise reject()
+            lease["expires_at"] = entry["expires_at"]
+            lease["renewals"] += 1
+        elif before != "running":
+            raise reject()
+        elif kind == "apply_finished":
+            task["apply_finished"] = True
+        return
+    reenter = kind == "reopened" and pair in REENTER_WAITING
+    if pair not in ALLOWED and not reenter:
+        raise reject()
+    if kind == "ready":
+        if pair != ("waiting", "ready"):
+            raise reject()
+    elif kind == "claimed":
+        if entry["generation"] != task["generation"] + 1 or task["lease"] is not None or entry["expires_at"] <= stamp:
+            raise reject()
+        if task["not_before"] is not None and stamp < task["not_before"]:
+            raise reject()
+        task["generation"] = entry["generation"]
+        task["lease"] = {"lease_id": entry["lease_id"], "generation": entry["generation"], "worker": entry["worker"],
+                         "step": entry["step"], "claimed_at": stamp, "expires_at": entry["expires_at"], "renewals": 0}
+    elif kind == "started":
+        if before != "dispatched" or not _lease_matches(task, entry) or entry["attempt"] != task["attempts"] + 1:
+            raise reject()
+        if entry["worker"] != task["lease"]["worker"] or entry["step"] != task["lease"]["step"]:
+            raise reject()
+        task["attempts"] = entry["attempt"]
+        task["not_before"] = None
+    elif kind in ("released", "dispatch_failed", "expired", "submitted"):
+        _lease_ends(kind, task, entry, before)
+        if kind == "dispatch_failed":
+            task["not_before"] = entry["not_before"]
+    elif kind in ("held", "failed"):
+        leased = before in ("dispatched", "running")
+        if leased != ("lease_id" in entry) or (leased and not _lease_matches(task, entry)):
+            raise reject()
+        if kind == "failed":
+            task["last_failure"] = stamp
+        task["lease"] = None
+    elif kind in ("reopened", "done") and task["lease"] is not None:
+        raise reject()
+    task["state"] = after
+
+
+def _lease_ends(kind, task, entry, before):
+    if not _lease_matches(task, entry):
+        raise reject()
+    if kind == "released" and before != "dispatched":
+        raise reject()
+    if kind == "dispatch_failed" and before != "dispatched":
+        raise reject()
+    if kind == "submitted" and before != "running":
+        raise reject()
+    if kind == "expired":
+        if (before, entry["state_after"]) not in (("dispatched", "ready"), ("running", "failed")):
+            raise reject()
+        if entry["state_after"] == "failed":
+            task["last_failure"] = entry["timestamp"]
+    task["lease"] = None
+
+
+def replay(entries):
+    """Rebuild per-task queue state from validated entries; raise exit code 3 on any impossible sequence."""
+    tasks, previous = {}, ""
+    for number, entry in enumerate(entries, start=1):
+        if entry["id"] != f"queue-{number:04d}" or entry["timestamp"] < previous:
+            raise reject()
+        previous = entry["timestamp"]
+        task_id = entry["task_id"]
+        task = tasks.get(task_id)
+        if entry["kind"] == "enqueued":
+            if task is not None:
+                raise reject()  # a task id is never reused (Q-RES-01)
+            tasks[task_id] = _new_task(entry["state_after"])
+            tasks[task_id]["last_stamp"] = entry["timestamp"]
+            continue
+        if task is None:
+            raise reject()
+        _step(task, entry, task["state"])
+        task["last_stamp"] = entry["timestamp"]
+    return tasks
+
+
+def expected_lease(task_id, task):
+    """The lease fields the chain proves for `task_id`, or None when the chain says no lease is live."""
+    lease = task["lease"]
+    if lease is None:
+        return None
+    return {"task_id": task_id, **lease}
+
+
+def check_queue_transition(before, after):
+    """True when the spec's transition table allows `before` to `after` (a repeat is never allowed)."""
+    return (before, after) in ALLOWED

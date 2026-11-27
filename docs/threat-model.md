@@ -132,7 +132,7 @@ Hooks fail closed. If a hook cannot verify its required state, configuration, in
 
 ## Queue and lease risks (issue 16)
 
-These rows cover the dependency graph, queue, leases and apply serialization specified in `docs/queue-spec.md`. They are design inputs for issues 17 and 18. The tests named here do not exist yet; each must be written first and must go red when its control is removed. Network isolation and multi-host operation remain outside this review. Rule IDs refer to `docs/queue-spec.md`.
+These rows cover the dependency graph, queue, leases and apply serialization specified in `docs/queue-spec.md`. They are design inputs for issues 17 and 18. Issue 17 implements the dependency graph, queue and lease rows; `docs/queue.md` maps each to its test. Rows and tests that belong to apply serialization and metrics (issue 18) do not exist yet; each must be written first and must go red when its control is removed. Network isolation and multi-host operation remain outside this review. Rule IDs refer to `docs/queue-spec.md`.
 
 | ID | Abuse case | Impact | Prerequisites | Rank | Mitigation | Verification | Residual risk |
 |---|---|---|---|---|---|---|---|

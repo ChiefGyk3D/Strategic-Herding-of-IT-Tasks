@@ -1,0 +1,974 @@
+"""Queue, lease and recovery tests (issue #17). Real files in a temporary git repository, no mocks of storage.
+
+Rule ids (Q-...) and threat-model rows (TM-...) refer to docs/queue-spec.md and docs/threat-model.md.
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest import mock
+
+from _bootstrap import ROOT, make_git_dir
+
+from shit import commands
+from shit import queue as q
+from shit import queue_records as qr
+from shit import task as task_mod
+from shit.errors import ShitError
+from shit.log import GENESIS, chain_hash
+from shit.project import Project
+
+BASE = datetime(2026, 11, 27, 10, 0, 0, tzinfo=UTC)
+
+
+def at(seconds):
+    return (BASE + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class QueueCase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.repo = Path(self._tmp.name).resolve() / "repo"
+        self.repo.mkdir()
+        make_git_dir(self.repo / ".git")
+        self.proj = Project.init(self.repo)
+        self.addCleanup(self.proj.close)
+        self.shit = self.repo / ".shit"
+        self.clock = 0
+
+    # -- helpers ----------------------------------------------------------
+
+    def tick(self, n=1):
+        self.clock += n
+        return at(self.clock)
+
+    def code(self, fn, *a, **kw):
+        with self.assertRaises(ShitError) as cm:
+            fn(*a, **kw)
+        return cm.exception.code
+
+    def task(self, tid, enqueue=True):
+        task_mod.create_task(self.proj, task_id=tid, title="Title", summary="Summary", owner="human",
+                             actor="human", now=self.tick())
+        if enqueue:
+            q.enqueue(self.proj, tid, "human", now=self.tick())
+
+    def claim(self, tid, step="draft", worker="w1", kind="ai"):
+        return q.claim(self.proj, {"task_id": tid, "step": step, "worker": worker, "worker_kind": kind},
+                       now=self.tick())
+
+    @staticmethod
+    def present(lease):
+        return {"task_id": lease["task_id"], "lease_id": lease["lease_id"], "generation": lease["generation"]}
+
+    def run_to_running(self, tid):
+        lease = self.claim(tid)
+        q.start(self.proj, self.present(lease), now=self.tick())
+        return lease
+
+    def status(self, **kw):
+        return q.status(self.proj, now=kw.pop("now", None) or self.tick(), **kw)
+
+    def lifecycle(self, tid):
+        return task_mod.get_task(self.proj, tid)["state"]
+
+    def success_report(self, tid):
+        commands.add_report(self.proj, task_id=tid, report_id=f"{tid}-report", outcome="success", summary="ok",
+                            evidence_ids=[], actor="human", now=self.tick())
+
+    def snap(self):
+        return {str(p.relative_to(self.shit)): p.read_bytes() for p in sorted(self.shit.rglob("*"))
+                if p.is_file() and p.name not in ("lock", "QUEUE.md")}
+
+    def queue_lines(self):
+        return (self.shit / "queue.jsonl").read_bytes().splitlines()
+
+    def rewrite_queue(self, lines):
+        """Rewrite queue.jsonl and its chain consistently (what an attacker with write access could do)."""
+        previous, chain = GENESIS, []
+        for line in lines:
+            previous = chain_hash(previous, line)
+            chain.append(previous.encode())
+        (self.shit / "queue.jsonl").write_bytes(b"".join(line + b"\n" for line in lines))
+        (self.shit / "queue.chain").write_bytes(b"".join(c + b"\n" for c in chain))
+
+
+class Flow(QueueCase):
+    def test_full_path_for_a_human_worker_only(self):
+        # Q-HET-02: claim, start, renew, report (submit) with plain calls and no adapter.
+        self.task("t1")
+        lease = self.claim("t1", worker="alice", kind="human")
+        self.assertEqual(lease["generation"], 1)
+        self.assertEqual(self.status()["t1"]["state"], "dispatched")
+        q.start(self.proj, self.present(lease), now=self.tick())
+        self.assertEqual(self.lifecycle("t1"), "running")
+        q.renew(self.proj, self.present(lease), now=self.tick())
+        q.submit(self.proj, self.present(lease), now=self.tick())
+        self.assertEqual(self.lifecycle("t1"), "review")
+        row = self.status()["t1"]
+        self.assertEqual((row["state"], row["lease"], row["attempts"]), ("review", None, 1))
+        self.assertFalse((self.shit / "leases" / "t1.json").exists())
+
+    def test_release_returns_to_ready_and_generation_rises(self):
+        self.task("t1")
+        first = self.claim("t1")
+        q.release(self.proj, self.present(first), now=self.tick())
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+        second = self.claim("t1")
+        self.assertEqual(second["generation"], 2)
+        self.assertNotEqual(second["lease_id"], first["lease_id"])
+
+    def test_release_of_a_running_task_is_illegal(self):
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        before = self.snap()
+        self.assertEqual(self.code(q.release, self.proj, self.present(lease), now=self.tick()), 4)
+        self.assertEqual(self.snap(), before)
+
+    def test_fail_and_hold_release_the_lease(self):
+        self.task("a")
+        self.task("b")
+        la, lb = self.run_to_running("a"), self.run_to_running("b")
+        q.fail(self.proj, self.present(la), now=self.tick())
+        q.hold(self.proj, self.present(lb), "owner", "needs a decision", "decision-1", now=self.tick())
+        rows = self.status()
+        self.assertEqual((rows["a"]["state"], rows["b"]["state"]), ("failed", "hold-owner"))
+        self.assertEqual((self.lifecycle("a"), self.lifecycle("b")), ("failed", "blocked"))
+        self.assertEqual(os.listdir(self.shit / "leases"), [])
+
+    def test_survives_restart_with_same_state(self):
+        self.task("a")
+        self.task("b")
+        self.run_to_running("a")
+        before = self.status()
+        self.proj.close()
+        self.proj = Project.open(self.repo)
+        self.assertEqual(q.status(self.proj, now=self.tick()), before)
+
+    def test_queue_md_is_a_view_only(self):
+        self.task("a")
+        self.run_to_running("a")
+        view = self.shit / "QUEUE.md"
+        self.assertIn("| a | running |", view.read_text())
+        before = self.status()
+        view.unlink()
+        self.assertEqual(self.status(), before)  # deleting it changes nothing and is not an error
+        self.assertTrue(view.exists())  # regenerated
+        view.write_text("| a | done | forged |\n")
+        self.assertEqual(self.status(), before)  # editing it changes nothing
+        self.assertNotIn("forged", view.read_text())
+        view.unlink()
+        q.render_view(self.proj, now=self.tick())
+        self.assertTrue(view.exists())
+
+    def test_queue_md_symlink_is_never_followed(self):
+        self.task("a")
+        target = self.repo / "elsewhere.txt"
+        target.write_text("keep")
+        (self.shit / "QUEUE.md").unlink()
+        os.symlink(target, self.shit / "QUEUE.md")
+        self.assertEqual(self.code(q.render_view, self.proj, now=self.tick()), 5)
+        self.assertEqual(target.read_text(), "keep")
+        self.run_to_running("a")  # an operation still succeeds; the view is only derived
+        self.assertEqual(target.read_text(), "keep")
+
+    def test_queue_md_carries_no_titles(self):
+        task_mod.create_task(self.proj, task_id="a", title="SENTINEL-TITLE", summary="SENTINEL-SUMMARY",
+                             owner="human", actor="human", now=self.tick())
+        q.enqueue(self.proj, "a", "human", now=self.tick())
+        text = (self.shit / "QUEUE.md").read_text()
+        self.assertNotIn("SENTINEL", text)
+
+
+class Readiness(QueueCase):
+    def test_chain_becomes_ready_only_in_order(self):  # Q-DEP-01
+        for tid in ("a", "b", "c"):
+            self.task(tid, enqueue=False)
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        q.add_edge(self.proj, "c", "b", "draft", "human", now=self.tick())
+        for tid in "abc":
+            q.enqueue(self.proj, tid, "human", now=self.tick())
+        rows = self.status()
+        self.assertEqual([rows[t]["state"] for t in "abc"], ["ready", "waiting", "waiting"])
+        self.assertEqual(rows["c"]["waiting_on"], ["b"])
+        self.success_report("a")
+        rows = self.status()
+        self.assertEqual([rows[t]["state"] for t in "abc"], ["ready", "ready", "waiting"])
+        self.success_report("b")
+        self.assertEqual(self.status()["c"]["state"], "ready")
+        kinds = [e["kind"] for e in map(json.loads, self.queue_lines())]
+        self.assertEqual(kinds.count("ready"), 2)  # the waiting to ready step is recorded
+
+    def test_a_failed_report_does_not_satisfy_a_draft_edge(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        commands.add_report(self.proj, task_id="a", report_id="r1", outcome="failed", summary="no", evidence_ids=[],
+                            actor="human", now=self.tick())
+        self.assertEqual(self.status()["b"]["state"], "waiting")
+
+    def test_unmet_apply_edge_never_blocks_draft_but_refuses_apply(self):  # Q-DEP-02, Q-SER-03, OQ-6
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "apply", "human", now=self.tick())
+        self.assertEqual(self.status()["b"]["state"], "ready")
+        before = self.snap()
+        self.assertEqual(self.code(self.claim, "b", "apply"), 4)
+        self.assertEqual(self.snap(), before)
+        lease = self.claim("b", "draft")
+        self.assertEqual(lease["step"], "draft")
+
+    def test_review_and_decision_edges_need_a_human(self):
+        for tid in ("a", "b", "c"):
+            self.task(tid)
+        q.add_edge(self.proj, "b", "a", "decision", "human", now=self.tick())
+        q.add_edge(self.proj, "c", "a", "review", "human", now=self.tick())
+        commands.add_decision(self.proj, task_id="a", decision_id="d1", status="proposed", question="q", choice="c",
+                              rationale="r", actor="model", now=self.tick())
+        self.assertEqual(self.status()["b"]["state"], "waiting")
+        commands.add_decision(self.proj, task_id="a", decision_id="d2", status="accepted", question="q", choice="c",
+                              rationale="r", actor="human", now=self.tick())
+        rows = self.status()
+        self.assertEqual((rows["b"]["state"], rows["c"]["state"]), ("ready", "waiting"))
+
+    def test_a_dependent_returns_to_waiting_when_the_gate_recloses(self):  # Q-DEP-09
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "decision", "human", now=self.tick())
+        commands.add_decision(self.proj, task_id="a", decision_id="d1", status="accepted", question="q", choice="c",
+                              rationale="r", actor="human", now=self.tick())
+        self.assertEqual(self.status()["b"]["state"], "ready")
+        commands.add_decision(self.proj, task_id="a", decision_id="d2", status="rejected", question="q", choice="c",
+                              rationale="r", actor="human", now=self.tick())
+        self.assertEqual(self.status()["b"]["state"], "waiting")
+        self.assertEqual(self.code(self.claim, "b"), 4)
+
+    def test_running_dependent_cannot_submit_while_gate_is_closed(self):  # Q-DEP-09
+        self.task("a")
+        self.task("b")
+        lease = self.run_to_running("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        self.assertEqual(self.code(q.submit, self.proj, self.present(lease), now=self.tick()), 9)
+        self.assertEqual(self.lifecycle("b"), "running")
+        self.success_report("a")
+        q.submit(self.proj, self.present(lease), now=self.tick())
+
+    def test_readiness_is_recomputed_from_files_after_deleting_every_derived_file(self):  # Q-DEP-08
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        before = self.status()
+        (self.shit / "QUEUE.md").unlink()
+        self.assertEqual(self.status(), before)
+
+
+class GraphOperations(QueueCase):
+    def test_cycles_unknown_and_duplicate(self):  # Q-DEP-03, Q-DEP-05, Q-DEP-06
+        for tid in ("a", "b", "c"):
+            self.task(tid)
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        q.add_edge(self.proj, "c", "b", "draft", "wrapper", now=self.tick())
+        before = (self.shit / "dependencies.json").read_bytes()
+        self.assertEqual(self.code(q.add_edge, self.proj, "a", "a", "draft", "human", now=self.tick()), 3)
+        self.assertEqual(self.code(q.add_edge, self.proj, "a", "c", "apply", "human", now=self.tick()), 3)
+        self.assertEqual(self.code(q.add_edge, self.proj, "a", "ghost", "draft", "human", now=self.tick()), 9)
+        self.assertEqual(self.code(q.add_edge, self.proj, "b", "a", "draft", "human", now=self.tick()), 3)
+        q.add_edge(self.proj, "b", "a", "review", "human", now=self.tick())
+        self.assertNotEqual((self.shit / "dependencies.json").read_bytes(), before)
+        self.assertEqual(len(json.loads((self.shit / "dependencies.json").read_text())["edges"]), 3)
+
+    def test_failed_add_leaves_graph_bytes_unchanged(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        before = (self.shit / "dependencies.json").read_bytes()
+        self.assertEqual(self.code(q.add_edge, self.proj, "a", "b", "draft", "human", now=self.tick()), 3)
+        self.assertEqual((self.shit / "dependencies.json").read_bytes(), before)
+
+    def test_model_actor_cannot_change_the_graph(self):  # Q-DEP-07
+        self.task("a")
+        self.task("b")
+        before = self.snap()
+        self.assertEqual(self.code(q.add_edge, self.proj, "b", "a", "draft", "model", now=self.tick()), 10)
+        self.assertEqual(self.code(q.remove_edge, self.proj, "b", "a", "draft", "model", now=self.tick()), 10)
+        self.assertEqual(self.snap(), before)
+
+    def test_remove_edge_refused_while_the_task_holds_a_lease(self):  # Q-DEP-07
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "apply", "human", now=self.tick())
+        self.claim("b")
+        self.assertEqual(self.code(q.remove_edge, self.proj, "b", "a", "apply", "human", now=self.tick()), 4)
+
+    def test_hand_edited_cycle_fails_closed(self):  # Q-DEP-04, TM-18
+        self.task("a")
+        self.task("b")
+        edges = [{"task_id": "a", "needs_id": "b", "type": "draft"}, {"task_id": "b", "needs_id": "a", "type": "draft"}]
+        (self.shit / "dependencies.json").write_text(json.dumps(
+            {"schema": "dependency-graph", "schema_version": 1, "edges": edges}))
+        before = self.snap()
+        self.assertEqual(self.code(self.claim, "a"), 8)
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_hand_edited_dangling_edge_and_garbage_fail_closed(self):  # Q-DEP-04
+        self.task("a")
+        edge = [{"task_id": "a", "needs_id": "ghost", "type": "draft"}]
+        graph = (self.shit / "dependencies.json")
+        graph.write_text(json.dumps({"schema": "dependency-graph", "schema_version": 1, "edges": edge}))
+        self.assertEqual(self.code(self.claim, "a"), 8)
+        graph.write_text("{not json")
+        self.assertEqual(self.code(self.claim, "a"), 8)
+        graph.write_text('{"schema":"dependency-graph","schema":"dependency-graph","schema_version":1,"edges":[]}')
+        self.assertEqual(self.code(self.claim, "a"), 8)
+
+    def test_symlinked_graph_is_refused(self):
+        self.task("a")
+        outside = self.repo / "g.json"
+        outside.write_text('{"schema":"dependency-graph","schema_version":1,"edges":[]}')
+        os.symlink(outside, self.shit / "dependencies.json")
+        self.assertEqual(self.code(self.status), 5)
+
+
+class Claims(QueueCase):
+    def test_claim_rejects_extra_fields_and_worker_supplied_values(self):  # Q-CLAIM-05, Q-LEASE-04, TM-16
+        self.task("t1")
+        base = {"task_id": "t1", "step": "draft", "worker": "w", "worker_kind": "ai"}
+        before = self.snap()
+        for extra in ({"lease_id": "0" * 32}, {"generation": 9}, {"now": at(5)}, {"state_after": "running"},
+                      {"expires_at": at(99999)}):
+            self.assertEqual(self.code(q.claim, self.proj, {**base, **extra}, now=self.tick()), 2, extra)
+        self.assertEqual(self.code(q.claim, self.proj, {k: v for k, v in base.items() if k != "step"}, now=self.tick()), 2)
+        self.assertEqual(self.code(q.claim, self.proj, {**base, "worker_kind": "gpt-4"}, now=self.tick()), 2)
+        self.assertEqual(self.code(q.claim, self.proj, {**base, "step": "deploy"}, now=self.tick()), 2)
+        self.assertEqual(self.code(q.claim, self.proj, {**base, "worker": "A B"}, now=self.tick()), 2)
+        self.assertEqual(self.snap(), before)
+
+    def test_claim_of_a_waiting_unknown_or_leased_task(self):
+        self.task("a")
+        self.task("b")
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        self.assertEqual(self.code(self.claim, "b"), 4)
+        self.assertEqual(self.code(self.claim, "ghost"), 9)
+        self.claim("a")
+        self.assertEqual(self.code(self.claim, "a"), 4)  # one live lease per task (Q-CLAIM-04)
+
+    def test_unenqueued_task_cannot_be_claimed(self):
+        self.task("a", enqueue=False)
+        self.assertEqual(self.code(self.claim, "a"), 9)
+
+    def test_precreated_lease_refuses_claim(self):  # Q-CLAIM-02, TM-15
+        self.task("t1")
+        before_queue = self.snap()
+        planted = self.shit / "leases" / "t1.json"
+
+        def plant(stage):
+            if stage == "pending-written":
+                planted.write_text("planted")
+
+        with mock.patch.object(q, "_checkpoint", plant):
+            self.assertEqual(self.code(self.claim, "t1"), 8)
+        self.assertEqual(self.queue_lines().__len__(), 1)  # only the enqueue entry
+        self.assertFalse((self.shit / "queue-pending.json").exists())
+        self.assertEqual(self.lifecycle("t1"), "open")
+        planted.unlink()
+        self.assertNotEqual(before_queue, {})
+
+    def test_leftover_lease_file_for_a_ready_task_is_an_orphan_not_a_claim(self):  # Q-LEASE-10, Q-REC-03
+        self.task("t1")
+        (self.shit / "leases" / "t1.json").write_text("planted")
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+        self.assertFalse((self.shit / "leases" / "t1.json").exists())
+        self.assertEqual(json.loads(self.queue_lines()[-1])["kind"], "orphan_removed")
+
+    def test_simultaneous_claims_single_winner(self):  # Q-CLAIM-01, TM-15 (racing claims, threads)
+        # The spec asks for 200 trials; each trial adds a task that every later operation re-verifies, so the
+        # default is 60 (about 6 s). Set SHIT_RACE_TRIALS=200 for the full run.
+        trials = int(os.environ.get("SHIT_RACE_TRIALS", "60"))
+        for n in range(trials):
+            task_mod.create_task(self.proj, task_id=f"r{n}", title="T", summary="S", owner="human", actor="human",
+                                 now=at(self.clock))
+            q.enqueue(self.proj, f"r{n}", "human", now=at(self.clock))
+        projects = [Project.open(self.repo) for _ in range(2)]
+        for p in projects:
+            self.addCleanup(p.close)
+        wins = {n: 0 for n in range(trials)}
+        errors = []
+        gate = threading.Barrier(2)
+
+        def worker(index):
+            gate.wait()
+            for n in range(trials):
+                try:
+                    q.claim(projects[index], {"task_id": f"r{n}", "step": "draft", "worker": f"w{index}",
+                                              "worker_kind": "script"}, now=at(self.clock + 1))
+                    wins[n] += 1
+                except ShitError as exc:
+                    errors.append(exc.code)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(120)
+        self.assertEqual(set(wins.values()), {1})
+        self.assertEqual(set(errors), {4})
+        self.assertEqual(len(os.listdir(self.shit / "leases")), trials)
+
+    def test_simultaneous_claims_from_two_processes(self):  # Q-CLAIM-01 across real processes
+        self.task("t1")
+        script = (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "from shit import queue as q; from shit.project import Project; from shit.errors import ShitError;"
+            "p = Project.open(sys.argv[2]);"
+            "\ntry:\n q.claim(p, {'task_id': 't1', 'step': 'draft', 'worker': 'w', 'worker_kind': 'ai'}, now=sys.argv[3]); print('won')"
+            "\nexcept ShitError as e:\n print('lost', e.code)\n")
+        procs = [subprocess.Popen([sys.executable, "-I", "-c", script, str(ROOT), str(self.repo), at(100)],
+                                  stdout=subprocess.PIPE, text=True) for _ in range(2)]
+        outs = sorted(p.communicate(timeout=60)[0].strip() for p in procs)
+        self.assertEqual(outs, ["lost 4", "won"])
+
+    def test_capability_and_capacity_are_not_part_of_this_issue(self):
+        # Documented gap (see docs/queue-spec.md follow-ups): no tag or capacity fields exist in a claim request.
+        self.assertNotIn("tags", q.CLAIM_KEYS)
+
+    def test_claim_before_not_before_is_refused(self):  # Q-RET-06
+        self.task("t1")
+        lease = self.claim("t1")
+        entries = [json.loads(line) for line in self.queue_lines()]
+        # a dispatch failure entry is written by issue 18's dispatcher; replay must honor its not_before
+        entries.append({**entries[-1], "id": "queue-0003", "timestamp": self.tick(), "kind": "dispatch_failed",
+                        "state_after": "ready", "lease_id": lease["lease_id"], "generation": 1,
+                        "not_before": at(self.clock + 500)})
+        for key in ("worker", "step", "expires_at"):
+            entries[-1].pop(key)
+        (self.shit / "leases" / "t1.json").unlink()
+        self.rewrite_queue([json.dumps(e, separators=(",", ":")).encode() for e in entries])
+        self.assertEqual(self.code(self.claim, "t1"), 4)
+        later = q.claim(self.proj, {"task_id": "t1", "step": "draft", "worker": "w", "worker_kind": "ai"},
+                        now=at(self.clock + 600))
+        self.assertEqual(later["generation"], 2)
+
+
+class Fencing(QueueCase):
+    def setUp(self):
+        super().setUp()
+        self.task("t1")
+        self.lease = self.claim("t1")
+        self.good = self.present(self.lease)
+
+    def refused(self, presented, op=None):
+        before = self.snap()
+        code = self.code(op or q.start, self.proj, presented, now=self.tick())
+        self.assertEqual(self.snap(), before)  # nothing is written
+        return code
+
+    def test_forged_lease_refused(self):  # Q-LEASE-01, TM-17
+        self.assertEqual(self.refused({**self.good, "lease_id": "0" * 32}), 12)
+        self.assertEqual(self.refused({**self.good, "lease_id": self.good["lease_id"][:-1] + "x"}), 12)
+        self.assertEqual(self.refused({**self.good, "generation": 2}), 12)
+        self.assertEqual(self.refused({**self.good, "generation": 0}), 12)
+        self.assertEqual(self.refused({**self.good, "task_id": "ghost"}), 9)
+
+    def test_shape_errors_are_usage_errors(self):
+        self.assertEqual(self.refused({**self.good, "extra": 1}), 2)
+        self.assertEqual(self.refused({"task_id": "t1"}), 2)
+        self.assertEqual(self.refused({**self.good, "generation": "1"}), 2)
+        self.assertEqual(self.refused({**self.good, "generation": True}), 2)
+        self.assertEqual(self.refused({**self.good, "lease_id": None}), 2)
+
+    def test_no_lease_refused_for_every_operation(self):
+        q.release(self.proj, self.good, now=self.tick())
+        for op in (q.start, q.renew, q.release, q.submit, q.fail):
+            self.assertEqual(self.refused(self.good, op), 12, op.__name__)
+        self.assertEqual(self.code(q.hold, self.proj, self.good, "owner", "r", "i", now=self.tick()), 12)
+
+    def test_hand_written_lease_file_grants_nothing(self):  # Q-LEASE-10
+        q.release(self.proj, self.good, now=self.tick())
+        forged = {**self.lease, "lease_id": "ab" * 16}
+        (self.shit / "leases" / "t1.json").write_text(json.dumps(forged))
+        self.status()  # maintenance removes the orphan file and records orphan_removed
+        self.assertEqual(self.refused({**self.good, "lease_id": "ab" * 16}), 12)
+
+    def test_tampered_live_lease_file_fails_closed(self):  # an edited expiry must not extend a lease
+        path = self.shit / "leases" / "t1.json"
+        record = json.loads(path.read_text())
+        record["expires_at"] = at(10 ** 6)
+        path.write_text(json.dumps(record))
+        before = self.snap()
+        self.assertEqual(self.code(self.status), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_stale_generation_submit_refused(self):  # Q-LEASE-02, TM-20
+        self.run_to_running("t1") if False else None
+        q.start(self.proj, self.good, now=self.tick())
+        q.reclaim(self.proj, "t1", "human", now=self.tick())  # lease A ends; the task is failed
+        self.assertEqual(self.lifecycle("t1"), "failed")
+        q.reopen(self.proj, "t1", "human", "retry", now=self.tick())
+        second = self.claim("t1", worker="w2")
+        self.assertEqual(second["generation"], 2)
+        q.start(self.proj, self.present(second), now=self.tick())
+        before = self.snap()
+        self.assertEqual(self.code(q.submit, self.proj, self.good, now=self.tick()), 12)  # worker A, generation 1
+        self.assertEqual(self.snap(), before)
+        q.submit(self.proj, self.present(second), now=self.tick())  # B's lease is intact
+
+    def test_wrong_state_for_the_operation(self):
+        self.assertEqual(self.refused(self.good, q.submit), 4)  # dispatched, not running
+        q.start(self.proj, self.good, now=self.tick())
+        self.assertEqual(self.refused(self.good, q.start), 4)
+
+
+class Expiry(QueueCase):
+    def test_dispatched_expiry_returns_to_ready_on_next_operation(self):  # Q-LEASE-05
+        self.task("t1")
+        lease = self.claim("t1")
+        later = at(self.clock + 901)
+        self.assertEqual(q.status(self.proj, now=later)["t1"]["state"], "ready")
+        kinds = [json.loads(line)["kind"] for line in self.queue_lines()]
+        self.assertEqual(kinds[-1], "expired")
+        self.assertFalse((self.shit / "leases" / "t1.json").exists())
+        self.clock += 902
+        self.assertEqual(self.code(q.start, self.proj, self.present(lease), now=self.tick()), 12)
+
+    def test_running_expiry_ends_failed_never_ready(self):  # Q-LEASE-06
+        self.task("t1")
+        self.run_to_running("t1")
+        row = q.status(self.proj, now=at(self.clock + 5000))["t1"]
+        self.assertEqual(row["state"], "failed")
+        self.assertEqual(self.lifecycle("t1"), "failed")
+        history = task_mod.get_task(self.proj, "t1")["history"][-1]
+        self.assertEqual((history["actor"], history["reason"]), ("wrapper", "lease expired"))
+
+    def test_renewal_bounds_enforced(self):  # Q-LEASE-03, TM-23
+        self.task("t1")
+        config = {"lease_ttl_seconds": 100 + 0, "lease_max_seconds": 350, "lease_max_renewals": 2}
+        lease = q.claim(self.proj, {"task_id": "t1", "step": "draft", "worker": "w", "worker_kind": "ai"},
+                        now=self.tick(), config=config)
+        p = self.present(lease)
+        first = q.renew(self.proj, p, now=self.tick(), config=config)
+        self.assertEqual(first["renewals"], 1)
+        second = q.renew(self.proj, p, now=self.tick(), config=config)
+        self.assertEqual(second["renewals"], 2)
+        before = self.snap()
+        self.assertEqual(self.code(q.renew, self.proj, p, now=self.tick(), config=config), 12)  # renewal count
+        self.assertEqual(self.snap(), before)
+
+    def test_total_length_bound(self):
+        self.task("t1")
+        config = {"lease_ttl_seconds": 100, "lease_max_seconds": 250, "lease_max_renewals": 50}
+        start = self.tick()
+        lease = q.claim(self.proj, {"task_id": "t1", "step": "draft", "worker": "w", "worker_kind": "ai"},
+                        now=start, config=config)
+        p = self.present(lease)
+        r1 = q.renew(self.proj, p, now=self.tick(), config=config)
+        r2 = q.renew(self.proj, p, now=self.tick(), config=config)  # clamped to claimed + 250
+        self.assertEqual(r2["expires_at"], (_dt(start) + timedelta(seconds=250)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        self.assertGreater(r2["expires_at"], r1["expires_at"])
+        self.assertEqual(self.code(q.renew, self.proj, p, now=self.tick(), config=config), 12)
+
+    def test_config_ranges_are_enforced(self):
+        self.task("t1")
+        for bad in ({"lease_ttl_seconds": 59}, {"lease_ttl_seconds": True}, {"unknown": 1}, {"max_attempts": 0},
+                    {"lease_ttl_seconds": 600, "lease_max_seconds": 100}, {"lease_max_renewals": 1001}):
+            self.assertEqual(self.code(q.status, self.proj, now=self.tick(), config=bad), 3, bad)
+
+    def test_clock_backward_fails_closed(self):  # Q-LEASE-08, TM-16
+        self.task("t1")
+        lease = self.claim("t1")
+        before = self.snap()
+        back = at(self.clock - 1)
+        self.assertEqual(self.code(q.claim, self.proj, {"task_id": "t1", "step": "draft", "worker": "w",
+                                                       "worker_kind": "ai"}, now=back), 8)
+        self.assertEqual(self.code(q.status, self.proj, now=back), 8)
+        self.assertEqual(self.code(q.renew, self.proj, self.present(lease), now=back), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_forward_clock_jump_does_not_double_claim(self):  # Q-LEASE-09
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        jump = at(self.clock + 10 ** 5)
+        second = q.status(self.proj, now=jump)
+        self.assertEqual(second["t1"]["state"], "failed")
+        self.assertEqual(self.code(q.submit, self.proj, self.present(lease), now=at(self.clock + 10 ** 5 + 1)), 12)
+
+    def test_forced_reclaim_writes_the_same_entries_as_expiry(self):  # Q-REC-05
+        for tid in ("a", "b"):
+            self.task(tid)
+            self.run_to_running(tid)
+        q.reclaim(self.proj, "a", "human", now=self.tick())
+        self.clock += 5000
+        q.status(self.proj, now=at(self.clock))
+        entries = {tid: [json.loads(line) for line in self.queue_lines() if json.loads(line)["task_id"] == tid]
+                   for tid in ("a", "b")}
+        shape = lambda tid: [(e["kind"], e["state_after"], e["actor"]) for e in entries[tid]]
+        self.assertEqual(shape("a"), shape("b"))
+        self.assertEqual(self.code(q.reclaim, self.proj, "b", "human", now=self.tick()), 9)
+        self.assertEqual(self.code(q.reclaim, self.proj, "a", "model", now=self.tick()), 10)
+
+
+def _dt(stamp):
+    return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+
+
+class RetryAndHold(QueueCase):
+    def test_no_automatic_retry_and_only_a_human_reopens(self):  # Q-RET-02
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        q.fail(self.proj, self.present(lease), now=self.tick())
+        for actor in ("wrapper", "model"):
+            self.assertEqual(self.code(q.reopen, self.proj, "t1", actor, "again", now=self.tick()), 4)
+        self.assertEqual(self.status()["t1"]["state"], "failed")
+        self.assertEqual(self.status(now=at(self.clock + 10 ** 6))["t1"]["state"], "failed")
+        q.reopen(self.proj, "t1", "human", "again", now=self.tick())
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+        self.assertEqual(self.lifecycle("t1"), "open")
+
+    def test_attempt_counts_started_entries_and_max_attempts_needs_a_decision(self):  # Q-RET-01, Q-RET-03
+        self.task("t1")
+        config = {"max_attempts": 2}
+        for n in range(2):
+            lease = q.claim(self.proj, {"task_id": "t1", "step": "draft", "worker": "w", "worker_kind": "ai"},
+                            now=self.tick(), config=config)
+            q.start(self.proj, self.present(lease), now=self.tick(), config=config)
+            q.fail(self.proj, self.present(lease), now=self.tick(), config=config)
+            if n == 0:
+                q.reopen(self.proj, "t1", "human", "again", now=self.tick(), config=config)
+        self.assertEqual(self.status(config=config)["t1"]["attempts"], 2)
+        before = self.snap()
+        self.assertEqual(self.code(q.reopen, self.proj, "t1", "human", "again", now=self.tick(), config=config), 10)
+        self.assertEqual(self.snap(), before)
+        commands.add_decision(self.proj, task_id="t1", decision_id="d1", status="accepted", question="q", choice="c",
+                              rationale="r", actor="human", now=self.tick())
+        q.reopen(self.proj, "t1", "human", "again", now=self.tick(), config=config)
+        self.assertEqual(self.status(config=config)["t1"]["state"], "ready")
+
+    def test_hold_blocks_dependents_and_leaves_only_through_a_human(self):  # Q-RET-07
+        for tid in ("a", "b"):
+            self.task(tid)
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        lease = self.run_to_running("a")
+        q.hold(self.proj, self.present(lease), "ci", "waiting for checks", "ci-run-1", now=self.tick())
+        rows = self.status(now=at(self.clock + 10 ** 6))
+        self.assertEqual((rows["a"]["state"], rows["b"]["state"]), ("hold-ci", "waiting"))
+        self.assertEqual(self.code(q.reopen, self.proj, "a", "wrapper", "x", now=self.tick()), 4)
+        q.reopen(self.proj, "a", "human", "resolved", now=self.tick())
+        self.assertEqual(self.status()["a"]["state"], "ready")
+
+    def test_reopen_lands_in_waiting_when_an_edge_is_unmet(self):
+        for tid in ("a", "b"):
+            self.task(tid)
+        lease = self.run_to_running("b")
+        q.fail(self.proj, self.present(lease), now=self.tick())
+        q.add_edge(self.proj, "b", "a", "draft", "human", now=self.tick())
+        q.reopen(self.proj, "b", "human", "again", now=self.tick())
+        self.assertEqual(json.loads(self.queue_lines()[-1])["state_after"], "waiting")
+        self.assertEqual(self.status()["b"]["state"], "waiting")
+
+    def test_hold_text_is_checked(self):
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        self.assertEqual(self.code(q.hold, self.proj, self.present(lease), "owner", "bad\u202etext", "i", now=self.tick()), 3)
+        self.assertEqual(self.code(q.hold, self.proj, self.present(lease), "elsewhere", "r", "i", now=self.tick()), 2)
+
+    def test_complete_requires_the_close_rules_and_is_terminal(self):  # Q-ST-05, TM-19
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        q.submit(self.proj, self.present(lease), now=self.tick())
+        self.assertEqual(self.code(q.complete, self.proj, "t1", "model", "done", now=self.tick()), 4)
+        self.assertEqual(self.code(q.complete, self.proj, "t1", "human", "done", now=self.tick()), 4)  # not approved yet
+        self.success_report("t1")
+        commands.add_review(self.proj, task_id="t1", review_id="rv1", report_id="t1-report", verdict="pass",
+                            summary="ok", actor="human", now=self.tick())
+        commands.add_decision(self.proj, task_id="t1", decision_id="d1", status="accepted", question="q", choice="c",
+                              rationale="r", actor="human", now=self.tick())
+        task_mod.transition(self.proj, "t1", "approved", "human", "ok", now=self.tick())
+        self.assertEqual(self.status()["t1"]["state"], "review")
+        q.complete(self.proj, "t1", "human", "closed", now=self.tick())
+        self.assertEqual((self.status()["t1"]["state"], self.lifecycle("t1")), ("done", "closed"))
+        for op in (lambda: self.claim("t1"), lambda: q.reopen(self.proj, "t1", "human", "x", now=self.tick()),
+                   lambda: q.enqueue(self.proj, "t1", "human", now=self.tick())):
+            self.assertIn(self.code(op), (3, 4))
+
+    def test_closed_id_not_reusable(self):  # Q-RES-01
+        self.task("t1")
+        self.assertEqual(self.code(q.enqueue, self.proj, "t1", "human", now=self.tick()), 3)
+        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t1", title="T", summary="S",
+                                   owner="human", actor="human", now=self.tick()), 2)
+        (self.shit / "tasks" / "t1.json").unlink()
+        self.assertEqual(self.code(task_mod.create_task, self.proj, task_id="t1", title="T", summary="S",
+                                   owner="human", actor="human", now=self.tick()), 3)
+
+    def test_enqueue_requires_human_or_wrapper_and_an_open_task(self):
+        self.task("t1", enqueue=False)
+        self.assertEqual(self.code(q.enqueue, self.proj, "t1", "model", now=self.tick()), 10)
+        self.assertEqual(self.code(q.enqueue, self.proj, "ghost", "human", now=self.tick()), 9)
+        self.assertEqual(self.code(q.enqueue, self.proj, "../x", "human", now=self.tick()), 3)
+        task_mod.transition(self.proj, "t1", "blocked", "human", "wait", now=self.tick(), blocked_reason="r",
+                            blocking_item="i")
+        self.assertEqual(self.code(q.enqueue, self.proj, "t1", "human", now=self.tick()), 4)
+
+
+class TransitionTable(unittest.TestCase):
+    def test_exactly_the_listed_pairs_are_legal(self):  # Q-ST-03
+        legal = {(a, b) for a in qr.STATES for b in qr.STATES if qr.check_queue_transition(a, b)}
+        self.assertEqual(len(qr.STATES) ** 2, 81)
+        self.assertEqual(legal, set(qr.ALLOWED))
+        self.assertEqual(len(legal), 24)
+        for state in qr.STATES:
+            self.assertFalse(qr.check_queue_transition(state, state))
+        for frm in ("done",):
+            self.assertFalse(any(qr.check_queue_transition(frm, b) for b in qr.STATES))  # done is terminal
+
+    def test_failed_never_goes_to_ready_except_by_reopen_entry(self):
+        entry = {"schema": "queue-entry", "schema_version": 1, "id": "queue-0001", "task_id": "t", "timestamp": at(1),
+                 "actor": "wrapper", "kind": "ready", "state_after": "ready"}
+        enqueued = {**entry, "kind": "enqueued", "state_after": "waiting", "id": "queue-0001"}
+        failed = {**entry, "id": "queue-0002", "kind": "failed", "state_after": "failed"}
+        with self.assertRaises(ShitError):
+            qr.replay([enqueued, failed])  # waiting to failed is not in the table
+
+
+class Hostile(QueueCase):
+    def entries(self):
+        return [json.loads(line) for line in self.queue_lines()]
+
+    def test_truncated_middle_line_fails_closed(self):  # Q-REC-04
+        self.task("a")
+        lease = self.run_to_running("a")
+        q.submit(self.proj, self.present(lease), now=self.tick())
+        lines = self.queue_lines()
+        del lines[1]
+        (self.shit / "queue.jsonl").write_bytes(b"".join(line + b"\n" for line in lines))
+        before = self.snap()
+        for op in (self.status, lambda: self.claim("a")):
+            self.assertEqual(self.code(op), 8)
+        self.assertEqual(self.snap(), before)
+
+    def test_edited_line_with_untouched_chain_fails_closed(self):
+        self.task("a")
+        lines = self.queue_lines()
+        lines[0] = lines[0].replace(b'"ready"', b'"waiting"')
+        (self.shit / "queue.jsonl").write_bytes(b"".join(line + b"\n" for line in lines))
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_chain_file_missing_or_short_fails_closed(self):
+        self.task("a")
+        (self.shit / "queue.chain").write_bytes(b"")
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_forged_rechained_entries_are_rejected_by_validation(self):  # TM-17, TM-19
+        self.task("a")
+        base = self.entries()[0]
+        forged_cases = {
+            "model reopen": {**base, "id": "queue-0002", "kind": "reopened", "actor": "model", "state_after": "ready"},
+            "unknown kind": {**base, "id": "queue-0002", "kind": "approved"},
+            "extra field": {**base, "id": "queue-0002", "kind": "ready", "model": "gpt"},
+            "claim without lease": {**base, "id": "queue-0002", "kind": "claimed", "state_after": "dispatched"},
+            "generation jump": {**base, "id": "queue-0002", "kind": "claimed", "state_after": "dispatched",
+                                "lease_id": "1" * 32, "generation": 7, "worker": "w", "step": "draft",
+                                "expires_at": at(10 ** 5)},
+            "done from ready": {**base, "id": "queue-0002", "kind": "done", "state_after": "done"},
+            "reused task id": {**base, "id": "queue-0002"},
+            "time goes back": {**base, "id": "queue-0002", "kind": "ready", "timestamp": at(-100)},
+            "wrong id": {**base, "id": "queue-0009", "kind": "ready"},
+        }
+        original = self.queue_lines()
+        for name, forged in forged_cases.items():
+            self.rewrite_queue([*original, json.dumps(forged, separators=(",", ":")).encode()])
+            self.assertEqual(self.code(self.status), 8, name)
+        self.rewrite_queue(original)
+        self.assertEqual(self.status()["a"]["state"], "ready")
+
+    def test_duplicate_key_and_depth_in_an_entry_are_refused(self):
+        self.task("a")
+        line = self.queue_lines()[0]
+        dup = line[:-1] + b',"kind":"ready"}'
+        self.rewrite_queue([dup])
+        self.assertEqual(self.code(self.status), 8)
+        self.rewrite_queue([line[:-1] + b',"x":[[[[[[[[[1]]]]]]]]]}'])
+        self.assertEqual(self.code(self.status), 7)
+
+    def test_hostile_characters_in_an_entry_message_are_refused(self):
+        self.task("a")
+        entry = {**self.entries()[0], "message": "line\u202ebreak"}
+        self.rewrite_queue([json.dumps(entry, separators=(",", ":")).encode()])
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_restored_older_queue_fails_closed(self):  # Q-RES-02, TM-19
+        self.task("a")
+        old = self.queue_lines()[:1]
+        lease = self.run_to_running("a")
+        q.submit(self.proj, self.present(lease), now=self.tick())
+        self.rewrite_queue(old)  # the prefix that ends at `enqueued`; the task is already in review
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_queue_entry_that_contradicts_the_lifecycle_fails_closed(self):  # Q-REC-04
+        self.task("a")
+        task_mod.transition(self.proj, "a", "blocked", "human", "by hand", now=self.tick(), blocked_reason="r",
+                            blocking_item="i")
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_task_file_missing_for_a_queued_task_fails_closed(self):
+        self.task("a")
+        (self.shit / "tasks" / "a.json").unlink()
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_symlinked_queue_files_and_leases_dir_are_refused(self):
+        self.task("a")
+        outside = self.repo / "x.jsonl"
+        outside.write_bytes((self.shit / "queue.jsonl").read_bytes())
+        (self.shit / "queue.jsonl").unlink()
+        os.symlink(outside, self.shit / "queue.jsonl")
+        self.assertEqual(self.code(self.status), 5)
+
+    def test_stray_name_in_leases_fails_closed(self):
+        self.task("a")
+        (self.shit / "leases" / "Not A Slug.txt").write_text("x")
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_lease_file_symlink_is_refused(self):
+        self.task("a")
+        os.symlink(self.repo / "elsewhere", self.shit / "leases" / "a.json")
+        self.assertEqual(self.code(self.status), 5)
+
+    def test_hostile_text_in_task_never_reaches_the_view_or_entries(self):
+        self.task("a")
+        self.assertNotIn(b"Title", b"".join(self.queue_lines()))
+
+
+class CrashRecovery(QueueCase):
+    STAGES = ("pending-written", "lease-applied", "lifecycle-applied", "entry-appended", "chain-appended",
+              "pending-removed")
+
+    class Crash(Exception):
+        pass
+
+    def scenario(self, case, op, module=q):
+        """Build a fresh repository, run `op` and crash at stage `case` (or never when None); return the end state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp).resolve() / "repo"
+            repo.mkdir()
+            make_git_dir(repo / ".git")
+            proj = Project.init(repo)
+            try:
+                for tid in ("t1",):
+                    task_mod.create_task(proj, task_id=tid, title="T", summary="S", owner="human", actor="human",
+                                         now=at(1))
+                    q.enqueue(proj, tid, "human", now=at(2))
+                with mock.patch.object(q, "_new_lease_id", lambda: "c" * 32):
+                    first = q.claim(proj, {"task_id": "t1", "step": "draft", "worker": "w", "worker_kind": "ai"}, now=at(3))
+                    if op != "claim":
+                        q.start(proj, {"task_id": "t1", "lease_id": first["lease_id"], "generation": 1}, now=at(4))
+                    target = {"claim": None, "start": None, "submit": q.submit, "fail": q.fail}.get(op)
+                    present = {"task_id": "t1", "lease_id": first["lease_id"], "generation": 1}
+                    if op == "claim":
+                        # crash during a second task's claim path is covered by a fresh task
+                        task_mod.create_task(proj, task_id="t2", title="T", summary="S", owner="human", actor="human",
+                                             now=at(5))
+                        q.enqueue(proj, "t2", "human", now=at(6))
+                        run = lambda: q.claim(proj, {"task_id": "t2", "step": "draft", "worker": "w", "worker_kind": "ai"},
+                                              now=at(7))
+                    else:
+                        run = lambda: target(proj, present, now=at(7))
+
+                    def crash(stage):
+                        if stage == case:
+                            raise CrashRecovery.Crash
+
+                    if case is not None:
+                        with mock.patch.object(module, "_checkpoint", crash), self.assertRaises(CrashRecovery.Crash):
+                            run()
+                    else:
+                        run()
+                    q.status(proj, now=at(8))  # any later locked operation finishes the commit
+                    q.status(proj, now=at(8))
+                return {str(p.relative_to(repo / ".shit")): p.read_bytes() for p in sorted((repo / ".shit").rglob("*"))
+                        if p.is_file() and p.name != "lock"}
+            finally:
+                proj.close()
+
+    def test_queue_crash_matrix_recovers_consistently(self):  # Q-REC-01, TM-24
+        for op in ("claim", "submit", "fail"):
+            expected = self.scenario(None, op)
+            for stage in self.STAGES:
+                with self.subTest(op=op, stage=stage):
+                    self.assertEqual(self.scenario(stage, op), expected)
+
+    def test_crash_inside_the_nested_lifecycle_transition_recovers(self):  # Q-ST-04
+        for op in ("submit", "fail"):
+            expected = self.scenario(None, op)
+            for stage in ("start", "pending-written", "event-appended", "chain-appended", "task-written"):
+                with self.subTest(op=op, stage=stage):
+                    self.assertEqual(self.scenario(stage, op, module=task_mod), expected)
+
+    def test_orphan_lease_removed(self):  # Q-REC-03a
+        self.task("t1")
+        (self.shit / "leases" / "ghost.json").write_text("{}")
+        self.status()
+        self.assertEqual(os.listdir(self.shit / "leases"), [])
+
+    def test_claimed_entry_with_missing_lease_file_is_treated_as_expired(self):  # Q-REC-03b
+        self.task("t1")
+        self.claim("t1")
+        (self.shit / "leases" / "t1.json").unlink()
+        self.assertEqual(self.status()["t1"]["state"], "ready")
+        self.assertEqual(json.loads(self.queue_lines()[-1])["kind"], "expired")
+
+    def test_stale_tmp_file_in_leases_is_cleaned(self):
+        self.task("t1")
+        (self.shit / "leases" / ".tmp-abc").write_text("x")
+        self.status()
+        self.assertEqual(os.listdir(self.shit / "leases"), [])
+
+    def test_pending_record_that_is_garbage_is_discarded_with_exit_8(self):  # Q-REC-02
+        self.task("t1")
+        before = self.snap()
+        pending = self.shit / "queue-pending.json"
+        pending.write_text("{not json")
+        self.assertEqual(self.code(self.status), 8)
+        self.assertFalse(pending.exists())
+        self.assertEqual(self.snap(), before)
+        pending.write_text(json.dumps({"index": 0}))
+        self.assertEqual(self.code(self.status), 8)
+
+    def test_torn_queue_tail_is_healed_from_the_pending_record(self):
+        self.task("t1")
+
+        def crash(stage):
+            if stage == "lifecycle-applied":
+                raise CrashRecovery.Crash
+
+        with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(CrashRecovery.Crash):
+            self.claim("t1")
+        pending = json.loads((self.shit / "queue-pending.json").read_text())
+        with open(self.shit / "queue.jsonl", "ab") as handle:
+            handle.write(pending["entry_line"].encode()[:20])  # a torn append
+        self.assertEqual(self.status()["t1"]["state"], "dispatched")
+
+    def test_pending_with_foreign_chain_line_fails_closed(self):
+        self.task("t1")
+
+        def crash(stage):
+            if stage == "pending-written":
+                raise CrashRecovery.Crash
+
+        with mock.patch.object(q, "_checkpoint", crash), self.assertRaises(CrashRecovery.Crash):
+            self.claim("t1")
+        path = self.shit / "queue-pending.json"
+        doc = json.loads(path.read_text())
+        doc["chain_line"] = hashlib.sha256(b"x").hexdigest()
+        path.write_text(json.dumps(doc))
+        self.assertEqual(self.code(self.status), 8)
+
+
+if __name__ == "__main__":
+    unittest.main()

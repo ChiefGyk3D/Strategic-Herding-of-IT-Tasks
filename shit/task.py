@@ -133,6 +133,11 @@ def get_task(project, task_id):
     return _guarded(run)
 
 
+def get_task_locked(project, task_id):
+    """Read a task while the caller already holds the store lock and has run recovery."""
+    return records.load_task(project.read(_task_path(task_id)))
+
+
 def create_task(project, *, task_id, title, summary, owner, actor, now=None):
     now = now or _now()
     record = {
@@ -148,6 +153,8 @@ def create_task(project, *, task_id, title, summary, owner, actor, now=None):
             _recover(project, log)
             if project.exists(path):
                 raise ShitError(USAGE)
+            if any(e["task_id"] == task_id for e in log.verify()):
+                raise ShitError(REJECTED)  # a task id is never reused, even if its file is gone (Q-RES-01)
             event = _event(log, task_id, actor, "task_created", "Task record created.", now)
             _commit(project, log, record, event)
             return record
@@ -155,38 +162,44 @@ def create_task(project, *, task_id, title, summary, owner, actor, now=None):
     return _guarded(run)
 
 
+def _transition_locked(project, log, task_id, to, actor, reason, now, blocked_reason, blocking_item, precheck):
+    """The body of `transition`; `project` must hold the lock and recovery must already have run."""
+    current = records.load_task(project.read(_task_path(task_id)))
+    frm = current["state"]
+    if to == "approved" and actor != "human" and (frm, to) in LEGAL:
+        raise ShitError(HUMAN_APPROVAL)
+    check_transition(frm, to, actor)
+    if precheck is not None:
+        precheck(current)
+    if now < current["updated_at"]:
+        raise ShitError(REJECTED)
+    record = {k: v for k, v in current.items() if k not in ("blocked_reason", "blocking_item")}
+    if to == "blocked":
+        if not blocked_reason or not blocking_item:
+            raise ShitError(REJECTED)
+        record["blocked_reason"], record["blocking_item"] = blocked_reason, blocking_item
+    elif blocked_reason is not None or blocking_item is not None:
+        raise ShitError(REJECTED)
+    record["state"] = to
+    record["updated_at"] = now
+    record["history"] = [*current["history"], {"from": frm, "to": to, "actor": actor, "at": now, "reason": reason}]
+    records.validate_task(record)
+    event = _event(log, task_id, actor, "state_transition", "State transition recorded.", now,
+                   from_state=frm, to_state=to)
+    _commit(project, log, record, event)
+    return record
+
+
 def transition(project, task_id, to, actor, reason, *, now=None, blocked_reason=None, blocking_item=None,
                precheck=None):
     now = now or _now()
-    path = _task_path(task_id)
+    _task_path(task_id)
     log = EventLog(project)
 
     def run():
         with project.locked():
             _recover(project, log)
-            current = records.load_task(project.read(path))
-            frm = current["state"]
-            if to == "approved" and actor != "human" and (frm, to) in LEGAL:
-                raise ShitError(HUMAN_APPROVAL)
-            check_transition(frm, to, actor)
-            if precheck is not None:
-                precheck(current)
-            if now < current["updated_at"]:
-                raise ShitError(REJECTED)
-            record = {k: v for k, v in current.items() if k not in ("blocked_reason", "blocking_item")}
-            if to == "blocked":
-                if not blocked_reason or not blocking_item:
-                    raise ShitError(REJECTED)
-                record["blocked_reason"], record["blocking_item"] = blocked_reason, blocking_item
-            elif blocked_reason is not None or blocking_item is not None:
-                raise ShitError(REJECTED)
-            record["state"] = to
-            record["updated_at"] = now
-            record["history"] = [*current["history"], {"from": frm, "to": to, "actor": actor, "at": now, "reason": reason}]
-            records.validate_task(record)
-            event = _event(log, task_id, actor, "state_transition", "State transition recorded.", now,
-                           from_state=frm, to_state=to)
-            _commit(project, log, record, event)
-            return record
+            return _transition_locked(project, log, task_id, to, actor, reason, now, blocked_reason,
+                                      blocking_item, precheck)
 
     return _guarded(run)

@@ -11,8 +11,10 @@ MESSAGES = {
     4: "illegal lifecycle transition",
     5: "confinement violation",
     7: "input exceeds limit",
+    8: "hook verification failed",
     9: "precondition missing",
     10: "human approval required",
+    12: "lease refused",
 }
 
 OK = 0
@@ -22,8 +24,11 @@ REJECTED = 3
 ILLEGAL_TRANSITION = 4
 CONFINEMENT = 5
 INPUT_LIMIT = 7
+FAILED_CLOSED = 8
 PRECONDITION = 9
 HUMAN_APPROVAL = 10
+# PROPOSED, not yet approved (docs/queue-spec.md OQ-1): the number and name may change.
+LEASE_REFUSED = 12
 
 
 class ShitError(Exception):

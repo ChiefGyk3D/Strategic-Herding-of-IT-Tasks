@@ -342,6 +342,62 @@ class Project:
             raise _os_error(exc) from None
         self._close(self._walk(parts))
 
+    def list_dir(self, name):
+        """Return the sorted entry names of the single-component directory `name` below the store."""
+        parts = self._split(name)
+        if len(parts) != 1:
+            raise ShitError(CONFINEMENT)
+        fd = self._walk(parts)
+        try:
+            return sorted(os.listdir(fd))
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            self._close(fd)
+
+    def create_exclusive(self, rel, data, limit=DEFAULT_LIMIT):
+        """Create `rel` with `data` only if it does not exist; return False when something is already there.
+
+        The content is written to a temp file and hard-linked into place, so the file appears complete or
+        not at all, and an existing entry (even a symlink) is never opened or followed.
+        """
+        parts = self._split(rel)
+        if len(data) > limit:
+            raise ShitError(INPUT_LIMIT)
+        dirfd = self._walk(parts[:-1])
+        tmp = f".tmp-{secrets.token_hex(8)}"
+        created = False
+        try:
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC, FILE_MODE, dir_fd=dirfd)
+            except OSError as exc:
+                raise _os_error(exc) from None
+            created = True
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view):]
+                os.fsync(fd)
+            finally:
+                self._close(fd)
+            try:
+                os.link(tmp, parts[-1], src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
+            except FileExistsError:
+                return False
+            os.unlink(tmp, dir_fd=dirfd)
+            created = False
+            os.fsync(dirfd)
+            return True
+        except ShitError:
+            raise
+        except OSError:
+            raise ShitError(INTERNAL) from None
+        finally:
+            if created:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp, dir_fd=dirfd)
+            self._close(dirfd)
+
     def exists(self, rel):
         parts = self._split(rel)
         dirfd = self._walk(parts[:-1])

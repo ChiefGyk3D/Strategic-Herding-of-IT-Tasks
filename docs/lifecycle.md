@@ -74,3 +74,18 @@
 | failed | closed | illegal | none | A failed task must be reopened rather than closed as successful work. |
 | failed | blocked | illegal | none | A failed task must be reopened before another condition is recorded. |
 | failed | failed | illegal | none | Repeating the current state is not a transition. |
+
+## Proposed amendment: bounded wrapper-only retry (draft, not in force)
+
+**Status:** draft for review. Nothing in this section changes the table above, and no code implements it. The owner decided on 2026-11-27 that a bounded, wrapper-only automatic retry is allowed (docs/queue-spec.md, OQ-3). A human must review this text before it replaces any rule above.
+
+Today `running` to `open` is illegal and `failed` to `open` is human-only, so a failed attempt always waits for a person. The amendment would add one legal transition and one counter:
+
+1. New row: `running` to `open`, actor `wrapper`, allowed only when the attempt failed for a reason the wrapper classifies as retryable (a lease that expired, or a launch failure that is not a work failure). The history reason must be one of a small fixed set of strings.
+2. A retry counter per task, kept in the queue log, not in the task record. After `max_auto_retries` (a configured integer, suggested default 1, allowed range 0 to 3; 0 turns the amendment off) consecutive wrapper retries the next failure moves the task to `failed` and only a human may reopen it.
+3. A human reopen, an accepted human decision, or a successful report resets the counter.
+4. The row `failed` to `open` stays human-only. A wrapper retry never passes through `failed`.
+5. Every retry is an event in the log and a queue entry, so it is visible and counted by the metrics.
+6. The threat model needs a new row for retry loops: an attacker or a flaky tool burning attempts. The control is the counter bound and the fixed reason set; the test must go red if the bound is removed.
+
+Open points for the reviewer: whether lease expiry on a running task is always safe to retry (the worker may have changed files outside the store), and whether `max_auto_retries` should be per role. Issue 17 leaves `expired` on a running lease ending in `failed` (Q-LEASE-06, Q-RET-02) until this text is approved.

@@ -263,3 +263,13 @@ class TornWrites(TaskBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IdReuse(TaskBase):
+    def test_id_of_a_deleted_task_file_is_never_reused(self):
+        self.create()
+        (self.shit / "tasks" / "t1.json").unlink()
+        before = self.snapshot()
+        self.assertEqual(self.code(self.create, "t1", T1), 3)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(len(self.events()), 1)
