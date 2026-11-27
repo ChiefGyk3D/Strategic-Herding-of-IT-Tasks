@@ -67,9 +67,9 @@ def parse(text):
     return fields
 
 
-def read(path):
+def read(path, base=None):
     """Read a decision file (at most 64 KiB, regular single-link file only) and validate it."""
-    data = read_bounded(path, MAX_BYTES)
+    data = read_bounded(path, MAX_BYTES, base)
     if len(data) > MAX_BYTES:
         raise ContractError(INPUT_LIMIT, "input exceeds limit")
     return parse(decode(data))

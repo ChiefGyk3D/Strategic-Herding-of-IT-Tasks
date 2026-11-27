@@ -159,9 +159,12 @@ def render(fields):
     return text
 
 
-def read(path):
-    """Read a brief file (at most 64 KiB, regular file only) and validate it."""
-    data = read_bounded(path, MAX_BYTES)
+def read(path, base=None):
+    """Read a brief file (at most 64 KiB, regular file only, below base) and validate it.
+
+    base is the trusted project or working root (default: the working directory); see _text.open_regular.
+    """
+    data = read_bounded(path, MAX_BYTES, base)
     if len(data) > MAX_BYTES:
         raise ContractError(INPUT_LIMIT, "input exceeds limit")
     return parse(decode(data))
