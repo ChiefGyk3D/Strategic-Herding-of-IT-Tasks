@@ -75,7 +75,9 @@ Rules:
 - A deployment declares the window it loaded. The tool reads that value and never
   assumes a default size.
 - The reference deployment in SAFO uses a configured 128K (131072) window (SOURCE).
-  A 32K or 64K window is a hardware choice for self-hosters, not a default.
+  The portable edition's default profile is 32K and 64K is an opt-in profile
+  (section 6, DECIDED 2026-11-27). Neither is a recall promise until its matrix row
+  is measured.
 
 Measurement matrix (protocol only; NOT RUN):
 
@@ -111,9 +113,19 @@ real private data.
 Test requirement: a hostile-input fixture with an over-window prompt must be refused,
 with the refusal visible in the log.
 
-## 6. Hardware class: OWNER DECISION (32K or 64K)
+## 6. Hardware class: DECIDED (32K default, 64K opt-in)
 
-This design does not choose. The owner chooses the hardware class.
+Status: DECIDED, 2026-11-27. Owner answer, multiple-choice, to the question on the
+window for the portable edition: "32K default, 64K opt-in (Recommended)".
+
+Decision:
+- Default profile for the shared-machine profile: 32K tokens.
+- Opt-in profile for capable hardware: 64K tokens. Documented, not the default.
+- The window stays a config value per deployment (section 4). Neither profile is
+  promised for recall until its matrix row in section 4 is measured. The 32K default
+  is a configuration choice; it is not a recall claim.
+
+The options below are kept as the record of what was weighed.
 
 Option A: 32K window.
 - For: smaller memory footprint; more machines qualify; lower latency per call
@@ -127,11 +139,12 @@ Option B: 64K window.
 - Against: higher memory need, so fewer self-hosted machines qualify; slower per call
   (INFERRED); recall not yet measured (MEASURED: none).
 
-Recommendation (INFERRED): plan the code for both, with the window as config. Make
-the portable edition's default profile 32K, and make 64K a documented opt-in profile,
-because the self-hosted audience is small teams on ordinary hardware. Switch the
-default only after the matrix in section 4 shows intact recall at 32K for the routed
-tasks. This recommendation is not a decision.
+Recommendation (INFERRED, adopted by the owner on 2026-11-27, see the decision above):
+plan the code for both, with the window as config. Make the portable edition's
+default profile 32K, and make 64K a documented opt-in profile, because the
+self-hosted audience is small teams on ordinary hardware. The recall evidence for
+the routed tasks at 32K still comes from the matrix in section 4; until that row is
+measured, no recall level is promised at 32K.
 
 ## 7. Self-hosted setup for a small team, and honest tiers
 
@@ -185,8 +198,8 @@ Acceptance (INFERRED, owner to confirm the numbers):
 
 ## 10. Owner decisions needed
 
-1. Hardware class: 32K or 64K window for the portable edition default. Options and
-   recommendation in section 6. OWNER DECISION.
+1. DECIDED (2026-11-27): 32K default, 64K opt-in. Owner words: "32K default, 64K
+   opt-in (Recommended)". Record in section 6.
 2. Model family: confirm gemma4 as the primary family, or name another. OWNER DECISION.
 3. Routing exclusions: confirm that commit messages and CI digests stay external or
    human only (section 3). OWNER DECISION.
