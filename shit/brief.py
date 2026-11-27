@@ -14,7 +14,8 @@ code (docs/exit-codes.md) and never echo the rejected value.
 
 import re
 
-from shit._text import check_size, check_text, decode, has_placeholder, read_bounded
+from shit._text import check_size, check_text, decode, read_bounded
+from shit._text import check_value as _check_value
 from shit.errors import INPUT_LIMIT, ContractError, rejected
 
 MAX_BYTES = 65536
@@ -53,20 +54,6 @@ MULTI = {
 }
 ORDER = ["issue", "role", "model", "packs", "objective", "scope", "constraints", "acceptance", "data_class",
          "cleanup_duty", "evidence", "review_destination"]
-
-
-def _check_value(key, value, limit):
-    if not isinstance(value, str):
-        raise rejected(f"{key}: must be text")
-    check_text(value)
-    if "\n" in value:
-        raise rejected(f"{key}: must be one line")
-    if value != value.strip() or not value:
-        raise rejected(f"{key}: empty or padded")
-    if len(value) > limit:
-        raise rejected(f"{key}: too long")
-    if has_placeholder(value):
-        raise rejected(f"{key}: unfilled placeholder")
 
 
 def _parse_packs(value):
@@ -141,7 +128,7 @@ def parse(text):
         m = _LINE.fullmatch(line)
         if not m:
             continue
-        key, value = m.group(1), m.group(2).strip()
+        key, value = m.group(1), m.group(2)
         if key not in SINGLE and key not in MULTI:
             raise rejected("unknown field")
         if key in MULTI:

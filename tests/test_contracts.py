@@ -180,6 +180,22 @@ class BriefHostileTextTests(unittest.TestCase):
                 text = brief.render(GOOD_BRIEF) + f"{key}: second\n"
                 self.assertEqual(code_of(brief.parse, text), 3)
 
+    def test_padded_values_are_rejected_on_parse_as_on_render(self):
+        base = brief.render(GOOD_BRIEF)
+        padded = [
+            base.replace("objective: Import the brief contract.",
+                         "objective:   Import the brief contract.   "),
+            base.replace("objective: Import the brief contract.",
+                         "objective: Import the brief contract. "),
+            base.replace("scope: templates/brief.md", "scope:  templates/brief.md"),
+            base.replace("packs: review-protocol, threat-model",
+                         "packs:  review-protocol, threat-model "),
+        ]
+        for text in padded:
+            with self.subTest(text=text.splitlines()[2:6]):
+                self.assertEqual(code_of(brief.parse, text), 3)
+        self.assertEqual(brief.parse(base)["objective"], "Import the brief contract.")
+
     def test_repeated_scope_lines_are_a_list(self):
         text = brief.render({**GOOD_BRIEF, "scope": ["a", "b", "c"]})
         self.assertEqual(brief.parse(text)["scope"], ["a", "b", "c"])
@@ -261,6 +277,44 @@ class BriefFileTests(unittest.TestCase):
 
     def test_read_refuses_a_directory(self):
         self.assertEqual(code_of(brief.read, self.dir), 5)
+
+    def test_read_refuses_a_symlinked_parent_directory(self):
+        outside = self.dir / "outside"
+        outside.mkdir()
+        (outside / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        work = self.dir / "work"
+        work.mkdir()
+        os.symlink(outside, work / "linked-dir")
+        self.assertEqual(code_of(brief.read, work / "linked-dir" / "brief.md"), 5)
+
+    def test_read_refuses_a_symlink_in_the_middle_of_the_path(self):
+        real = self.dir / "real"
+        (real / "deep").mkdir(parents=True)
+        (real / "deep" / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        os.symlink(real, self.dir / "alias")
+        self.assertEqual(code_of(brief.read, self.dir / "alias" / "deep" / "brief.md"), 5)
+
+    def test_read_refuses_a_hard_linked_file(self):
+        outside = self.dir / "outside.md"
+        outside.write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        hard = self.dir / "hard.md"
+        os.link(outside, hard)
+        self.assertEqual(code_of(brief.read, hard), 5)
+
+    def test_header_reader_refuses_a_symlinked_parent_and_a_hard_link(self):
+        real = self.dir / "real"
+        real.mkdir()
+        (real / "r.md").write_text(GOOD_HEADER, encoding="utf-8")
+        os.symlink(real, self.dir / "linked")
+        self.assertEqual(code_of(evidence.read_header, self.dir / "linked" / "r.md"), 5)
+        os.link(real / "r.md", self.dir / "hard.md")
+        self.assertEqual(code_of(evidence.read_header, self.dir / "hard.md"), 5)
+
+    def test_read_of_a_plain_nested_path_still_works(self):
+        nested = self.dir / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "brief.md").write_text(brief.render(GOOD_BRIEF), encoding="utf-8")
+        self.assertEqual(brief.read(nested / "brief.md")["role"], "implementer")
 
 
 class HeaderTests(unittest.TestCase):
