@@ -6,9 +6,24 @@
 
 A lease is proved today by a `lease_id` (128 random bits) plus a generation. Both sit in `.shit/leases/<task-id>.json`, mode 0600. Any process running as the same operating-system user can read that file and present the id, so it can renew, submit, fail or release a lease it does not hold (TM-17). The chain already stops a worker that has no id, a stale generation, and a hand-forged lease file. It does not stop a same-user process that reads the file.
 
+## Limits (read first)
+
+Per-worker credentials do not stop a hostile process running as the same operating-system user. Memory, environment variables and mode 0600 files are all readable by that user. Without a broker running under a different OS identity (authenticated IPC with peer credentials), or a distinct OS identity per worker, this design only protects against passive disclosure of the `.shit` store (a copied file, a screenshot, a logged listing). The claims in the sections below are read in that narrower sense.
+
+Unresolved items from the Daybreak round 1 review:
+
+- Same-user hostile workers: a worker that can read another worker's secret can release or submit its lease.
+- Standard input is already the adapter prompt transport, so it cannot also carry the secret.
+- "Never printed" conflicts with the paste-in adapter showing the secret to a human once.
+- A renewal can commit before the caller receives the rotated secret, losing the lease.
+- A claim cannot deliver the secret exactly once if the response is lost.
+- Default-off migration allows a downgrade unless the mode is persisted and proven by the chain.
+- A human `reclaim` and `reopen` rely on the unauthenticated `actor == "human"` label; authenticated human-control operations are needed.
+- The presented lease id is compared in constant time but is not first constrained to the canonical length and encoding.
+
 ## Goal and non-goals
 
-Goal: a worker proves it is the worker the claim was issued to, using a secret that is not stored in any file the wrapper reads back, so reading `.shit` is not enough to act as that worker.
+Goal: a worker proves it is the worker the claim was issued to, using a secret that is not stored in any file the wrapper reads back, so reading `.shit` is not enough to act as that worker. This is protection from passive disclosure of the store, not from a hostile process of the same OS user (see Limits).
 
 Non-goals: defending against a process that can read the claiming worker's memory or environment, against root, or against the owner's account being compromised. Authentication of humans (actor strings stay provenance labels). Network use: there is none.
 
@@ -24,7 +39,7 @@ Non-goals: defending against a process that can read the claiming worker's memor
 
 ## What it defends against on one machine
 
-- A same-user process that reads `.shit` (the lease file, the chain, `QUEUE.md`, a pending record) learns the id and the digest but cannot act as the worker.
+- A process that only reads `.shit` (the lease file, the chain, `QUEUE.md`, a pending record) learns the id and the digest but cannot act as the worker. A same-user process that also reads the worker's secret still can (see Limits).
 - A leaked or logged lease id, for example from a screenshot or a shared task listing.
 - A stale worker whose lease was reclaimed: it holds an old secret that no longer matches.
 

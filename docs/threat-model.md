@@ -153,7 +153,10 @@ These rows cover the dependency graph, queue, leases and apply serialization spe
 - A compromised local account or administrator can alter records and logs.
 - Stage one records are not cryptographically signed, encrypted, or append-only at the filesystem level.
 - The queue hash chain detects edits, truncation and reordering by someone who does not also rewrite the chain. Anyone who can rewrite `queue.jsonl`, `queue.chain` and the shards together, including deleting them all, cannot be detected without signing (docs/queue-spec.md, Q-RES-02).
-- A lease id is a bearer token readable by any process of the same operating-system user (TM-17). Per-worker credentials are designed in `docs/design/lease-credentials.md` and not yet implemented.
+- A lease id is a bearer token readable by any process of the same operating-system user (TM-17). Per-worker credentials, as designed in `docs/design/lease-credentials.md` and not yet implemented, do not stop a hostile process of the same OS user: that needs a broker running under another OS identity with authenticated IPC, or distinct OS identities per worker. The design narrows exposure to passive disclosure of `.shit` only.
+- A same-user process with write access to the repository can still move or replace the `.shit` directory or its files. The store lock now rests on a directory descriptor and the queue tip is anchored in `queue-anchor.json`, which closes accidental and partial rollback, but a process that rewrites the queue files, the chain, the shards and the anchor together, or replaces the whole store, is the unsigned-history case above: an authenticated monotonic anchor outside the writable repository is required to close it. Until then a generation can be reused after such a coordinated rollback.
+- The hash chain is unkeyed: an entry appended with a recomputed chain is accepted if it is a valid next step. Actor labels (`human`, `wrapper`) are validated but not authenticated.
+- Work done while holding the store lock is not time-bounded, and privacy-scan traversal does not bound directory width or cumulative bytes (follow-up).
 - A compromised allowlisted executable can act within its operating-system permissions.
 - Fail-closed hooks protect integrity but may create denial-of-service conditions.
 - Privacy scanning can miss unknown patterns and can produce false positives.

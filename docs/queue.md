@@ -49,6 +49,17 @@ The spec text now matches the code.
 5. A hold leaves only through a human `reopen`. The table's hold to running (wrapper resume) is not implemented.
 6. Deleting `queue.jsonl`, `queue.chain` and the shards together is undetectable without signing. It is listed under residual risks in `docs/threat-model.md`.
 
+## Hardening notes (Daybreak round 1)
+
+- The store lock is taken on a descriptor of the `.shit` directory, not on the `lock` file path. Replacing the file does not admit a second holder. Anyone who can move or replace the `.shit` directory itself can still redirect a process to a different store; that needs a different OS identity (see the threat model).
+- An exclusive publication that stopped between its link and its unlink leaves a `.tmp-` name and its destination sharing one inode. The next operation removes exactly that pair; any other extra link is still refused (exit code 5).
+- Replay enforces global ceilings on every lease whatever the configuration: a TTL of at most 86,400 seconds from the entry's own time, an absolute lifetime of at most 604,800 seconds, at most 1,000 renewals, and no renewal at or after the lease's expiry. `apply_started` and `apply_finished` are accepted only as one ordered pair under an `apply`-step lease, once per attempt. Apply claims still refuse while an apply prerequisite has not finished.
+- Every mutation checks the clock against the queue tip and the event-log tip, and `EventLog.prepare` validates the whole sequence with the candidate, so time never goes backwards in either chain.
+- An append that would cross the 64 MiB log cap is refused with exit code 7 before anything is written. The check for a lifecycle event assumes the largest record, so it refuses slightly early.
+- The task cap (2,000) counts queued ids and shard owners together. An empty persisted shard is refused.
+- Maintenance removes every temporary leftover in one pass, and readiness reads an index of edges by task.
+- Not done (follow-up): privacy-scan directory width and cumulative byte budgets, an operation deadline while holding the lock, and `scandir`-based bounded listings (M4).
+
 ## Still open
 
 | Question | Effect on this implementation |
