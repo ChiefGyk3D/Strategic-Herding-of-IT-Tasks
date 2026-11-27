@@ -48,6 +48,18 @@ scan = true
 # Default: 32768. The window must match the window the local server actually loaded.
 context_tokens = 32768
 
+# Optional size limits checked by `shit check`. Remove the leading "# " from the table header and the
+# keys you want. With no [limits] table nothing is measured. The install owner sets the numbers; measure
+# your own instruction files first and re-measure after changes.
+# [limits]
+# Largest allowed size in bytes of each well-known instruction file at the project root (the list is
+# INSTRUCTION_FILES in shit/check.py). Integer 1 to 10000000. Default: not set, no check.
+# instruction_max_bytes = 8000
+# Largest allowed number of names in [roles] names. Integer 1 to 10000000. Default: not set, no check.
+# listed_roles_max = 6
+# What an exceeded limit does: "warn" prints a warning and exits 0; "fail" exits 7. Default: "warn".
+# on_exceed = "warn"
+
 [yardstick]
 # Optional weights for `python3 -m shit.yardstick`, one per event kind, each an integer from 0 to 1000.
 # The report multiplies each event count by its weight and sums them into "effort points". Points are an
