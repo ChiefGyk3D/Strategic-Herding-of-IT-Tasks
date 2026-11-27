@@ -147,7 +147,9 @@ class ConfigRejectionTests(unittest.TestCase):
         self.assertEqual(code_of(config.parse, GOOD.replace('"example-project"', '"<project name>"')), 3)
 
     def test_hostile_character_is_rejected(self):
-        self.assertEqual(code_of(config.parse, GOOD.replace("example-project", "example​-project")), 3)
+        zero_width_space = chr(0x200B)
+        self.assertEqual(code_of(config.parse, GOOD.replace("example-project",
+                                                           "example" + zero_width_space + "-project")), 3)
 
     def test_non_text_input_is_rejected(self):
         self.assertEqual(code_of(config.parse, b"schema_version = 1"), 3)
