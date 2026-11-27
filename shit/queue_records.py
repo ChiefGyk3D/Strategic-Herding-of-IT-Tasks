@@ -8,6 +8,7 @@ No file is read here; `queue.py` does the storage.
 
 import json
 import re
+from datetime import datetime
 
 from . import records
 from .errors import INPUT_LIMIT, REJECTED, ShitError
@@ -19,6 +20,12 @@ HOLD_KINDS = ("owner", "ci")
 LEASE_ID = re.compile(r"[0-9a-f]{32}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_MESSAGE = 500
+STAMP = "%Y-%m-%dT%H:%M:%SZ"
+# Global hard ceilings, the top of each configuration range. Replay and loading enforce them for every lease,
+# whatever configuration the entry was written under.
+MAX_TTL = 86400
+MAX_LIFETIME = 604800
+MAX_RENEWALS = 1000
 
 HOLDS = ("hold-owner", "hold-ci")
 
@@ -91,6 +98,11 @@ CONFIG_DEFAULTS = {
 
 def reject():
     return ShitError(REJECTED)
+
+
+def _seconds(later, earlier):
+    """Whole seconds from `earlier` to `later`, both fixed-width UTC stamps."""
+    return int((datetime.strptime(later, STAMP) - datetime.strptime(earlier, STAMP)).total_seconds())
 
 
 def make_config(**overrides):
@@ -216,7 +228,7 @@ def validate_lease(obj):
     if type(obj["renewals"]) is not int or obj["renewals"] < 0:
         raise reject()
     claimed, expires = records._stamp(obj, "claimed_at"), records._stamp(obj, "expires_at")
-    if expires <= claimed:
+    if expires <= claimed or _seconds(obj["expires_at"], obj["claimed_at"]) > MAX_LIFETIME or obj["renewals"] > MAX_RENEWALS:
         raise reject()
     return obj
 
@@ -262,6 +274,10 @@ def _step(task, entry, before):
             lease = task["lease"]
             if entry["worker"] != lease["worker"] or entry["step"] != lease["step"] or entry["expires_at"] <= lease["expires_at"]:
                 raise reject()
+            if (_seconds(entry["expires_at"], lease["expires_at"]) > MAX_TTL
+                    or _seconds(entry["expires_at"], lease["claimed_at"]) > MAX_LIFETIME
+                    or lease["renewals"] + 1 > MAX_RENEWALS):
+                raise reject()
             lease["expires_at"] = entry["expires_at"]
             lease["renewals"] += 1
         elif before != "running" or task["lease"]["step"] != "apply":
@@ -284,6 +300,8 @@ def _step(task, entry, before):
             raise reject()
     elif kind == "claimed":
         if entry["generation"] != task["generation"] + 1 or task["lease"] is not None or entry["expires_at"] <= stamp:
+            raise reject()
+        if _seconds(entry["expires_at"], stamp) > MAX_TTL:
             raise reject()
         if task["not_before"] is not None and stamp < task["not_before"]:
             raise reject()

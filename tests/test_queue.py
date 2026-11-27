@@ -1489,5 +1489,52 @@ class LockIdentity(QueueCase):
                 pass
 
 
+class ReplayCeilings(QueueCase):
+    """Replay enforces the global lease ceilings even for a correctly chained entry."""
+
+    def entries(self):
+        return [json.loads(line) for line in self.queue_lines()]
+
+    def test_a_far_future_claim_is_refused_by_replay(self):  # M2
+        self.task("t1")
+        self.claim("t1")
+        entries = self.entries()
+        entries[-1]["expires_at"] = "9999-12-31T23:59:59Z"
+        with self.assertRaises(ShitError) as raised:
+            qr.replay(entries)
+        self.assertEqual(raised.exception.code, 3)
+
+    def test_a_claim_longer_than_the_ttl_ceiling_is_refused(self):  # M2
+        self.task("t1")
+        self.claim("t1")
+        entries = self.entries()
+        entries[-1]["expires_at"] = at(self.clock + 86401)
+        with self.assertRaises(ShitError):
+            qr.replay(entries)
+
+    def test_a_renewal_past_the_absolute_ceiling_is_refused(self):  # M2
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        q.renew(self.proj, self.present(lease), now=self.tick())
+        entries = self.entries()
+        entries[-1]["expires_at"] = "2099-01-01T00:00:00Z"
+        with self.assertRaises(ShitError):
+            qr.replay(entries)
+
+    def test_a_lease_file_with_an_impossible_lifetime_is_rejected(self):  # M2
+        self.task("t1")
+        lease = self.claim("t1")
+        lease["expires_at"] = "9999-12-31T23:59:59Z"
+        with self.assertRaises(ShitError):
+            qr.validate_lease(lease)
+
+    def test_the_generated_limits_still_replay(self):  # M2 positive control
+        self.task("t1")
+        lease = self.run_to_running("t1")
+        for _ in range(3):
+            q.renew(self.proj, self.present(lease), now=self.tick())
+        qr.replay(self.entries())
+
+
 if __name__ == "__main__":
     unittest.main()
