@@ -4,16 +4,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from _bootstrap import make_git_dir
+
+from shit import records
 from shit.errors import ShitError
-from shit.log import EventLog
+from shit.log import GENESIS, EventLog, chain_hash
 from shit.project import Project
 
 
 def ev(i, **over):
     base = {
-        "schema": "event-log", "schema_version": 1, "id": f"event-{i:04d}", "task_id": "t1",
+        "schema": "event-log", "schema_version": 1, "id": f"event-{i:04d}", "task_id": f"t{i}",
         "timestamp": "2026-11-26T15:30:00Z", "actor": "human", "event": "task_created",
-        "message": "Task record created.", "record_id": "t1",
+        "message": "Task record created.", "record_id": f"t{i}",
     }
     base.update(over)
     return base
@@ -25,7 +28,7 @@ class LogBase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.repo = Path(self._tmp.name).resolve() / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
         self.proj = Project.init(self.repo)
         self.addCleanup(self.proj.close)
         self.log = EventLog(self.proj)
@@ -73,6 +76,57 @@ class AppendAndVerify(LogBase):
 
     def test_append_requires_lock(self):
         self.assertEqual(self.code(self.log.append, ev(1)), 1)
+
+
+def tr(i, task, frm, to, stamp, actor="wrapper"):
+    return ev(i, task_id=task, record_id=task, event="state_transition", message="State transition recorded.",
+              actor=actor, timestamp=stamp, from_state=frm, to_state=to)
+
+
+class Chronology(LogBase):
+    """Forged logs with a valid chain, so only the lifecycle rules can reject them."""
+
+    def forge(self, events):
+        prev, chain, lines = GENESIS, [], []
+        for event in events:
+            line = records.dump_event(event)
+            prev = chain_hash(prev, line)
+            lines.append(line)
+            chain.append(prev)
+        (self.shit / "events.jsonl").write_bytes(b"".join(x + b"\n" for x in lines))
+        (self.shit / "events.chain").write_bytes(b"".join(c.encode("ascii") + b"\n" for c in chain))
+
+    def created(self, i, task, stamp):
+        return ev(i, task_id=task, record_id=task, timestamp=stamp)
+
+    def test_forged_valid_sequence_verifies(self):
+        self.forge([self.created(1, "t1", "2026-11-26T15:30:00Z"), tr(2, "t1", "open", "running", "2026-11-26T15:31:00Z"),
+                    tr(3, "t1", "running", "review", "2026-11-26T15:32:00Z")])
+        self.assertEqual(len(self.log.verify()), 3)
+
+    def test_backwards_timestamp_rejected(self):
+        self.forge([self.created(1, "t1", "2026-11-26T15:31:00Z"), self.created(2, "t2", "2026-11-26T15:30:00Z")])
+        self.assertEqual(self.code(self.log.verify), 3)
+
+    def test_transition_must_start_from_previous_state(self):
+        self.forge([self.created(1, "t1", "2026-11-26T15:30:00Z"),
+                    tr(2, "t1", "running", "review", "2026-11-26T15:31:00Z")])
+        self.assertEqual(self.code(self.log.verify), 3)
+
+    def test_first_transition_must_start_from_open(self):
+        self.forge([tr(1, "t1", "running", "review", "2026-11-26T15:31:00Z")])
+        self.assertEqual(self.code(self.log.verify), 3)
+
+    def test_replayed_old_transition_with_new_id_rejected(self):
+        self.forge([self.created(1, "t1", "2026-11-26T15:30:00Z"),
+                    tr(2, "t1", "open", "running", "2026-11-26T15:31:00Z"),
+                    tr(3, "t1", "running", "review", "2026-11-26T15:32:00Z"),
+                    tr(4, "t1", "open", "running", "2026-11-26T15:33:00Z")])
+        self.assertEqual(self.code(self.log.verify), 3)
+
+    def test_second_creation_of_same_task_rejected(self):
+        self.forge([self.created(1, "t1", "2026-11-26T15:30:00Z"), self.created(2, "t1", "2026-11-26T15:31:00Z")])
+        self.assertEqual(self.code(self.log.verify), 3)
 
 
 class Tamper(LogBase):

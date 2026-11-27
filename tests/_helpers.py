@@ -104,16 +104,21 @@ class RepoCase(unittest.TestCase):
     # -- records ---------------------------------------------------------
 
     def new_task(self, tid="t1", state="open"):
+        # The log enforces chronology, so each task continues after the last stamp used by an earlier one.
+        base = getattr(self, "_next_minute", 0)
+        stamp = lambda n: f"2026-11-26T{15 + (30 + base + n) // 60:02d}:{(30 + base + n) % 60:02d}:00Z"
         task_mod.create_task(self.proj, task_id=tid, title="Title", summary="Summary", owner="human",
-                             actor="human", now=T0)
-        path = [("running", "wrapper", T1), ("review", "wrapper", T2), ("approved", "human", T3),
-                ("closed", "human", T4)]
-        for to, actor, at in path:
+                             actor="human", now=stamp(0))
+        path = [("running", "wrapper"), ("review", "wrapper"), ("approved", "human"), ("closed", "human")]
+        used = 0
+        for n, (to, actor) in enumerate(path, start=1):
             if state == "open":
                 break
-            task_mod.transition(self.proj, tid, to, actor, "step", now=at)
+            task_mod.transition(self.proj, tid, to, actor, "step", now=stamp(n))
+            used = n
             if to == state:
                 break
+        self._next_minute = base + used + 1
 
     def put(self, rel, text):
         parent = self.store / Path(rel).parent

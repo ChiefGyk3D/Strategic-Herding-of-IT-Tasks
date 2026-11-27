@@ -19,7 +19,7 @@ from .errors import (
     ShitError,
 )
 from .lifecycle import LEGAL, check_transition
-from .log import GENESIS, EventLog, Prepared, chain_hash
+from .log import CHAIN_PATH, GENESIS, LOG_PATH, EventLog, Prepared, chain_hash
 
 PENDING = "pending.json"
 PENDING_LIMIT = 4 * records.MAX_RECORD_BYTES
@@ -76,7 +76,10 @@ def _recover(project, log):
     event = records.load_event(line)
     if event["task_id"] != task["id"]:
         raise ShitError(REJECTED)
-    log_lines, chain_lines = log._raw()
+    log_lines, log_torn = log._split(LOG_PATH)
+    chain_lines, chain_torn = log._split(CHAIN_PATH)
+    log_lines = log.heal_torn_tail(LOG_PATH, log_lines, log_torn, index, line + b"\n")
+    chain_lines = log.heal_torn_tail(CHAIN_PATH, chain_lines, chain_torn, index, chain_line.encode("ascii") + b"\n")
     if len(chain_lines) < index or len(log_lines) < index:
         raise ShitError(REJECTED)
     previous = GENESIS if index == 0 else chain_lines[index - 1].decode("ascii", "replace")

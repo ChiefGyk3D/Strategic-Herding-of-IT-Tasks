@@ -27,15 +27,75 @@ _NOFOLLOW = os.O_NOFOLLOW
 _CLOEXEC = os.O_CLOEXEC
 
 
+def _is_repo_dir(path):
+    """True when `path` is a real, user-owned git directory: not a symlink, with HEAD, objects and refs."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        head = os.lstat(os.path.join(path, "HEAD"))
+        return (stat.S_ISREG(head.st_mode)
+                and all(stat.S_ISDIR(os.lstat(os.path.join(path, name)).st_mode) for name in ("objects", "refs")))
+    except OSError:
+        return False
+
+
+def _gitdir_pointer(candidate, git):
+    """Read a `.git` file that must hold exactly one `gitdir: <path>` line naming a regular, user-owned file."""
+    try:
+        fd = os.open(git, os.O_RDONLY | _NOFOLLOW | _CLOEXEC)
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > 4096:
+                raise ShitError(CONFINEMENT)
+            text = os.read(fd, 4097).decode("utf-8")
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeDecodeError):
+        raise ShitError(CONFINEMENT) from None
+    if not text.endswith("\n") or text.count("\n") != 1 or not text.startswith("gitdir: "):
+        raise ShitError(CONFINEMENT)
+    target = text[len("gitdir: "):-1]
+    if not os.path.isabs(target):
+        target = os.path.join(candidate, target)
+    return os.path.normpath(target)
+
+
+def _repo_marker(candidate):
+    """Return False when `candidate` has no `.git` entry, True for a real repository, else ShitError(5).
+
+    A planted file, empty directory, symlink, foreign-owned entry or a gitdir pointer to a non-repository
+    fails closed instead of being walked past.
+    """
+    git = os.path.join(candidate, ".git")
+    try:
+        st = os.lstat(git)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise ShitError(CONFINEMENT) from None
+    if stat.S_ISLNK(st.st_mode) or st.st_uid != os.getuid():
+        raise ShitError(CONFINEMENT)
+    if stat.S_ISDIR(st.st_mode):
+        gitdir = git
+    elif stat.S_ISREG(st.st_mode):
+        gitdir = _gitdir_pointer(candidate, git)
+    else:
+        raise ShitError(CONFINEMENT)
+    if not _is_repo_dir(gitdir):
+        raise ShitError(CONFINEMENT)
+    return True
+
+
 def discover_root(start, ceiling=None):
-    """Return the nearest directory at or above `start` that holds a `.git` entry.
+    """Return the nearest directory at or above `start` that holds a real repository marker.
 
     The walk never goes above `ceiling` when one is given.
     """
     here = Path(os.path.realpath(start))
     top = Path(os.path.realpath(ceiling)) if ceiling is not None else None
     for candidate in (here, *here.parents):
-        if (candidate / ".git").exists():
+        if _repo_marker(str(candidate)):
             return candidate
         if candidate == top:
             break
@@ -88,7 +148,7 @@ class Project:
 
     @classmethod
     def init(cls, repo):
-        """Create `.shit/` with its subdirectories (mode 0700) and return the open project."""
+        """Create `.shit/` and its subdirectories, forcing mode 0700 on each (existing ones too)."""
         proj = cls._open_store(repo, create=True)
         try:
             os.fchmod(proj._fd, stat.S_IRWXU)  # == DIR_MODE (0o700)
@@ -99,7 +159,13 @@ class Project:
                     pass
                 except OSError as exc:
                     raise _os_error(exc) from None
-                proj._close(proj._walk((sub,)))
+                fd = proj._walk((sub,))
+                try:
+                    os.fchmod(fd, stat.S_IRWXU)
+                except OSError as exc:
+                    raise _os_error(exc) from None
+                finally:
+                    proj._close(fd)
         except BaseException:
             proj.close()
             raise

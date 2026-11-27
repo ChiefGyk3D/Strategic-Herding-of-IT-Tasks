@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from _bootstrap import make_git_dir
+
 from shit import project as project_mod
 from shit.errors import ShitError
 from shit.project import Project, discover_root
@@ -21,7 +23,7 @@ class Base(unittest.TestCase):
         base = Path(self._tmp.name).resolve()
         self.repo = base / "repo"
         self.repo.mkdir()
-        (self.repo / ".git").mkdir()
+        make_git_dir(self.repo / ".git")
         self.outside = base / "outside"
         self.outside.mkdir()
         self.secret = self.outside / "secret.txt"
@@ -50,6 +52,52 @@ class InitAndDiscovery(Base):
 
     def test_discover_without_repository_is_precondition_missing(self):
         self.assertEqual(self.code(discover_root, self.outside, ceiling=self.outside), 9)
+
+    def test_init_forces_0700_on_precreated_tasks_directory(self):
+        other = self.outside / "r3"
+        other.mkdir()
+        make_git_dir(other / ".git")
+        os.mkdir(other / ".shit", 0o700)
+        os.mkdir(other / ".shit" / "tasks", 0o777)
+        os.chmod(other / ".shit" / "tasks", 0o777)
+        proj = Project.init(other)
+        self.addCleanup(proj.close)
+        self.assertEqual(stat.S_IMODE((other / ".shit" / "tasks").stat().st_mode), 0o700)
+
+    def test_planted_git_file_is_not_a_repository(self):
+        other = self.outside / "planted"
+        other.mkdir()
+        (other / ".git").write_text("gitdir: /nowhere\n")
+        self.assertEqual(self.code(discover_root, other, ceiling=self.outside), 5)
+
+    def test_planted_empty_git_directory_is_not_a_repository(self):
+        other = self.outside / "empty"
+        other.mkdir()
+        (other / ".git").mkdir()
+        self.assertEqual(self.code(discover_root, other, ceiling=self.outside), 5)
+
+    def test_symlinked_git_entry_is_not_a_repository(self):
+        other = self.outside / "linked"
+        other.mkdir()
+        os.symlink(self.repo / ".git", other / ".git")
+        self.assertEqual(self.code(discover_root, other, ceiling=self.outside), 5)
+
+    def test_gitdir_pointer_to_real_repository_is_accepted(self):
+        other = self.outside / "worktree"
+        other.mkdir()
+        (other / ".git").write_text(f"gitdir: {self.repo / '.git'}\n")
+        self.assertEqual(discover_root(other, ceiling=self.outside), other)
+
+    def test_gitdir_pointer_to_non_repository_is_refused(self):
+        other = self.outside / "pointer"
+        other.mkdir()
+        (self.outside / "notrepo").mkdir()
+        (other / ".git").write_text(f"gitdir: {self.outside / 'notrepo'}\n")
+        self.assertEqual(self.code(discover_root, other, ceiling=self.outside), 5)
+
+    def test_foreign_owned_git_entry_is_refused(self):
+        with mock.patch.object(project_mod.os, "getuid", return_value=os.getuid() + 1):
+            self.assertEqual(self.code(discover_root, self.repo, ceiling=self.outside), 5)
 
     def test_open_missing_store_is_precondition_missing(self):
         other = self.outside / "r"

@@ -24,22 +24,65 @@ def chain_hash(previous_hex, line):
     return hashlib.sha256(previous_hex.encode("ascii") + b"\n" + line).hexdigest()
 
 
+def _check_lifecycle(events):
+    """Reject a log whose timestamps go backwards or whose transitions do not continue each task's history.
+
+    Every state_transition must start from the state the task is in (its previous to_state, or the
+    initial state "open" for the first event of a task). A replayed old transition therefore fails the
+    continuity check even when its id is new. Timestamps are fixed-width UTC strings, so they compare as text.
+    """
+    last_stamp, state = "", {}
+    for event in events:
+        stamp = event["timestamp"]
+        if stamp < last_stamp:
+            raise ShitError(REJECTED)
+        last_stamp = stamp
+        task_id = event["task_id"]
+        if event["event"] == "task_created":
+            if task_id in state:
+                raise ShitError(REJECTED)
+            state[task_id] = "open"
+        elif event["event"] == "state_transition":
+            if event["from_state"] != state.get(task_id, "open"):
+                raise ShitError(REJECTED)
+            state[task_id] = event["to_state"]
+
+
 class EventLog:
     def __init__(self, project):
         self.project = project
 
-    def _lines(self, rel):
+    def _split(self, rel):
+        """Return (complete_lines, torn_tail). A torn tail is bytes after the last newline, or None."""
         try:
             data = self.project.read(rel, limit=MAX_LOG_BYTES)
         except ShitError as exc:
             if exc.code != PRECONDITION:
                 raise
-            return []
-        if data == b"":
-            return []
-        if not data.endswith(b"\n"):
+            return [], None
+        cut = data.rfind(b"\n") + 1
+        torn = data[cut:] or None
+        return (data[:cut - 1].split(b"\n") if cut else []), torn
+
+    def _lines(self, rel):
+        lines, torn = self._split(rel)
+        if torn is not None:
             raise ShitError(REJECTED)
-        return data[:-1].split(b"\n")
+        return lines
+
+    def heal_torn_tail(self, rel, lines, torn, index, expected):
+        """Drop a torn final line left by an interrupted append of the pending transaction at `index`.
+
+        The torn bytes must be a proper prefix of the full append (`expected`, newline included) and the
+        file must hold exactly `index` complete lines. The file is then rewritten atomically with only
+        those lines, so the next append re-writes the whole entry. Anything else is refused.
+        """
+        if torn is None:
+            return lines
+        if len(lines) != index or not 0 < len(torn) < len(expected) or not expected.startswith(torn):
+            raise ShitError(REJECTED)
+        self.project.write_atomic(rel, b"".join(line + b"\n" for line in lines), limit=MAX_LOG_BYTES)
+        return lines
 
     def _raw(self):
         """Return (log_lines, chain_lines) with only line-shape checks."""
@@ -66,6 +109,7 @@ class EventLog:
             if recorded.decode("ascii", "replace") != previous:
                 raise ShitError(REJECTED)
             events.append(event)
+        _check_lifecycle(events)
         return events
 
     def prepare(self, event):
