@@ -199,7 +199,7 @@ Test infrastructure for the queue operations above. It lives in `tests/` and cha
 | `tests/store_model.py` | A pure model of the queue lifecycle and the generator of operation sequences |
 | `tests/test_store_harness.py` | The tests that use all of it, and the negative cases |
 
-**Run it.** `python3 -m unittest discover -s tests -p test_store_harness.py` (the default size takes about 30 seconds and is part of the full discover). Long mode, which is opt-in: `SHIT_HARNESS_LONG=1 python3 -m unittest discover -s tests -p test_store_harness.py`. Real databases in temporary directories; nothing about SQLite is mocked.
+**Run it.** `python3 -m unittest discover -s tests -p test_store_harness.py` (the default size takes about 30 seconds and is part of the full discover). Long mode, which is opt-in and takes about ten minutes: `SHIT_HARNESS_LONG=1 python3 -m unittest discover -s tests -p test_store_harness.py`. Real databases in temporary directories; nothing about SQLite is mocked.
 
 | Variable | Default (long) | Meaning |
 |---|---|---|
