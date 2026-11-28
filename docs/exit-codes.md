@@ -19,7 +19,7 @@ For privacy scan findings, output contains only the file path and line number. I
 | 4 | illegal_transition | `illegal lifecycle transition` | The requested lifecycle transition is not legal. |
 | 5 | confinement_violation | `confinement violation` | A path escapes its root or encounters a symlink, hard link, FIFO, socket, or device file. |
 | 6 | privacy_hit | `privacy scan hit` | A privacy rule matched; only the file path and line number may be reported. |
-| 7 | input_limit | `input exceeds limit` | A record exceeds the byte-size or nesting-depth limit. |
+| 7 | input_limit | `input exceeds limit` | A record exceeds the byte-size or nesting-depth limit, or a scan, listing or lock hold exceeds its bound ([bounded-work.md](bounded-work.md)). |
 | 8 | hook_failed_closed | `hook verification failed` | A hook could not verify its required state and failed closed. For the queue this includes an interrupted queue commit that cannot be proven or a broken event log; the operator procedure is in docs/queue-spec.md, Q-REC-02. For the SQLite store it also covers an unsupported SQLite or Python version, a corrupt or unreadable database, a wrong application id or schema version, a schema fingerprint mismatch and an append-only or no-delete trigger firing, an error at COMMIT whose outcome cannot be known, or a store file that exists but is not a complete store (docs/store.md). |
 | 9 | precondition_missing | `precondition missing` | A required record, file, directory, or prior state was not found. |
 | 10 | human_approval_required | `human approval required` | The operation requires an explicit human approval that is absent. |

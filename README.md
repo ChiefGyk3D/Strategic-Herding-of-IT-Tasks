@@ -16,6 +16,8 @@ The dependency graph, durable queue and per-task leases are implemented in `shit
 
 The SQLite store that will replace the file queue is being built in steps; its foundation (confined connection, schema, fingerprint, error mapping) is `shit/store.py`, described in [docs/store.md](docs/store.md).
 
+Bounded work (directory width, byte budget, scan and lock-hold deadlines) is described in [docs/bounded-work.md](docs/bounded-work.md).
+
 ## Review threads
 
 `shit threads` validates a strict dispositions file and prints the exact `gh api` request plan for listing, replying to and resolving the review threads of any pull request; it never starts a process. A small launcher, `scripts/threads_run.py`, sits outside the package and runs the plan with the GitHub CLI when you run it yourself. See [docs/threads.md](docs/threads.md).

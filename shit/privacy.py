@@ -12,13 +12,16 @@ and control characters, and runs of whitespace, so inserted zero-width character
 
 The scan walks the repository from a directory descriptor with O_NOFOLLOW. A symlink, hard link, FIFO,
 socket or device is exit 5; a file over the size limit, or a tree over the file-count or depth limit,
-is exit 7; any hit is exit 6.
+is exit 7, as is a directory wider than MAX_DIR_ENTRIES (never listed in full), a tree whose files total more than
+MAX_TOTAL_BYTES, or a scan that runs past MAX_SECONDS. A bound that trips skips the rest of that work, so the scan
+never reports a clean tree it did not read. Any hit is exit 6.
 """
 
 import os
 import re
 import stat
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -33,12 +36,15 @@ from .errors import (
     REJECTED,
     ShitError,
 )
-from .project import discover_root
+from .project import bounded_names, discover_root
 
 ENV_DENY = "SHIT_DENY_FILE"
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_FILES = 20000
 MAX_DEPTH = 32
+MAX_DIR_ENTRIES = 5000
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_SECONDS = 120.0
 MAX_DENY_BYTES = 64 * 1024
 MAX_DENY_ENTRIES = 1000
 MIN_ENTRY_CHARS = 3
@@ -236,6 +242,8 @@ class _Walk:
     def __init__(self, terms):
         self.terms = terms
         self.files = 0
+        self.total = 0
+        self.deadline = time.monotonic() + MAX_SECONDS
         self.findings = []  # (display path, line, label)
         self.codes = set()
 
@@ -247,16 +255,24 @@ class _Walk:
     def report(self, parts, line, label):
         self.findings.append(("/".join(parts), line, label))
 
+    def expired(self):
+        if time.monotonic() >= self.deadline:
+            self.codes.add(INPUT_LIMIT)
+            return True
+        return False
+
     def walk(self, dirfd, parts, depth):
-        if depth > MAX_DEPTH:
+        if depth > MAX_DEPTH or self.expired():
             self.codes.add(INPUT_LIMIT)
             return
         try:
-            names = sorted(os.listdir(dirfd))
-        except OSError:
-            self.codes.add(INTERNAL)
+            names = sorted(bounded_names(dirfd, MAX_DIR_ENTRIES))
+        except ShitError as exc:
+            self.codes.add(exc.code)
             return
         for name in names:
+            if self.expired():
+                return
             if depth == 0 and name == ".git":
                 continue
             shown = [*parts, self.part(name)]
@@ -302,6 +318,10 @@ class _Walk:
         elif name_is_credential(name) or name_embeds_secret(name):
             self.report(shown, 0, "filename")
         if st.st_size > MAX_FILE_BYTES:
+            self.codes.add(INPUT_LIMIT)
+            return
+        self.total += st.st_size
+        if self.total > MAX_TOTAL_BYTES:
             self.codes.add(INPUT_LIMIT)
             return
         try:
