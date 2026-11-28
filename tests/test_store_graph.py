@@ -142,7 +142,7 @@ class AddEdgeTests(Base):
             "empty": (("a", "", "draft"), errors.REJECTED),
             "too long": (("a", "x" * 65, "draft"), errors.REJECTED),
             "very long": (("a", "x" * 100000, "draft"), errors.REJECTED),
-            "bidi": (("a", "c‮", "draft"), errors.REJECTED),
+            "bidi": (("a", "c\u202e", "draft"), errors.REJECTED),
             "not text": ((5, "c", "draft"), errors.REJECTED),
             "bytes": ((b"a", "c", "draft"), errors.REJECTED),
         }
@@ -253,6 +253,16 @@ class CapTests(Base):
         store.add_edge(self.conn, source, others[-1], "draft")
         self.consistent()
 
+    def test_a_duplicate_is_reported_before_the_cap_like_the_file_graph(self):
+        names = self.seed_tasks(dep.MAX_NEEDS_PER_TASK + 2)
+        edges = [(names[0], other, "draft") for other in names[1:dep.MAX_NEEDS_PER_TASK + 1]]
+        store.add_edges(self.conn, edges)
+        graph = dep.add_edges(dep.empty_graph(), edges, set(names))
+        for args in ((names[0], names[1], "draft"), (names[0], names[-1], "draft")):
+            file_code = code_of(dep.add_edge, graph, *args, set(names))
+            self.assertEqual(code_of(store.add_edge, self.conn, *args), file_code)
+        self.assertEqual(code_of(store.add_edge, self.conn, names[0], names[1], "draft"), errors.REJECTED)
+
     def test_the_cap_is_checked_before_the_cycle_like_the_file_graph(self):
         names = self.seed_tasks(dep.MAX_NEEDS_PER_TASK + 2)
         source = names[0]
@@ -356,6 +366,17 @@ class RemoveEdgeTests(Base):
         store.remove_edge(self.conn, "b", "a", "draft")
         self.assertEqual(store.list_edges(self.conn), [])
 
+    def test_an_expired_but_unreclaimed_lease_still_guards_like_the_file_graph(self):
+        # queue.remove_edge refuses while the replayed task has a lease at all; it never reads the clock.
+        self.tasks("a", "b")
+        store.add_edge(self.conn, "b", "a", "draft")
+        self.clock = datetime(2020, 1, 1, tzinfo=UTC)  # the lease expired years ago by the wall clock
+        self.lease("b")
+        self.assertLess(self.conn.execute("SELECT expires_at FROM leases").fetchone()[0], "2021")
+        self.assertEqual(code_of(store.remove_edge, self.conn, "b", "a", "draft"), errors.ILLEGAL_TRANSITION)
+        self.assertEqual(len(store.list_edges(self.conn)), 1)
+        self.consistent()
+
     def test_removal_is_one_transaction_and_loses_the_lock_race_cleanly(self):
         self.tasks("a", "b")
         store.add_edge(self.conn, "b", "a", "draft")
@@ -419,10 +440,10 @@ class Differential(Base):
     `shit.queue.remove_edge` adds on top) must accept and reject the same operations with the same exit code,
     and leave the same edges and closures."""
 
-    NODES = ["a", "b", "c", "d", "e", "f", "g", "h"]
-    GHOSTS = ["ghost", "z9"]
-    HOSTILE = ["A", "a\x00b", "x" * 65, "", "a b", "../a", "a‮b", "a\n", 5, None, b"a", "x" * 5000, "a'--"]
-    KINDS = list(dep.TYPES) * 3 + ["bogus", "", None, "DRAFT", 3]
+    NODES = ("a", "b", "c", "d", "e", "f", "g", "h")
+    GHOSTS = ("ghost", "z9")
+    HOSTILE = ("A", "a\x00b", "x" * 65, "", "a b", "../a", "a\u202eb", "a\n", 5, None, b"a", "x" * 5000, "a'--")
+    KINDS = (*dep.TYPES, *dep.TYPES, *dep.TYPES, "bogus", "", None, "DRAFT", 3)
     LEASED = ("c", "f")
 
     def setUp(self):
@@ -448,14 +469,14 @@ class Differential(Base):
 
     def run_one(self, graph, op, args):
         if op == "add":
-            file_call = lambda: dep.add_edge(graph, *args, self.known)  # noqa: E731
-            store_call = lambda: store.add_edge(self.conn, *args)  # noqa: E731
+            file_call = lambda: dep.add_edge(graph, *args, self.known)
+            store_call = lambda: store.add_edge(self.conn, *args)
         elif op == "batch":
-            file_call = lambda: dep.add_edges(graph, args, self.known)  # noqa: E731
-            store_call = lambda: store.add_edges(self.conn, args)  # noqa: E731
+            file_call = lambda: dep.add_edges(graph, args, self.known)
+            store_call = lambda: store.add_edges(self.conn, args)
         else:
-            file_call = lambda: self.file_remove(graph, *args)  # noqa: E731
-            store_call = lambda: store.remove_edge(self.conn, *args)  # noqa: E731
+            file_call = lambda: self.file_remove(graph, *args)
+            store_call = lambda: store.remove_edge(self.conn, *args)
         try:
             new_graph, file_code = file_call(), None
         except ShitError as exc:
