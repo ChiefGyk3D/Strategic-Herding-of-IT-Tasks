@@ -140,6 +140,14 @@ def check_targets(threads, comment_ids):
             raise ShitError(PRECONDITION)
 
 
+def check_unique(found):
+    """A read that names one comment id or one thread id twice is ambiguous: refused before any write (exit 8)."""
+    comments = [t["comment_id"] for t in found]
+    ids = [t["thread_id"] for t in found]
+    if len(set(comments)) != len(comments) or len(set(ids)) != len(ids):
+        raise closed()
+
+
 def format_list(threads, repo, number):
     if not threads:
         return [f"no unresolved threads on {repo}#{number}"]
@@ -148,7 +156,7 @@ def format_list(threads, repo, number):
         by_file.setdefault(t["path"], []).append(t)
     lines = []
     for path in sorted(by_file):
-        lines.append(flat(path, 300))
+        lines.append("file: " + flat(path, 300))  # a fixed prefix: a path can never start a `::` workflow command
         for t in by_file[path]:
             lines.append(f"  {t['comment_id']} {flat(t['path'], 100)}:{flat(t['line'], 10)} "
                          f"{flat(t['author'], 60)}: {flat(t['body'], SHOW)}")

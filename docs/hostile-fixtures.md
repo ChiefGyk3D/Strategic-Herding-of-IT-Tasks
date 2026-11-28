@@ -49,6 +49,8 @@ Rows marked `none` have no risk-register row. They are gaps in `docs/threat-mode
 | H-29c | a command that quietly opens a socket and swallows the error fails the flow | none | n/a | `NetworkDenial.test_a_hidden_connection_is_caught_by_the_flow` |
 | H-29d | no module of the package imports a network or process module | none | n/a | `NetworkDenial.test_no_module_imports_network_or_process_code` |
 | H-29e | the import scan reports a banned import in every spelling | none | n/a | `NetworkDenial.test_import_scan_bites` |
+| H-29f | every file under `shit/` is Python and none launches a process (os calls, aliases, dynamic imports, eval); only named scripts outside it may | none | n/a | `NetworkDenial.test_nothing_under_the_package_can_launch_a_process` |
+| H-29g | the process-launch scan reports every spelling and accepts ordinary `os` use | none | n/a | `NetworkDenial.test_process_launch_scan_bites` |
 
 ## Not testable on this branch
 

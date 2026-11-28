@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -27,7 +28,7 @@ SECRET = "stderr-secret-text"
 ENV_SENTINEL = "SHIT_TEST_UNLISTED_VARIABLE"
 
 FAKE_GH = '''#!{python}
-import json, os, sys
+import json, os, sys, time
 here = os.path.dirname(os.path.abspath(__file__))
 cfg = json.load(open(os.path.join(here, "cfg.json")))
 state_path = os.path.join(here, "state.json")
@@ -47,6 +48,17 @@ state[kind] += 1
 json.dump(state, open(state_path, "w"))
 answers = cfg[kind]
 answer = answers[min(index, len(answers) - 1)]
+mode = answer.get("flood")
+if mode:
+    stream = sys.stdout if mode == "out" else sys.stderr
+    try:
+        while True:
+            stream.write("x" * 65536)
+            stream.flush()
+    except BrokenPipeError:
+        sys.exit(0)
+if answer.get("sleep"):
+    time.sleep(answer["sleep"])
 sys.stderr.write(cfg.get("stderr", ""))
 sys.stdout.write(answer["out"] if isinstance(answer["out"], str) else json.dumps(answer["out"]))
 sys.exit(answer.get("rc", 0))
@@ -117,9 +129,9 @@ class Case(unittest.TestCase):
         (self.work / name).write_text(threads.render_plan(plan), encoding="utf-8")
         return name
 
-    def run_plan(self, name, **kw):
+    def run_plan(self, name, *opts, **kw):
         environ = kw.pop("environ", None) or self.environ()
-        return run_main(lambda a: launcher.main(a, environ=environ, cwd=self.work, **kw), [name])
+        return run_main(lambda a: launcher.main(a, environ=environ, cwd=self.work, **kw), [*opts, name])
 
 
 class ListTests(Case):
@@ -378,19 +390,23 @@ class RefusalTests(Case):
         code, _, _ = self.run_plan(name, environ={"PATH": str(self.dir / "empty")})
         self.assertEqual(code, 11)
 
-    def test_a_command_that_cannot_start_or_times_out_is_tool_unavailable(self):
+    def test_a_command_that_cannot_start_is_tool_unavailable(self):
         self.fake()
-        name = self.plan_file(kind="list")
 
         def cannot_start(argv, **kw):
             raise FileNotFoundError("gh")
 
-        def slow(argv, **kw):
-            raise subprocess.TimeoutExpired(argv, 1)
+        self.assertEqual(self.run_plan(self.plan_file(kind="list"), popen=cannot_start)[0], 11)
 
-        for runner in (cannot_start, slow):
-            code, _, _ = self.run_plan(name, runner=runner)
-            self.assertEqual(code, 11)
+    def test_a_call_past_the_deadline_is_killed_and_is_tool_unavailable(self):
+        from unittest import mock
+
+        self.fake(read=[{"out": {}, "sleep": 30}])
+        with mock.patch.object(launcher, "CALL_TIMEOUT", 1):
+            started = time.monotonic()
+            code, out, _ = self.run_plan(self.plan_file(kind="list"))
+        self.assertEqual((code, out), (11, ""))
+        self.assertLess(time.monotonic() - started, 20)
 
 
 class CallRuleTests(Case):
@@ -399,17 +415,17 @@ class CallRuleTests(Case):
 
         def spy(argv, **kw):
             seen.append((argv, kw))
-            return subprocess.run(argv, check=False, **{k: v for k, v in kw.items() if k != "check"})
+            return subprocess.Popen(argv, **kw)
 
         self.fake()
-        self.run_plan(self.plan_file(kind="list"), runner=spy)
+        self.run_plan(self.plan_file(kind="list"), popen=spy)
         argv, kw = seen[0]
         self.assertIsInstance(argv, list)
         self.assertFalse(kw.get("shell", False))
         self.assertIs(kw["stdin"], subprocess.DEVNULL)
-        self.assertEqual(kw["timeout"], 60)
-        self.assertIs(kw["check"], False)
-        self.assertTrue(kw["capture_output"])
+        self.assertIs(kw["stdout"], subprocess.PIPE)
+        self.assertIs(kw["stderr"], subprocess.PIPE)
+        self.assertEqual(launcher.CALL_TIMEOUT, 60)
 
     def test_the_child_gets_only_the_allowed_environment(self):
         self.fake()
@@ -432,6 +448,8 @@ class CallRuleTests(Case):
 
     def test_the_allow_list_has_no_unneeded_credential_names(self):
         self.assertFalse(any(name.endswith(("_SECRET", "_PASSWORD")) for name in launcher.ENV_ALLOW))
+        for name in launcher.RISKY + launcher.DROPPED_UNLESS_OPTED + ("GH_HOST",):
+            self.assertNotIn(name, launcher.ENV_ALLOW, name)
 
     def test_the_token_never_reaches_the_output(self):
         self.fake(stderr="fake-credential-value")
@@ -452,6 +470,153 @@ class CallRuleTests(Case):
                               capture_output=True, text=True, check=False, timeout=60)
         self.assertEqual(done.returncode, 2)
         self.assertNotIn(os.fspath(self.work), done.stderr)
+
+
+class HardeningTests(Case):
+    def refused(self, *opts, **env):
+        self.fake()
+        return self.run_plan(self.plan_file(kind="list"), *opts, environ=self.environ(**env))
+
+    def test_each_risky_variable_is_refused_by_name_with_no_call(self):
+        for name in launcher.RISKY:
+            with self.subTest(name=name):
+                self.setUp()
+                code, out, err = self.refused(**{name: "value-that-must-not-print"})
+                self.assertEqual(code, 3)
+                self.assertIn(name, out)
+                self.assertNotIn("value-that-must-not-print", out + err)
+                self.assertEqual(self.calls(), [])
+
+    def test_opt_in_passes_exactly_that_name(self):
+        for name in launcher.RISKY:
+            with self.subTest(name=name):
+                self.setUp()
+                other = next(n for n in launcher.RISKY if n != name)
+                self.fake()
+                code, _, _ = self.run_plan(self.plan_file(kind="list"), "--allow-env", name,
+                                           environ=self.environ(**{name: "v"}))
+                self.assertEqual(code, 0)
+                names = set(self.calls()[0]["env"])
+                self.assertIn(name, names)
+                self.assertEqual(names & (set(launcher.RISKY) - {name}), set(), other)
+
+    def test_opting_in_one_name_does_not_cover_another(self):
+        code, out, _ = self.refused("--allow-env", "HTTPS_PROXY", HTTPS_PROXY="a", SSL_CERT_FILE="b")
+        self.assertEqual(code, 3)
+        self.assertIn("SSL_CERT_FILE", out)
+        self.assertNotIn("HTTPS_PROXY", out)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_token_name_or_anything_else_can_never_be_opted_in(self):
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "LD_PRELOAD",
+                     "PYTHONPATH", "HOME", "GH_HOST", "", "a b", "HTTPS_PROXY=x", "https_proxy;x"):
+            with self.subTest(name=name):
+                self.setUp()
+                code, out, err = self.refused("--allow-env", name)
+                self.assertEqual((code, out), (2, ""))
+                self.assertEqual(self.calls(), [])
+                self.assertNotIn(name, err) if name else None
+
+    def test_config_directory_variables_are_dropped_unless_opted_in(self):
+        env = {name: "/somewhere" for name in launcher.DROPPED_UNLESS_OPTED}
+        self.fake()
+        self.assertEqual(self.run_plan(self.plan_file(kind="list"), environ=self.environ(**env))[0], 0)
+        self.assertEqual(set(self.calls()[0]["env"]) & set(env), set())
+        self.setUp()
+        self.fake()
+        self.run_plan(self.plan_file(kind="list"), "--allow-env", "GH_CONFIG_DIR", environ=self.environ(**env))
+        self.assertEqual(set(self.calls()[0]["env"]) & set(env), {"GH_CONFIG_DIR"})
+
+    def test_home_is_the_only_location_variable_passed_by_default(self):
+        self.assertIn("HOME", launcher.ENV_ALLOW)
+        self.assertEqual(set(launcher.child_env({"HOME": "/h", "XDG_CONFIG_HOME": "/x", "GH_CONFIG_DIR": "/y"}))
+                         & {"HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"}, {"HOME"})
+
+
+class BoundedReadTests(Case):
+    def test_a_flood_on_stdout_or_stderr_is_cut_off_with_the_limit_code(self):
+        for stream in ("out", "err"):
+            with self.subTest(stream=stream):
+                self.setUp()
+                self.fake(read=[{"out": {}, "flood": stream}])
+                started = time.monotonic()
+                code, out, _ = self.run_plan(self.plan_file(kind="list"))
+                self.assertEqual((code, out), (7, ""))
+                self.assertLess(time.monotonic() - started, 30)
+
+    def test_a_flooding_reply_is_cut_off_too_and_reports_the_count(self):
+        self.fake(reply=[{"out": {}, "flood": "err"}])
+        code, out, _ = self.run_plan(self.plan_file([{"comment_id": 101, "action": "reply", "body": "x"}]))
+        self.assertEqual(code, 7)
+        self.assertIn("0 of 1 done", out)
+
+    def test_an_answer_just_under_the_limit_is_read_whole(self):
+        pad = "y" * (threads.ANSWER_LIMIT // 2)
+        self.fake(read=[{"out": page([node("T1", 101, body=pad)])}])
+        code, out, _ = self.run_plan(self.plan_file(kind="list"))
+        self.assertEqual(code, 0)
+        self.assertIn("1 unresolved thread(s)", out)
+
+
+class AmbiguityTests(Case):
+    def test_duplicate_comment_ids_are_refused_before_any_write(self):
+        self.fake(read=[{"out": page([node("T_A", 7), node("T_B", 7)])}])
+        code, out, _ = self.run_plan(self.plan_file([{"comment_id": 7, "action": "reply_resolve", "body": "x"}]))
+        self.assertEqual((code, out), (8, ""))
+        self.assertEqual(self.writes(), [])
+
+    def test_duplicate_thread_ids_and_duplicates_across_pages_are_refused(self):
+        for read in ([{"out": page([node("T", 1), node("T", 2)])}],
+                     [{"out": page([node("A", 7)], more=True, cursor="n")}, {"out": page([node("B", 7)])}]):
+            with self.subTest(read=str(read)[:30]):
+                self.setUp()
+                self.fake(read=read)
+                code, _, _ = self.run_plan(self.plan_file(kind="list"))
+                self.assertEqual(code, 8)
+
+
+class OutputTests(Case):
+    def test_no_printed_line_can_be_a_workflow_command(self):
+        hostile = node("T1", 101, path="::add-mask::SECRET", body="::error::x\n::warning::y")
+        hostile["comments"]["nodes"][0]["author"]["login"] = "::set-output::z"
+        self.fake(read=[{"out": page([hostile])}])
+        code, out, _ = self.run_plan(self.plan_file(kind="list"))
+        self.assertEqual(code, 0)
+        for line in out.splitlines():
+            self.assertFalse(line.lstrip().startswith("::"), line)
+        self.assertIn("file: ::add-mask::SECRET", out)
+
+
+class GhPathTests(Case):
+    def gh(self):
+        return str(self.bin / "gh")
+
+    def test_explicit_gh_is_used_and_path_is_not_searched(self):
+        self.fake()
+        code, _, _ = self.run_plan(self.plan_file(kind="list"), "--gh", self.gh(),
+                                   environ={"PATH": str(self.dir / "empty"), "HOME": str(self.dir)})
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_bad_explicit_gh_is_refused_with_no_call(self):
+        self.fake()
+        real = self.bin / "gh"
+        (self.dir / "ln").symlink_to(real)
+        groupw = self.dir / "gw"
+        groupw.write_text("x")
+        groupw.chmod(0o775)
+        otherw = self.dir / "ow"
+        otherw.write_text("x")
+        otherw.chmod(0o757)
+        noexec = self.dir / "nx"
+        noexec.write_text("x")
+        noexec.chmod(0o644)
+        cases = (("gh", 2), ("./gh", 2), (str(self.bin / ".." / "bin" / "gh"), 2), (str(self.dir / "missing"), 9),
+                 (str(self.dir / "ln"), 5), (str(groupw), 5), (str(otherw), 5), (str(noexec), 5), (str(self.bin), 5))
+        for arg, want in cases:
+            with self.subTest(arg=arg):
+                self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", arg)[0], want)
+        self.assertEqual(self.calls(), [])
 
 
 class PlacementTests(unittest.TestCase):

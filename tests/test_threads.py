@@ -248,14 +248,28 @@ class PageTests(unittest.TestCase):
         body = "line one\nline two\x1b[31m red " + chr(0x202E) + chr(0x200B) + "x" * 400
         found = threads.parse_page(page([node("T1", 1, "b.py", 7, body), node("T2", 2, "a.py", 3, "first")]))[0]
         lines = threads.format_list(found, REPO, 9)
-        self.assertEqual(lines[0], "a.py")
-        self.assertEqual(lines[2], "b.py")
+        self.assertEqual(lines[0], "file: a.py")
+        self.assertEqual(lines[2], "file: b.py")
         self.assertEqual(lines[-1], f"2 unresolved thread(s) on {REPO}#9")
         text = "\n".join(lines)
         for bad in ("\x1b", chr(0x202E), chr(0x200B)):
             self.assertNotIn(bad, text)
         self.assertEqual(len(lines), 5)
         self.assertLessEqual(len(lines[3]), 400)
+
+    def test_a_hostile_path_cannot_start_a_workflow_command(self):
+        found = threads.parse_page(page([node("T1", 1, "::add-mask::SECRET", 7, "x")]))[0]
+        lines = threads.format_list(found, REPO, 9)
+        self.assertEqual(lines[0], "file: ::add-mask::SECRET")
+        self.assertFalse(any(line.startswith("::") for line in lines))
+
+    def test_check_unique(self):
+        a, b = threads.parse_page(page([node("A", 7), node("B", 8)]))[0]
+        threads.check_unique([a, b])
+        for pair in ([a, {**b, "comment_id": 7}], [a, {**b, "thread_id": "A"}]):
+            with self.assertRaises(Exception) as ctx:
+                threads.check_unique(pair)
+            self.assertEqual(ctx.exception.code, 8)
 
     def test_empty_list_line(self):
         self.assertEqual(threads.format_list([], REPO, 9), [f"no unresolved threads on {REPO}#9"])

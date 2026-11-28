@@ -722,6 +722,49 @@ class NetworkDenial(unittest.TestCase):
             self.assertTrue(imported_roots(src) & {"socket", "urllib", "subprocess"}, src)
 
 
+    def test_nothing_under_the_package_can_launch_a_process(self):
+        """H-29f every file under shit/ at any depth is Python and none launches a process, in any spelling."""
+        package = ROOT / "shit"
+        others = sorted(
+            p.relative_to(package).as_posix()
+            for p in package.rglob("*")
+            if p.is_file() and p.suffix != ".py" and "__pycache__" not in p.parts
+        )
+        self.assertEqual(others, [], "a file that is not Python under shit/ is never scanned")
+        files = sorted(package.rglob("*.py"))
+        self.assertGreaterEqual(len(files), 10)
+        for path in files:
+            self.assertEqual(process_launch_uses(path.read_text()), set(), path.relative_to(ROOT).as_posix())
+        # Outside the package the only program that may launch a process is named here, exactly. A new script
+        # that launches one fails this test until a person adds it with a reason.
+        launchers = {"refresh.py": "regenerates the starter set", "threads_run.py": "runs a review-thread plan with gh"}
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            if process_launch_uses(path.read_text()):
+                self.assertIn(path.name, launchers, path.name)
+
+    def test_process_launch_scan_bites(self):
+        """H-29g the process-launch scan reports every spelling: os calls, aliases, dynamic imports, eval."""
+        bad = (
+            "import os\nos.system('true')", "import os\nos.popen('true')", "import os\nos.execv('/bin/true', [])",
+            "import os\nos.execvp('true', [])", "import os\nos.spawnl(0, '/bin/true')", "import os\nos.fork()",
+            "import os\nos.posix_spawn('/bin/true', [], {})", "import os as o\no.system('true')",
+            "import os as o\nf = o.popen", "from os import system", "from os import system as s",
+            "from os import path, execv", "import posix\nposix.system('true')", "import posix\nposix.fork()",
+            "from posix import fork", "import pty", "import importlib", "from importlib import import_module",
+            "__import__('sub' + 'process')", "eval('1')", "exec('1')", "import runpy", "import _posixsubprocess",
+            "import subprocess", "from subprocess import run", "import multiprocessing", "import ctypes",
+            "import os\ngetattr(os, 'sys' + 'tem')('true')", "import os\nx = os\nx.system('true')",
+        )
+        for src in bad:
+            with self.subTest(src=src):
+                self.assertTrue(process_launch_uses(src), src)
+        good = ("import os\nos.path.join('a')", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
+                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import re\nre.compile('x')", "import hashlib")
+        for src in good:
+            with self.subTest(src=src):
+                self.assertEqual(process_launch_uses(src), set(), src)
+
+
 def imported_roots(source):
     found = set()
     for node in ast.walk(ast.parse(source)):
@@ -729,6 +772,58 @@ def imported_roots(source):
             found |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module:
             found.add(node.module.split(".")[0])
+    return found
+
+
+LAUNCH_MODULES = {"subprocess", "_posixsubprocess", "multiprocessing", "pty", "importlib", "runpy", "ctypes", "_ctypes",
+                  "pdb", "code", "idlelib"}
+OS_MODULES = {"os", "posix", "nt"}
+LAUNCH_OS_ATTRS = ("system", "popen", "fork", "forkpty", "startfile", "posix_spawn", "posix_spawnp", "plock")
+LAUNCH_OS_PREFIXES = ("exec", "spawn")
+DYNAMIC_NAMES = {"__import__", "eval", "exec"}
+
+
+def _launches(attr):
+    return attr in LAUNCH_OS_ATTRS or attr.startswith(LAUNCH_OS_PREFIXES)
+
+
+def process_launch_uses(source):
+    """Spellings in `source` that can start a process or import code dynamically (empty set when none).
+
+    Covers imports of process modules (any depth, aliased or not), `os`/`posix` calls and references such as
+    system, popen, exec* and spawn* (also through `import os as o` and `from os import system`), `__import__`,
+    `eval` and `exec`, and `getattr` on a module name with a computed attribute.
+    """
+    found = set()
+    aliases = set(OS_MODULES)
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in LAUNCH_MODULES:
+                    found.add(f"import {a.name}")
+                if a.name.split(".")[0] in OS_MODULES and a.asname:
+                    aliases.add(a.asname)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            aliases |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            if root in LAUNCH_MODULES:
+                found.add(f"from {node.module}")
+            if root in OS_MODULES:
+                found |= {f"from {node.module} import {a.name}" for a in node.names if _launches(a.name)}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases
+                and _launches(node.attr)):
+            found.add(f"{node.value.id}.{node.attr}")
+        elif isinstance(node, ast.Name) and node.id in DYNAMIC_NAMES:
+            found.add(node.id)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            target = node.args[0] if node.args else None
+            name = node.args[1] if len(node.args) > 1 else None
+            literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
+            if isinstance(target, ast.Name) and target.id in aliases and not (literal and not _launches(name.value)):
+                found.add("getattr on a process-capable module")
     return found
 
 

@@ -1,6 +1,6 @@
 # Review threads
 
-`shit threads` and `scripts/threads_run.py` list the open review threads of a pull request and answer them from a file: a reply by REST, a resolve by one GraphQL mutation per thread. They work on any repository and pull request; both are arguments. All traffic goes through the GitHub CLI (`gh`), which holds the credential: nothing here reads, passes on or prints a token, and the output of `gh` is never shown.
+`shit threads` and `scripts/threads_run.py` list the open review threads of a pull request and answer them from a file: a reply by REST, a resolve by one GraphQL mutation per thread. They work on any repository and pull request; both are arguments. All traffic goes through the GitHub CLI (`gh`). The `shit` package and the plan contain no token and never read one. The launcher does read your token variables: it passes the pair that matches the trusted host to `gh` (and nothing else of your environment, see below), and never prints or logs their values or the output of `gh`.
 
 This is the configurable port of the SAFO tool `safo-threads` (SAFO issue 587, SAFO commit `b499b33`; SHIT issue 55). Nothing in it is specific to one maintainer.
 
@@ -16,7 +16,7 @@ The launcher is outside the `shit` package because SHIT forbids any module of th
 ```
 shit threads [--config PATH] list  OWNER/NAME PR                      > plan.json
 shit threads [--config PATH] apply OWNER/NAME PR DISPOSITIONS.json    > plan.json
-python3 scripts/threads_run.py [--config PATH] plan.json
+python3 scripts/threads_run.py [--config PATH] [--gh PATH] [--allow-env NAME ...] plan.json
 ```
 
 Run the launcher from the directory that holds `plan.json`; the plan file, the dispositions file and the configuration file must be regular files below the working directory (a path outside it, a symlink, a FIFO and a hard-linked file are refused).
@@ -29,7 +29,7 @@ One JSON object: `schema`, `schema_version`, `kind` (`list` or `apply`), `host`,
 
 ### list
 
-The launcher reads the unresolved, current threads (50 a page, at most 20 pages; more is refused, not cut) and prints them grouped by file, one line each: the first comment's id, `file:line`, the author and the first 200 characters of the body. Resolved and outdated threads are dropped. Whitespace becomes one space and every control, bidi, zero-width or separator character is written as a `\u` escape, so a comment cannot start a workflow command or move the cursor.
+The launcher reads the unresolved, current threads (50 a page, at most 20 pages; more is refused, not cut) and prints them grouped by file (each group starts with a `file: ` line, so a hostile path can never begin a line with `::`), one line each: the first comment's id, `file:line`, the author and the first 200 characters of the body. Resolved and outdated threads are dropped. Whitespace becomes one space and every control, bidi, zero-width or separator character is written as a `\u` escape, and every printed line either starts with `file: ` or with two spaces, so a comment cannot start a CI workflow command (`::name::`) or move the cursor.
 
 ### apply
 
@@ -57,7 +57,13 @@ The dispositions file is a JSON list; each row is exactly `comment_id` (the id `
 
 **Host and credential.** A plan file is data anyone may have edited, and the credential goes to whatever host a call names, so the plan never chooses the host. The launcher takes the trusted host only from an explicit `--config PATH` (its `[tracker] host`), otherwise `github.com`. It never reads a configuration file by default, so a file left in the working directory cannot choose the host that receives your token. **A GitHub Enterprise or other self-hosted host needs `--config`**; without it only `github.com` is used. A plan whose `host` is null uses the trusted host; a plan naming a different host is refused before any call with exit code 3 (the message names no host). A `--config` file that is unreadable is refused too (3, 5 or 9). Every call carries `--hostname HOST` for the trusted host.
 
-**Call rules.** No shell (an argument list), stdin closed, a 60 second timeout per call, standard output and standard error captured and never shown. The environment is an explicit allowlist (`ENV_ALLOW` in the script): `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`, `USER`, `TMPDIR`, `GH_CONFIG_DIR`, the `XDG_*` directories, and the proxy and certificate variables `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and lowercase forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`. It adds `GH_PROMPT_DISABLED=1` and `NO_COLOR=1`. Only the token variables that apply to the trusted host are passed, never both pairs: `GH_TOKEN` and `GITHUB_TOKEN` for `github.com`; `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` for any other host. `GH_HOST` is not passed. Every other variable is dropped, and a value with a control character is dropped. The tokens are the user's own credential, passed untouched so `gh` can authenticate; the launcher never reads, prints or logs their values. If you sign in with `gh auth login`, no token variable is needed.
+**Call rules.** No shell (an argument list), stdin closed, a 60 second deadline per call. Output is read in bounded pieces: at most 4 MiB of standard output and of standard error; past that the child is killed and the run stops with exit code 7. Output of `gh` is checked and never shown. A read that returns two threads with the same comment id or the same thread id is refused (exit 8) before any write, because a reply and its resolve could land on different threads.
+
+**Environment.** `gh` receives only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`, `USER`, `TMPDIR` (`HOME` is how `gh` finds its own sign-in and settings), `GH_PROMPT_DISABLED=1`, `NO_COLOR=1`, and the token pair for the trusted host: `GH_TOKEN` and `GITHUB_TOKEN` for `github.com`; `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` for any other host, never both pairs. `GH_HOST` is not passed. Every other variable is dropped, and a value with a control character is dropped. If you sign in with `gh auth login`, no token variable is needed.
+
+**Proxy and certificate variables are refused.** A proxy variable together with a certificate authority variable can send your token through a server of someone else's choosing. So the launcher refuses to start (exit 3, naming only the variable) if `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` (or their lowercase forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `GIT_SSL_CAPATH` or `NODE_EXTRA_CA_CERTS` is set in its own environment. If you are behind a proxy you trust, opt in per name: `--allow-env HTTPS_PROXY` (repeatable). Only names on that fixed list are accepted, each passes exactly that one variable, and a token name or any other name is a usage error (exit 2). Opting in widens the credential trust boundary to that proxy or authority. `GH_CONFIG_DIR` and the `XDG_*` directories (where `gh` keeps settings that can name a socket or host) are dropped unless opted in the same way.
+
+**Which `gh` runs (residual risk).** By default the launcher runs the first `gh` found on `PATH`, and gives it your token. Anyone who can put a file earlier on your `PATH`, or replace the selected program, receives the token; the launcher cannot tell a genuine `gh` from a replaced one. To narrow this, pass `--gh /absolute/path/to/gh`: the path must be absolute, without `..`, a regular file (not a symlink or directory), executable, and not writable by group or others (otherwise exit 5; missing, exit 9; relative, exit 2). That limits who can swap the file; it does not make the program trustworthy.
 
 ## Exit codes
 
@@ -67,11 +73,11 @@ The codes are the shared table in [exit-codes.md](exit-codes.md); no new code is
 |---:|---|
 | 0 | Done. |
 | 2 | Arguments are invalid: bad repository name or number, or an unknown option. |
-| 3 | The dispositions file, the configuration or the plan was rejected, including a plan naming a host other than the configured one. |
-| 5 | A dispositions, configuration or plan path violated confinement. |
-| 7 | An input or an answer from `gh` exceeded a size or depth limit. |
-| 8 | GitHub did not answer as required. Before any write this is a failed read (nothing was written). After the first write the printed lines show what was done and where it stopped. |
+| 3 | The dispositions file, the configuration or the plan was rejected, including a plan naming a host other than the configured one, or a proxy or certificate variable set without `--allow-env`. |
+| 5 | A dispositions, configuration, plan or `--gh` path violated confinement. |
+| 7 | An input or the output of `gh` exceeded a size or depth limit (the child is killed). |
+| 8 | GitHub did not answer as required, or the read named a comment or thread id twice. Before any write this is a failed read (nothing was written). After the first write the printed lines show what was done and where it stopped. |
 | 9 | A file or the configuration was not found, or a replied or resolved `comment_id` is not an unresolved thread. Nothing was written. |
 | 11 | `gh` is missing, cannot start, or a call timed out (60 seconds each). |
 
-Tests: `tests/test_threads.py` (plan builder, validation, helpers) and `tests/test_threads_run.py` (the launcher, against a fake `gh` executable on a temporary `PATH`). No test touches the network or a real credential.
+Tests: `tests/test_threads.py` (plan builder, validation, helpers) and `tests/test_threads_run.py` (the launcher, against a fake `gh` executable on a temporary `PATH`). `tests/test_hostile.py` H-29d, H-29f and H-29g keep every file under `shit/` free of process launching, in any spelling, and name the only scripts outside it that may launch one. No test touches the network or a real credential.
