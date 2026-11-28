@@ -14,28 +14,10 @@ import time
 import unittest
 
 from _bootstrap import ROOT
-from test_store_queue import Base, at, code_of
+from test_store_queue import Base, Recorder, at, code_of
 
 from shit import errors, store
 from shit.errors import ShitError
-
-
-class Recorder:
-    """A real connection that remembers every statement it ran."""
-
-    def __init__(self, real):
-        self.real, self.sql = real, []
-
-    @property
-    def in_transaction(self):
-        return self.real.in_transaction
-
-    def execute(self, sql, *args):
-        self.sql.append(sql)
-        return self.real.execute(sql, *args)
-
-    def close(self):
-        self.real.close()
 
 
 class Faulty:

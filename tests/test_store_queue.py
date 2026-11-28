@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from _bootstrap import make_git_dir
 
@@ -39,6 +40,21 @@ def task_dict(task_id, now):
 
 def reached_all(edge):
     return True
+
+
+class Recorder:
+    """A real connection that remembers every statement it ran."""
+
+    def __init__(self, real):
+        self.real, self.sql = real, []
+
+    @property
+    def in_transaction(self):
+        return self.real.in_transaction
+
+    def execute(self, sql, *args):
+        self.sql.append(sql)
+        return self.real.execute(sql, *args)
 
 
 class Base(unittest.TestCase):
@@ -552,6 +568,14 @@ class GraphEntryTests(Base):
         self.assertEqual((self.count("edges"), self.count("queue_entries")), before)
         self.consistent()
 
+    def test_the_clock_is_checked_before_the_shape_of_an_edge_to_remove(self):
+        # `queue.remove_edge` checks the clock and applies maintenance first (found by the differential test).
+        self.task("a", enqueue=False)
+        self.task("b", enqueue=False)
+        self.assertEqual(code_of(store.queue_remove_edge, self.conn, "a", "b", "bogus", "human", at(0)), errors.FAILED_CLOSED)
+        self.assertEqual(code_of(store.queue_remove_edge, self.conn, "a", "b", "bogus", "human", self.tick()), errors.REJECTED)
+        self.consistent()
+
     def test_an_edge_cannot_be_removed_from_a_task_with_a_live_lease(self):
         self.task("a", enqueue=False)
         self.task("b")
@@ -563,8 +587,38 @@ class GraphEntryTests(Base):
         self.consistent()
 
 
+class PopulationTests(Base):
+    def test_queued_tasks_and_shard_owners_together_stay_within_the_cap(self):
+        with mock.patch.object(dependencies, "MAX_TASKS", 3):
+            for name in ("a", "b", "c", "d"):
+                self.task(name, enqueue=False)
+            store.queue_enqueue(self.conn, "a", "human", self.tick())
+            store.queue_add_edges(self.conn, [("b", "a", "draft")], "human", self.tick())  # owners: b; queued: a
+            store.queue_enqueue(self.conn, "c", "human", self.tick())  # a, b, c
+            before = self.count("queue_entries")
+            self.assertEqual(code_of(store.queue_enqueue, self.conn, "d", "human", self.tick()), errors.INPUT_LIMIT)
+            self.assertEqual(code_of(store.queue_add_edges, self.conn, [("d", "a", "draft")], "human", self.tick()),
+                             errors.INPUT_LIMIT)
+            self.assertEqual(self.count("queue_entries"), before)
+            self.assertEqual(self.count("edges"), 1)
+            self.consistent()
+
+
 class QueueLiveStateTests(Base):
     """A queued task changes lifecycle state only through its queue operation (docs/store.md, C4)."""
+
+    def test_the_queue_state_is_read_inside_the_transaction_that_writes_the_task(self):
+        self.task("a")
+        lease = self.claim("a")
+        recorder = Recorder(self.conn)
+        self.assertEqual(code_of(store.transition_task, recorder, "a", "failed", "wrapper", "x", self.tick()),
+                         errors.ILLEGAL_TRANSITION)
+        self.assertEqual(recorder.sql[0], "BEGIN IMMEDIATE")
+        self.assertTrue(any("FROM queue_entries" in sql for sql in recorder.sql[1:]))
+        self.assertEqual(recorder.sql[-1], "ROLLBACK")
+        self.assertEqual(self.lifecycle("a"), "open")
+        self.assertEqual(self.state("a")["lease"]["lease_id"], lease["lease_id"])
+        self.consistent()
 
     def test_transition_task_refuses_a_change_the_queue_state_does_not_allow(self):
         self.task("a")

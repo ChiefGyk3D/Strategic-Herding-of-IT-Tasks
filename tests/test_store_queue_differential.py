@@ -32,15 +32,43 @@ from shit.project import Project
 
 BASE = datetime(2026, 11, 27, 10, 0, 0, tzinfo=UTC)
 CONFIG = {"lease_ttl_seconds": 300, "lease_max_seconds": 900, "lease_max_renewals": 3, "max_attempts": 2}
-TASKS = ("t0", "t1", "t2", "t3")
+TASKS = ("t0", "t1", "t2", "t3", "t4")
 TYPES = ("draft", "apply", "review", "decision")
-SUITABLE = {None: ("enqueue",), "waiting": ("claim", "maintain", "add_edge"), "ready": ("claim", "claim", "add_edge"),
-            "dispatched": ("start", "start", "renew", "release", "hold", "fail", "reclaim"),
-            "running": ("renew", "submit", "submit", "fail", "hold", "reclaim"),
+SUITABLE = {None: ("enqueue", "enqueue", "add_edge"), "waiting": ("claim", "maintain", "add_edge"),
+            "ready": ("claim", "claim", "add_edge"),
+            "dispatched": ("start", "start", "renew", "release", "hold", "fail", "reclaim", "add_edge", "add_edge"),
+            "running": ("renew", "submit", "submit", "fail", "hold", "reclaim", "add_edge", "add_edge", "add_edge"),
             "review": ("approve", "complete", "complete", "reopen"), "hold-owner": ("reopen",),
             "hold-ci": ("reopen",), "failed": ("reopen", "reopen", "approve"), "done": ("reopen", "claim")}
 EVERY = ("enqueue", "claim", "start", "renew", "release", "submit", "fail", "hold", "reopen", "approve",
          "complete", "reclaim", "add_edge", "remove_edge", "maintain")
+
+# t1 needs t0 (draft) and is enqueued first: it waits, and is promoted once t0's milestone is reached. t2 is submitted
+# while a new edge is unmet (exit code 9), then once the milestone is reached. t4 fails at the attempt limit and
+# is reopened only after a decision. Every step is checked against the file queue like a random one.
+LIMIT = {**CONFIG, "max_attempts": 1}
+PROLOGUE = (
+    ("add_edge", "t1", {"edge": ("t1", "t0", "draft")}),
+    ("enqueue", "t1", {}),
+    ("enqueue", "t0", {}),
+    ("maintain", "t0", {}),
+    ("claim", "t1", {"expect": 4}),  # still waiting
+    ("maintain", "t0", {"reached": ("t0", "draft")}),  # promotion of t1
+    ("claim", "t1", {}),
+    ("enqueue", "t2", {}),
+    ("claim", "t2", {}),
+    ("start", "t2", {}),
+    ("add_edge", "t2", {"edge": ("t2", "t3", "review")}),
+    ("submit", "t2", {"expect": 9}),
+    ("maintain", "t2", {"reached": ("t3", "review")}),
+    ("submit", "t2", {}),
+    ("enqueue", "t4", {}),
+    ("claim", "t4", {}),
+    ("start", "t4", {}),
+    ("fail", "t4", {}),
+    ("reopen", "t4", {"cfg": LIMIT, "decided": False, "expect": 10}),
+    ("reopen", "t4", {"cfg": LIMIT, "decided": True}),
+)
 
 
 def at(seconds):
@@ -134,26 +162,12 @@ class DifferentialTests(unittest.TestCase):
             return rng.choice(SUITABLE[queued["state"] if queued else None])
         return rng.choice(EVERY)
 
-    def operations(self, rng, now):
-        """[(label, file call, store call)] for one randomly chosen operation."""
-        task = rng.choice((*TASKS, *TASKS, "ghost"))
-        other = rng.choice(TASKS)
-        actor = rng.choice(("human", "human", "wrapper", "model"))
-        presented = self.present(rng, task)
-        worker = rng.choice(("w1", "w2"))
-        step = rng.choice(("draft", "draft", "review", "apply"))
-        reason = rng.choice(("Because.", "Needs work.", "Waiting.", "Waiting for a check.", "bad" + chr(1), ""))
-        hold_kind = rng.choice(("owner", "ci", "ci", "owner", "owner", "ci", "ci", "bogus"))
-        edge = (task, other, rng.choice(("draft", "draft", "review", "decision", "apply", "bogus")))
-        request = {"task_id": task, "step": step, "worker": worker, "worker_kind": rng.choice(("ai", "human"))}
-        if rng.random() < 0.05:
-            request["lease_id"] = "f" * 32
-        kind = self.choose(rng, task)
-        cfg = CONFIG
+    def pairs(self, now, cfg, task, actor, presented, request, reason, hold_kind, edge):
+        """{kind: (call on the file queue, call on the store)} for one set of arguments."""
         p = self.proj
         met = self.met
         c = self.conn
-        table = {
+        return {
             "enqueue": (lambda: q.enqueue(p, task, actor, now=now, config=cfg),
                         lambda: store.queue_enqueue(c, task, actor, now, config=cfg, met=met)),
             "claim": (lambda: q.claim(p, request, now=now, config=cfg),
@@ -186,6 +200,24 @@ class DifferentialTests(unittest.TestCase):
             "maintain": (lambda: q.status(p, now=now, config=cfg),
                          lambda: store.queue_maintain(c, now, config=cfg, met=met)),
         }
+
+    def operations(self, rng, now):
+        """[(label, file call, store call)] for one randomly chosen operation."""
+        task = rng.choice((*TASKS, *TASKS, "ghost"))
+        other = rng.choice(TASKS)
+        actor = rng.choice(("human", "human", "wrapper", "model"))
+        presented = self.present(rng, task)
+        worker = rng.choice(("w1", "w2"))
+        step = rng.choice(("draft", "draft", "review", "apply"))
+        reason = rng.choice(("Because.", "Needs work.", "Waiting.", "Waiting for a check.", "bad" + chr(1), ""))
+        hold_kind = rng.choice(("owner", "ci", "ci", "owner", "owner", "ci", "ci", "bogus"))
+        edge = (task, other, rng.choice(("draft", "draft", "review", "decision", "apply", "bogus")))
+        request = {"task_id": task, "step": step, "worker": worker, "worker_kind": rng.choice(("ai", "human"))}
+        if rng.random() < 0.05:
+            request["lease_id"] = "f" * 32
+        kind = self.choose(rng, task)
+        cfg = rng.choice((CONFIG, {**CONFIG, "max_attempts": 1}))
+        table = self.pairs(now, cfg, task, actor, presented, request, reason, hold_kind, edge)
         return kind, task, table[kind][0], table[kind][1]
 
     def file_entries(self):
@@ -204,6 +236,50 @@ class DifferentialTests(unittest.TestCase):
             self.assertEqual(a, b, (context, "entry", number))
         self.assertEqual(chain, hashes, context)
 
+    def execute(self, kind, task, on_file, on_store, context, seen):
+        """One operation on both sides: the same outcome and, for a lease, the same record."""
+        expected = outcome(on_file)
+        actual = outcome(on_store)
+        self.assertEqual(actual[0], expected[0], (context, expected, actual))
+        if expected[0] == "code" or kind in ("claim", "renew"):
+            self.assertEqual(actual[1], expected[1], (context, expected, actual))
+        seen[(kind, expected[0] if expected[0] == "ok" else expected[1])] += 1
+        if expected[0] == "ok" and kind in ("claim", "renew"):
+            self.leases[task] = expected[1]
+        return expected
+
+    def sync(self, context):
+        """The store keeps no maintenance from a refused operation (it rolled back with it); the file queue does.
+        Both apply the same maintenance now, and from here the logs must be equal."""
+        self.assertEqual(outcome(lambda: q.status(self.proj, now=at(self.floor), config=CONFIG))[0],
+                         outcome(lambda: store.queue_maintain(self.conn, at(self.floor), config=CONFIG,
+                                                              met=self.met))[0])
+        self.compare_logs(context)
+        self.assertEqual(store.verify(self.conn), [], context)
+
+    def scripted(self, steps):
+        """Fixed steps that reach the paths a random run reaches only by luck, each checked as the random ones are."""
+        seen = Counter()
+        for number, (kind, task, args) in enumerate(steps):
+            self.floor += 2
+            now = at(self.floor)
+            cfg = args.pop("cfg", CONFIG)
+            if "reached" in args:
+                self.reached ^= {args.pop("reached")}
+            if "decided" in args:
+                self.decided = args.pop("decided")
+            lease = self.leases.get(task)
+            presented = {"task_id": task, "lease_id": lease["lease_id"], "generation": lease["generation"]} if lease else {}
+            request = {"task_id": task, "step": "draft", "worker": "w1", "worker_kind": "human"}
+            table = self.pairs(now, cfg, task, args.get("actor", "human"), presented, request, "Because.", "owner",
+                               args.get("edge"))
+            expected = self.execute(kind, task, *table[kind], ("scripted", number, kind, task, now), seen)
+            self.assertEqual(expected[0], args.get("expect", "ok") if args.get("expect") in (None, "ok") else "code")
+            if "expect" in args and args["expect"] != "ok":
+                self.assertEqual(expected[1], args["expect"], (number, kind, task))
+            self.sync(("scripted", number))
+        return seen
+
     def run_sequence(self, seed, length):
         rng = random.Random(seed)
         seen = Counter()
@@ -211,28 +287,14 @@ class DifferentialTests(unittest.TestCase):
         for number in range(length):
             clock += rng.choice((0, 0, 0, 1, 2, 5, 10, 30, 120))
             now = at(clock if rng.random() > 0.04 else max(0, clock - 400))  # now and then the clock goes back
-            if rng.random() < 0.05:
+            if rng.random() < 0.06:
                 self.reached ^= {(rng.choice(TASKS), rng.choice(TYPES))}
-            if rng.random() < 0.05:
+            if rng.random() < 0.15:
                 self.decided = not self.decided
             kind, task, on_file, on_store = self.operations(rng, now)
-            expected = outcome(on_file)
-            actual = outcome(on_store)
-            context = (seed, number, kind, task, now)
-            self.assertEqual(actual[0], expected[0], (context, expected, actual))
-            if expected[0] == "code" or kind in ("claim", "renew"):
-                self.assertEqual(actual[1], expected[1], (context, expected, actual))
-            seen[(kind, expected[0] if expected[0] == "ok" else expected[1])] += 1
-            if expected[0] == "ok" and kind in ("claim", "renew"):
-                self.leases[task] = expected[1]
+            self.execute(kind, task, on_file, on_store, (seed, number, kind, task, now), seen)
             self.floor = max(self.floor, clock)
-            # The store keeps no maintenance from a refused operation (it rolled back with it); the file queue does.
-            # Both apply the same maintenance now, and from here the logs must be equal.
-            self.assertEqual(outcome(lambda: q.status(self.proj, now=at(self.floor), config=CONFIG))[0],
-                             outcome(lambda: store.queue_maintain(self.conn, at(self.floor), config=CONFIG,
-                                                                  met=self.met))[0])
-            self.compare_logs(context)
-            self.assertEqual(store.verify(self.conn), [], context)
+            self.sync((seed, number))
         return seen
 
     def final_checks(self):
@@ -268,9 +330,10 @@ class DifferentialTests(unittest.TestCase):
         self.assertEqual(file_leases, sorted(name + ".json" for name in leases))
 
     def test_random_sequences_agree_with_the_file_queue_and_with_replay(self):
-        seeds = [int(x) for x in os.environ.get("SHIT_DIFF_SEEDS", "20261127,20261128").split(",")]
-        length = int(os.environ.get("SHIT_DIFF_LENGTH", "110"))
+        seeds = [int(x) for x in os.environ.get("SHIT_DIFF_SEEDS", "1,2,3").split(",")]
+        length = int(os.environ.get("SHIT_DIFF_LENGTH", "140"))
         seen = Counter()
+        seen.update(self.scripted(PROLOGUE))
         for seed in seeds:
             seen.update(self.run_sequence(seed, length))
         self.final_checks()

@@ -2,7 +2,7 @@
 
 This is the only module that imports `sqlite3`. `connect` is the only way to open the database. It
 refuses an unsafe file before opening it, applies every pragma, and verifies the schema fingerprint
-before it hands the connection out. Queue operations are not here yet.
+before it hands the connection out. The task, graph and queue operations are write helpers further down.
 
 Rules for callers: every write goes through `write_transaction` (BEGIN IMMEDIATE, never a deferred
 upgrade), SQL text is a literal with `?` parameters, and errors leave this module as `ShitError`
@@ -2365,12 +2365,12 @@ def queue_remove_edge(conn, task_id, needs_id, kind, actor, now, *, config=None,
     """Remove one edge and write the `graph_changed` entry in one transaction (see `remove_edge` for the codes)."""
     if actor not in ("human", "wrapper"):
         raise ShitError(HUMAN_APPROVAL)
-    edge = _graph_edge((task_id, needs_id, kind))
     config, key = _options(now, config, key)
     with write_transaction(conn):
         if _keyed(conn, key, _ANY_TASK, ("graph_changed",)) is not None:
             return
         _begin(conn, now, met)
+        edge = _graph_edge((task_id, needs_id, kind))  # after the clock and maintenance, as `queue.remove_edge`
         if conn.execute("SELECT 1 FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge).fetchone() is None:
             raise ShitError(PRECONDITION)
         if conn.execute("SELECT 1 FROM leases WHERE task_id = ?", (task_id,)).fetchone() is not None:

@@ -785,5 +785,140 @@ class GraphLintTests(unittest.TestCase):
         self.assertEqual(len(writes), 2)  # exactly one INSERT and one DELETE
 
 
+C4_WRITERS = ("queue_maintain", "queue_enqueue", "queue_claim", "queue_start", "queue_renew", "queue_release",
+              "queue_submit", "queue_fail", "queue_hold", "queue_reopen", "queue_complete", "queue_reclaim",
+              "queue_apply_start", "queue_apply_finish", "queue_add_edges", "queue_remove_edge")
+C4_READS = ("queue_entries", "queue_state", "queue_snapshot", "queue_entry_for_key", "_task_entries", "_queue_tip",
+            "_latest_queue_state", "_task_edges", "_keyed", "_check_population", "_due_leases", "_waiting")
+
+
+def top_level(source):
+    return {n.name: n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)}
+
+
+class QueueOperationLintTests(unittest.TestCase):
+    """Issue 61, C4: the queue operations are on the allowlist one by one, and being listed frees nothing else."""
+
+    def test_every_operation_holds_exactly_one_write_transaction(self):
+        top = top_level((ROOT / STORE).read_text(encoding="utf-8"))
+        for name in C4_WRITERS:
+            _with_parents(top[name])
+            with self.subTest(name=name):
+                guarded = [n for n in ast.walk(top[name]) if isinstance(n, ast.With) and any(
+                    isinstance(i.context_expr, ast.Call) and getattr(i.context_expr.func, "id", "") == "write_transaction"
+                    for i in n.items)]
+                self.assertEqual(len(guarded), 1, name)
+                begins = [n for n in ast.walk(top[name]) if isinstance(n, ast.Constant) and isinstance(n.value, str)
+                          and n.value.upper().startswith(("BEGIN", "COMMIT", "ROLLBACK"))]
+                self.assertEqual(begins, [], name)  # a transaction is opened by write_transaction only
+                for call in ast.walk(top[name]):
+                    if isinstance(call, ast.Call) and getattr(call.func, "id", "") in IN_TRANSACTION:
+                        self.assertTrue(_in_write_transaction(call), (name, call.lineno))
+                    if isinstance(call, ast.Call) and getattr(call.func, "attr", "") in EXECUTORS:
+                        statement = _text(call.args[0]) or ""
+                        if not is_read_only(statement):
+                            self.assertTrue(_in_write_transaction(call), (name, statement))
+
+    def test_the_reads_never_write_and_never_call_a_writer(self):
+        top = top_level((ROOT / STORE).read_text(encoding="utf-8"))
+        for name in C4_READS:
+            with self.subTest(name=name):
+                for node in ast.walk(top[name]):
+                    if isinstance(node, ast.Call) and getattr(node.func, "attr", "") in EXECUTORS:
+                        self.assertTrue(is_read_only(_text(node.args[0]) or ""), name)
+                    if isinstance(node, ast.Call) and getattr(node.func, "id", "") in IN_TRANSACTION:
+                        self.fail(name + " calls an in-transaction writer")
+
+    def test_the_allowlists_name_real_functions_and_are_exact(self):
+        source = (ROOT / STORE).read_text(encoding="utf-8")
+        top = top_level(source)
+        for name in IN_TRANSACTION:
+            self.assertIn(name, top)
+        for name in C4_WRITERS + C4_READS:
+            self.assertIn(name, top)
+        # The writers among the in-transaction functions execute, and only the ones that write directly are listed to.
+        for name in ("_append_entry", "_lifecycle_step", "_insert_lease", "_renew_lease_row", "_drop_lease",
+                     "_take_slot", "_release_slots"):
+            self.assertEqual(ALLOWED_METHODS[name], {"execute"})
+        for name in ("_expire", "_maintain", "_begin"):
+            self.assertNotIn(name, ALLOWED_METHODS)  # they call writers; they run no statement themselves
+        self.assertEqual(access_findings(source, STORE), [])
+
+    def test_an_in_transaction_function_called_outside_a_transaction_is_a_finding(self):
+        bad = (
+            "def queue_x(conn):\n    _append_entry(conn, {}, now)",
+            "def queue_x(conn):\n    _expire(conn, 'a', now)",
+            "def queue_x(conn):\n    with other(conn):\n        _drop_lease(conn, 'a')",
+            "def helper(conn):\n    _begin(conn, now, None)",
+            ("def queue_x(conn):\n    def write_transaction(_):\n        return None\n"
+             "    with write_transaction(conn):\n        _append_entry(conn, {}, now)"),
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                found = access_findings(source, STORE, {**ALLOWED_METHODS, "queue_x": {"execute"}})
+                self.assertIn("in-transaction function called outside a write transaction", {kind for _, kind in found})
+
+    def test_calls_from_inside_a_transaction_or_from_another_in_transaction_function_pass(self):
+        good = (
+            "def queue_x(conn):\n    with write_transaction(conn):\n        _append_entry(conn, {}, now)",
+            "def queue_x(conn):\n    with write_transaction(conn) as c:\n        _expire(c, 'a', now)",
+            "def _maintain(conn, now, met):\n    _expire(conn, 'a', now)",
+            "def _begin(conn, now, met):\n    _maintain(conn, now, met)",
+        )
+        for source in good:
+            with self.subTest(source=source):
+                self.assertEqual(access_findings(source, STORE), [], source)
+
+    def test_an_alias_or_a_callback_of_an_in_transaction_function_is_a_finding(self):
+        bad = (
+            "def queue_x(conn):\n    write = _append_entry\n    with write_transaction(conn):\n        write(conn, {}, now)",
+            "def queue_x(conn):\n    with write_transaction(conn):\n        run(_drop_lease)",
+            "def queue_x(conn):\n    return [_expire]",
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                found = access_findings(source, STORE)
+                self.assertIn("in-transaction function referenced without a direct call", {kind for _, kind in found})
+
+    def test_being_in_transaction_does_not_let_a_function_run_text_or_skip_the_list(self):
+        unlisted = 'def _append_entry(conn):\n    conn.execute("DELETE FROM leases")'
+        found = {kind for _, kind in access_findings(unlisted, STORE, {})}
+        self.assertIn("database method in a function not on the list", found)
+        dynamic = ('def _append_entry(conn, name):\n    conn.execute("DELETE FROM " + name)')
+        self.assertTrue(access_findings(dynamic, STORE) or sql_findings(dynamic, STORE, BUILDERS))
+        text = 'def _drop_lease(conn, sql):\n    conn.execute(sql)'
+        self.assertTrue(access_findings(text, STORE))
+
+    def test_an_in_transaction_name_cannot_be_borrowed_by_a_look_alike(self):
+        bad = (
+            "def _append_entry(conn):\n    pass\n\ndef _append_entry(conn):\n    pass",
+            "def innocent():\n    def _drop_lease(conn):\n        conn.execute('DELETE FROM leases')\n    return _drop_lease",
+            "_append_entry = something",
+            "def f(_append_entry):\n    pass",
+            "class Holder:\n    def _expire(self):\n        pass",
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE, {**ALLOWED_METHODS}), source)
+
+    def test_a_write_in_an_operation_outside_its_transaction_is_a_finding(self):
+        for statement in ("INSERT INTO queue_entries (seq) VALUES (?)", "UPDATE leases SET renewals = 0",
+                          "DELETE FROM apply_slots", "INSERT INTO apply_slots (target) VALUES (?)",
+                          "DELETE FROM leases WHERE task_id = ?"):
+            with self.subTest(statement=statement):
+                bare = 'def queue_apply_start(conn):\n    conn.execute("' + statement + '", row)'
+                self.assertTrue(access_findings(bare, STORE))
+                guarded = 'def queue_apply_start(conn):\n    with write_transaction(conn):\n        conn.execute("' + statement + '", row)'
+                self.assertEqual(access_findings(guarded, STORE), [])
+
+    def test_the_idempotency_key_never_reaches_sql_text(self):
+        source = (ROOT / STORE).read_text(encoding="utf-8")
+        self.assertEqual(sql_findings(source, STORE, BUILDERS), [])
+        top = top_level(source)
+        for node in ast.walk(top["_keyed"]):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "execute":
+                self.assertIn("?", _text(node.args[0]))  # the key travels as a parameter
+
+
 if __name__ == "__main__":
     unittest.main()
