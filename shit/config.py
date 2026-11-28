@@ -39,7 +39,7 @@ _MAX_WEIGHT = 1000
 # table -> {key: kind}. Kinds: "int1" exact schema version, "text" bounded string, "slug" lowercase slug,
 # "repo" owner/repo reference, "host" code host name, "log" path under .shit, "root" the fixed storage root, "bool", "window"
 # context size in tokens, "slugs" list of slugs, "weight" integer 0 to 1000, "limit" positive int up to 10 million,
-# "mode" warn or fail. The top level has only schema_version.
+# "mode" warn or fail, "timeout" milliseconds 0 to 600000 (the store lock wait). The top level has only schema_version.
 SCHEMA = {
     "": {"schema_version": "int1"},
     "project": {"name": "slug"},
@@ -52,6 +52,7 @@ SCHEMA = {
     "local_model": {"context_tokens": "window"},
     "limits": {"instruction_max_bytes": "limit", "listed_roles_max": "limit", "on_exceed": "mode"},
     "yardstick": {name: "weight" for name in WEIGHT_KEYS},
+    "store": {"busy_timeout_ms": "timeout"},
 }
 REQUIRED = {
     "": ["schema_version"],
@@ -68,6 +69,7 @@ DEFAULTS = {
     "privacy": {"scan": True},
     "limits": {"on_exceed": "warn"},
     "yardstick": {name: 1 for name in WEIGHT_KEYS},
+    "store": {"busy_timeout_ms": 60000},  # equals store.DEFAULT_BUSY_TIMEOUT_MS (a test keeps them equal)
 }
 
 
@@ -103,6 +105,10 @@ def _check_value(kind, value):
     if kind == "limit":
         if type(value) is not int or not 1 <= value <= _MAX_LIMIT:
             raise rejected("limits: must be an integer from 1 to 10000000")
+        return value
+    if kind == "timeout":
+        if type(value) is not int or not 0 <= value <= 600000:
+            raise rejected("store: busy_timeout_ms must be an integer from 0 to 600000")
         return value
     if kind == "mode":
         if value not in _MODES:

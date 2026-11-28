@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 
 from ._text import check_text
-from .errors import INPUT_LIMIT, REJECTED, ContractError, ShitError
+from .errors import INPUT_LIMIT, REJECTED, STABLE_EXIT_CODES, ContractError, ShitError
 from .lifecycle import ACTORS, STATES, check_transition
 
 MAX_RECORD_BYTES = 65536
@@ -232,7 +232,7 @@ def validate_event(obj):
         raise _reject()
     if event == "command_failed":
         code = obj.get("exit_code")
-        if type(code) is not int or not 1 <= code <= 11:
+        if type(code) is not int or code not in STABLE_EXIT_CODES:
             raise _reject()
     elif "exit_code" in obj:
         raise _reject()
