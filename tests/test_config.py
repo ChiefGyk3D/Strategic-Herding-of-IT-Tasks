@@ -202,6 +202,25 @@ class ConfigLimitsTests(unittest.TestCase):
             self.assertRegex(text, rf"(?m)^# {key} = ")
 
 
+class ConfigStoreTests(unittest.TestCase):
+    def test_default_wait_matches_the_store(self):
+        from shit import store
+        self.assertEqual(config.parse(GOOD)["store"], {"busy_timeout_ms": store.DEFAULT_BUSY_TIMEOUT_MS})
+        self.assertEqual(config.parse(GOOD + "\n[store]\nbusy_timeout_ms = 0\n")["store"]["busy_timeout_ms"], 0)
+        self.assertEqual(config.parse(GOOD + "\n[store]\nbusy_timeout_ms = 600000\n")["store"]["busy_timeout_ms"],
+                         store.MAX_BUSY_TIMEOUT_MS)
+
+    def test_bad_wait_values_are_rejected(self):
+        for bad in ("-1", "600001", "true", "1.5", '"9"'):
+            with self.subTest(bad=bad):
+                self.assertEqual(code_of(config.parse, GOOD + f"\n[store]\nbusy_timeout_ms = {bad}\n"), 3)
+        self.assertEqual(code_of(config.parse, GOOD + "\n[store]\nsurprise = 1\n"), 3)
+
+    def test_template_documents_the_store_wait_as_a_comment(self):
+        text = (TEMPLATES / "config.toml").read_text(encoding="utf-8")
+        self.assertRegex(text, r"(?m)^# busy_timeout_ms = 60000")
+
+
 class ConfigTemplateTests(unittest.TestCase):
     def setUp(self):
         self.text = (TEMPLATES / "config.toml").read_text(encoding="utf-8")

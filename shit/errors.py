@@ -15,6 +15,7 @@ MESSAGES = {
     9: "precondition missing",
     10: "human approval required",
     12: "lease refused",
+    13: "store busy",
 }
 
 OK = 0
@@ -29,6 +30,12 @@ PRECONDITION = 9
 HUMAN_APPROVAL = 10
 # Approved by the owner on 2026-11-27 (docs/queue-spec.md, OQ-1).
 LEASE_REFUSED = 12
+# The SQLite store could not take its write lock within the configured wait (docs/store.md). Retryable.
+BUSY = 13
+
+
+# Every stable exit code of docs/exit-codes.md except 0 (ok). The event log, the store and the tests read this one set.
+STABLE_EXIT_CODES = tuple(range(1, 14))
 
 
 class ShitError(Exception):
