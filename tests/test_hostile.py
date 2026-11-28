@@ -754,6 +754,11 @@ class NetworkDenial(unittest.TestCase):
             "__import__('sub' + 'process')", "eval('1')", "exec('1')", "import runpy", "import _posixsubprocess",
             "import subprocess", "from subprocess import run", "import multiprocessing", "import ctypes",
             "import os\ngetattr(os, 'sys' + 'tem')('true')", "import os\nx = os\nx.system('true')",
+            "import os\nos.__dict__['sys' + 'tem']('id')", "import os\nvars(os)['system']('id')",
+            "import os\nobject.__getattribute__(os, 'system')('id')", "import os\nglobals()['os'].system('id')",
+            "import sys\nsys.modules['os'].system('id')", "from operator import attrgetter",
+            "import operator\noperator.attrgetter('system')(__import__('os'))", "import os\nlocals()['os']",
+            "import os\nos.__getattribute__('system')", "compile('1', 'f', 'eval')",
         )
         for src in bad:
             with self.subTest(src=src):
@@ -780,7 +785,10 @@ LAUNCH_MODULES = {"subprocess", "_posixsubprocess", "multiprocessing", "pty", "i
 OS_MODULES = {"os", "posix", "nt"}
 LAUNCH_OS_ATTRS = ("system", "popen", "fork", "forkpty", "startfile", "posix_spawn", "posix_spawnp", "plock")
 LAUNCH_OS_PREFIXES = ("exec", "spawn")
-DYNAMIC_NAMES = {"__import__", "eval", "exec"}
+DYNAMIC_NAMES = {"__import__", "eval", "exec", "vars", "globals", "locals", "compile", "breakpoint"}
+# Reflection that reaches a module's contents without naming them: never needed by the package.
+REFLECTION_ATTRS = {"__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__", "__subclasses__",
+                    "__loader__", "__spec__", "attrgetter", "methodcaller"}
 
 
 def _launches(attr):
@@ -810,12 +818,19 @@ def process_launch_uses(source):
             root = node.module.split(".")[0]
             if root in LAUNCH_MODULES:
                 found.add(f"from {node.module}")
+            if root == "operator":
+                found |= {f"from operator import {a.name}" for a in node.names if a.name in REFLECTION_ATTRS}
             if root in OS_MODULES:
                 found |= {f"from {node.module} import {a.name}" for a in node.names if _launches(a.name)}
     for node in ast.walk(tree):
         if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases
                 and _launches(node.attr)):
             found.add(f"{node.value.id}.{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr in REFLECTION_ATTRS:
+            found.add(f"reflection .{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr == "modules" and isinstance(node.value, ast.Name) \
+                and node.value.id == "sys":
+            found.add("sys.modules")
         elif isinstance(node, ast.Name) and node.id in DYNAMIC_NAMES:
             found.add(node.id)
         elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":

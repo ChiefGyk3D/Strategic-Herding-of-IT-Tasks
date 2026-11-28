@@ -10,6 +10,7 @@ network or a real credential. Nothing here is imported by the `shit` package, wh
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,13 +30,25 @@ ENV_SENTINEL = "SHIT_TEST_UNLISTED_VARIABLE"
 
 FAKE_GH = '''#!{python}
 import json, os, sys, time
-here = os.path.dirname(os.path.abspath(__file__))
+here = os.path.dirname(os.path.realpath(__file__))
 cfg = json.load(open(os.path.join(here, "cfg.json")))
 state_path = os.path.join(here, "state.json")
 state = json.load(open(state_path)) if os.path.exists(state_path) else {{"read": 0, "reply": 0, "resolve": 0}}
 argv = sys.argv[1:]
+def resolved_config():
+    # what gh would read: GH_CONFIG_DIR, else XDG_CONFIG_HOME/gh, else HOME/.config/gh
+    base = os.environ.get("GH_CONFIG_DIR")
+    if not base:
+        xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.environ.get("HOME", ""), ".config")
+        base = os.path.join(xdg, "gh")
+    path = os.path.join(base, "config.yml")
+    return open(path).read() if os.path.isfile(path) else None
+names = ("HOME", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "TMPDIR")
+seen = {{n: os.environ.get(n) for n in names}}
+modes = {{n: (oct(os.stat(v).st_mode & 0o777) if v and os.path.isdir(v) else None) for n, v in seen.items()}}
 with open(os.path.join(here, "calls.jsonl"), "a") as log:
-    log.write(json.dumps({{"argv": argv, "env": sorted(os.environ), "stdin_tty": sys.stdin.isatty()}}) + "\\n")
+    log.write(json.dumps({{"argv": argv, "env": sorted(os.environ), "stdin_tty": sys.stdin.isatty(), "vals": seen,
+                          "modes": modes, "config_seen": resolved_config(), "me": here}}) + "\\n")
 text = " ".join(argv)
 if "-X POST" in text:
     kind = "reply"
@@ -101,6 +114,7 @@ class Case(unittest.TestCase):
         gh = self.bin / "gh"
         gh.write_text(FAKE_GH.format(python=sys.executable), encoding="utf-8")
         gh.chmod(0o755)
+        self.bin.chmod(0o755)  # the user's umask may be group-writable; --gh refuses such a directory
         cfg = {
             "read": read if read is not None else [{"out": page([node("T1", 101), node("T2", 102)])}],
             "reply": reply if reply is not None else [{"out": {}}],
@@ -448,7 +462,7 @@ class CallRuleTests(Case):
 
     def test_the_allow_list_has_no_unneeded_credential_names(self):
         self.assertFalse(any(name.endswith(("_SECRET", "_PASSWORD")) for name in launcher.ENV_ALLOW))
-        for name in launcher.RISKY + launcher.DROPPED_UNLESS_OPTED + ("GH_HOST",):
+        for name in launcher.RISKY + ("GH_HOST", "HOME", "TMPDIR", "GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
             self.assertNotIn(name, launcher.ENV_ALLOW, name)
 
     def test_the_token_never_reaches_the_output(self):
@@ -517,20 +531,124 @@ class HardeningTests(Case):
                 self.assertEqual(self.calls(), [])
                 self.assertNotIn(name, err) if name else None
 
-    def test_config_directory_variables_are_dropped_unless_opted_in(self):
-        env = {name: "/somewhere" for name in launcher.DROPPED_UNLESS_OPTED}
+
+class PrivateEnvTests(Case):
+    def go(self, *opts, plan=None, environ=None, **kw):
+        self.tmp = self.dir / "tmproot"
+        self.tmp.mkdir(exist_ok=True)
+        env = environ or self.environ()
+        return run_main(lambda a: launcher.main(a, environ=env, cwd=self.work, tmpdir=str(self.tmp), **kw),
+                        [*opts, plan or self.plan_file(kind="list")])
+
+    def hostile_home(self, text="api_host: attacker.example\nhttp_unix_socket: /tmp/attacker.sock\n"):
+        home = self.dir / "userhome"
+        (home / ".config" / "gh").mkdir(parents=True)
+        (home / ".config" / "gh" / "config.yml").write_text(text, encoding="utf-8")
+        return home
+
+    def test_the_child_gets_private_directories_and_never_the_users_home(self):
         self.fake()
-        self.assertEqual(self.run_plan(self.plan_file(kind="list"), environ=self.environ(**env))[0], 0)
-        self.assertEqual(set(self.calls()[0]["env"]) & set(env), set())
+        home = self.hostile_home()
+        env = self.environ(HOME=str(home), XDG_CONFIG_HOME=str(home / ".config"), GH_CONFIG_DIR=str(home / "gh"),
+                           TMPDIR=str(home), XDG_DATA_HOME=str(home), XDG_CACHE_HOME=str(home),
+                           XDG_STATE_HOME=str(home))
+        self.assertEqual(self.go(environ=env)[0], 0)
+        call = self.calls()[0]
+        for name, value in call["vals"].items():
+            self.assertTrue(value.startswith(str(self.tmp) + os.sep), (name, value))
+            self.assertNotIn(str(home), value)
+            self.assertEqual(call["modes"][name], "0o700", name)
+        self.assertEqual(len(set(call["vals"].values())), len(call["vals"]))
+        self.assertEqual({"GH_NO_UPDATE_NOTIFIER", "GH_PROMPT_DISABLED", "NO_COLOR"} - set(call["env"]), set())
+        self.assertNotIn(str(home), json.dumps(call["env"]))
+
+    def test_a_hostile_config_in_the_users_home_has_no_effect(self):
+        self.fake()
+        home = self.hostile_home()
+        self.assertEqual(self.go(environ=self.environ(HOME=str(home)))[0], 0)
+        self.assertIsNone(self.calls()[0]["config_seen"])
+
+    def test_the_private_directory_is_removed_after_success_and_after_failure(self):
+        self.fake()
+        self.go()
+        self.assertEqual(list(self.tmp.iterdir()), [])
+        self.setUp()
+        self.fake(read=[{"out": "", "rc": 1}])
+        self.assertEqual(self.go()[0], 8)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+        self.setUp()
+        self.fake(read=[{"out": {}, "flood": "out"}])
+        self.assertEqual(self.go()[0], 7)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+        def boom(argv, **kw):
+            raise RuntimeError("unexpected")
+
         self.setUp()
         self.fake()
-        self.run_plan(self.plan_file(kind="list"), "--allow-env", "GH_CONFIG_DIR", environ=self.environ(**env))
-        self.assertEqual(set(self.calls()[0]["env"]) & set(env), {"GH_CONFIG_DIR"})
+        with self.assertRaises(RuntimeError):
+            self.go(popen=boom)
+        self.assertEqual(list(self.tmp.iterdir()), [])
 
-    def test_home_is_the_only_location_variable_passed_by_default(self):
-        self.assertIn("HOME", launcher.ENV_ALLOW)
-        self.assertEqual(set(launcher.child_env({"HOME": "/h", "XDG_CONFIG_HOME": "/x", "GH_CONFIG_DIR": "/y"}))
-                         & {"HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"}, {"HOME"})
+    def test_nothing_is_created_when_the_run_is_refused_early(self):
+        self.fake()
+        (self.work / "bad.json").write_text("x", encoding="utf-8")
+        self.assertEqual(self.go(plan="bad.json")[0], 3)
+        self.assertEqual(self.go("--allow-env", "GH_TOKEN")[0], 2)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+        self.assertEqual(self.calls(), [])
+
+    def good_config_dir(self, mode=0o700):
+        path = self.dir / "ghcfg"
+        path.mkdir(exist_ok=True)
+        path.chmod(mode)
+        (path / "config.yml").write_text("git_protocol: https\n", encoding="utf-8")
+        return path
+
+    def test_the_opt_in_config_dir_is_used_and_home_stays_private(self):
+        self.fake()
+        cfg = self.good_config_dir()
+        self.assertEqual(self.go("--gh-config-dir", str(cfg))[0], 0)
+        call = self.calls()[0]
+        self.assertEqual(call["vals"]["GH_CONFIG_DIR"], str(cfg))
+        self.assertIn("git_protocol", call["config_seen"])
+        self.assertTrue(call["vals"]["HOME"].startswith(str(self.tmp)))
+
+    def test_the_opt_in_config_dir_is_validated(self):
+        self.fake()
+        cfg = self.good_config_dir()
+        link = self.dir / "link"
+        link.symlink_to(cfg)
+        sub = cfg / "sub"
+        sub.mkdir(mode=0o700)
+        (self.dir / "file").write_text("x")
+        bad_mode = self.dir / "mode750"
+        bad_mode.mkdir()
+        bad_mode.chmod(0o750)
+        loose = self.dir / "mode777"
+        loose.mkdir()
+        loose.chmod(0o777)
+        cases = (("ghcfg", 2), ("./ghcfg", 2), (str(self.dir / "x" / ".." / "ghcfg"), 2), (str(self.dir / "missing"), 9),
+                 (str(link), 5), (str(link / "sub"), 5), (str(self.dir / "file"), 5), (str(bad_mode), 5),
+                 (str(loose), 5), ("/", 5), ("/proc/1", 5))
+        for arg, want in cases:
+            with self.subTest(arg=arg):
+                self.assertEqual(self.go("--gh-config-dir", arg)[0], want)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_directory_owned_by_someone_else_is_refused(self):
+        from unittest import mock
+
+        self.fake()
+        cfg = self.good_config_dir()
+        with mock.patch.object(launcher.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertEqual(self.go("--gh-config-dir", str(cfg))[0], 5)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_old_config_directory_names_can_no_longer_be_opted_in(self):
+        for name in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "HOME", "TMPDIR"):
+            with self.subTest(name=name):
+                self.assertEqual(self.go("--allow-env", name)[0], 2)
 
 
 class BoundedReadTests(Case):
@@ -597,6 +715,46 @@ class GhPathTests(Case):
                                    environ={"PATH": str(self.dir / "empty"), "HOME": str(self.dir)})
         self.assertEqual(code, 0)
         self.assertEqual(len(self.calls()), 1)
+
+    def test_a_writable_parent_directory_is_refused(self):
+        self.fake()
+        for mode in (0o775, 0o757, 0o777):
+            with self.subTest(mode=oct(mode)):
+                self.bin.chmod(mode)
+                self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", self.gh())[0], 5)
+        self.bin.chmod(0o755)
+        sticky = self.dir / "sticky"
+        sticky.mkdir()
+        (sticky / "inner").mkdir()
+        shutil.copy(self.bin / "gh", sticky / "inner" / "gh")
+        (sticky / "inner" / "gh").chmod(0o755)
+        sticky.chmod(0o1777)  # sticky but owned by this user, not by root: still refused
+        self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", str(sticky / "inner" / "gh"))[0], 5)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_writable_grandparent_is_refused_but_a_root_sticky_tmp_is_not(self):
+        self.fake()
+        self.dir.chmod(0o770)
+        self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", self.gh())[0], 5)
+        self.dir.chmod(0o700)
+        self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", self.gh())[0], 0)
+
+    def test_the_checked_file_is_the_one_that_runs_even_if_the_path_is_swapped(self):
+        self.fake()
+        real = self.bin / "gh"
+
+        def swap_then_start(argv, **kw):
+            os.replace(real, self.bin / "moved")
+            real.write_text("#!" + sys.executable + "\nimport sys; open(" + repr(str(self.dir / "evil")) +
+                            ", 'w').write('ran')\n")
+            real.chmod(0o755)
+            return subprocess.Popen(argv, **kw)
+
+        code, out, _ = self.run_plan(self.plan_file(kind="list"), "--gh", str(real), popen=swap_then_start)
+        self.assertEqual(code, 0, out)
+        self.assertFalse((self.dir / "evil").exists())
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.calls()[0]["me"], str(self.bin))
 
     def test_bad_explicit_gh_is_refused_with_no_call(self):
         self.fake()

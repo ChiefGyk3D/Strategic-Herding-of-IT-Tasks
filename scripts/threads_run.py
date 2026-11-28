@@ -1,6 +1,6 @@
 """Run a review-thread request plan with the GitHub CLI. This is the user's own step.
 
-    python3 scripts/threads_run.py [--config PATH] [--gh PATH] [--allow-env NAME ...] PLAN.json
+    python3 scripts/threads_run.py [--config PATH] [--gh PATH] [--gh-config-dir PATH] [--allow-env NAME ...] PLAN.json
 
 The plan comes from `shit threads list ...` or `shit threads apply ...` (docs/threads.md), saved to a file below
 the working directory. This launcher sits outside the `shit` package on purpose: no module of the package may
@@ -22,7 +22,10 @@ output of `gh` (stdout and stderr) is never shown, only checked.
 
 Which `gh`: the first one on PATH, unless `--gh PATH` names one. A `gh` that an attacker can put on your PATH
 receives your token, so use `--gh` with an absolute path to a regular file (not a symlink) that no other user can
-write. That is the whole check; the launcher cannot tell a genuine `gh` from a replaced one.
+write, in a directory chain (every parent, after resolving links) that no other user can write unless it is a
+root-owned sticky directory such as /tmp. The file is opened once, checked through that descriptor, and run through
+/proc/self/fd/N where the platform has it, so replacing the path after the check does not change what runs; without
+/proc the residual is a race on the path. The launcher cannot tell a genuine `gh` from a replaced one.
 
 Host and credential: the host comes only from an explicit `--config PATH` (`[tracker] host`), else github.com; no
 file is read by default and the plan never chooses it. A plan whose host is not null and differs is refused before any
@@ -30,14 +33,19 @@ call (exit 3). Every call carries `--hostname HOST`. The launcher reads the toke
 passes the pair that applies to that host to `gh` (GH_TOKEN and GITHUB_TOKEN for github.com, GH_ENTERPRISE_TOKEN and
 GITHUB_ENTERPRISE_TOKEN for any other host), and never the other pair. It never prints or logs their values.
 
-Environment: `gh` gets only HOME, PATH, LANG, LC_ALL, TERM, TZ, USER, TMPDIR (HOME is how `gh` finds its own sign-in
-and settings), the applicable token pair, GH_PROMPT_DISABLED=1 and NO_COLOR=1. Any other variable of yours is dropped,
-GH_HOST included. A value with a control character is dropped.
+Environment: `gh` gets only PATH, LANG, LC_ALL, TERM, TZ, USER, the applicable token pair, GH_PROMPT_DISABLED=1,
+GH_NO_UPDATE_NOTIFIER=1 and NO_COLOR=1, and a fresh private HOME, GH_CONFIG_DIR, XDG_*_HOME and TMPDIR: a new
+mode-0700 directory made for this run and removed afterwards. Your own HOME is never passed, so no `gh` configuration
+of yours (hosts, `api_host`, `http_unix_socket`, aliases, pager, extensions, proxy) applies. The token then comes
+only from the token variable pair. Any other variable of yours is dropped, GH_HOST included.
+If you rely on `gh auth login`, `--gh-config-dir PATH` opts in one configuration directory: absolute, an existing
+directory you own, mode 0700, no symlink in the path (exit 5 otherwise, 2 if relative, 9 if missing). GH_CONFIG_DIR
+is then that path and HOME stays private. Residual: a `config.yml` or `hosts.yml` in that directory can still redirect
+traffic or name a socket, so only point it at a directory only you can write.
 Proxy and certificate variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY, SSL_CERT_FILE, SSL_CERT_DIR,
 REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and similar) can send the token through a server of someone else's choosing, so the
 launcher refuses to start (exit 3, naming the variable) when one is set. `--allow-env NAME` (repeatable) opts one such
 name in and passes exactly that variable; it accepts only names on the fixed list in OPT_IN, never a token name.
-The same list covers GH_CONFIG_DIR and the XDG_* directories, which are dropped unless opted in.
 
 Exit codes (docs/exit-codes.md): 0 done; 2 usage; 3 plan rejected or a risky variable set; 5 plan or `gh` path
 outside confinement or not a regular file; 7 limit; 8 GitHub did not answer as required or a write failed; 9 plan
@@ -50,6 +58,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -71,17 +80,15 @@ CALL_TIMEOUT = 60
 READ_CHUNK = 65536
 
 # What `gh` receives from your environment. Nothing else is passed on.
-ENV_ALLOW = ("PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ", "USER", "TMPDIR")
-ENV_FORCE = {"GH_PROMPT_DISABLED": "1", "NO_COLOR": "1"}
+ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "TERM", "TZ", "USER")
+ENV_FORCE = {"GH_PROMPT_DISABLED": "1", "NO_COLOR": "1", "GH_NO_UPDATE_NOTIFIER": "1"}
 # Set in your environment: the launcher refuses to start unless the name is opted in with --allow-env.
 RISKY = (
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy",
     "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO", "GIT_SSL_CAPATH",
     "NODE_EXTRA_CA_CERTS",
 )
-# Dropped silently unless opted in (gh settings can name a socket or a host to talk to).
-DROPPED_UNLESS_OPTED = ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME")
-OPT_IN = (*RISKY, *DROPPED_UNLESS_OPTED)
+OPT_IN = RISKY
 # The user's own credential, and only the pair that applies to the target host (never both pairs).
 DEFAULT_HOST = "github.com"
 TOKENS_DOTCOM = ("GH_TOKEN", "GITHUB_TOKEN")
@@ -97,8 +104,23 @@ def clean_value(value):
     return isinstance(value, str) and not any(unicodedata.category(c) in ("Cc", "Cs") for c in value)
 
 
-def child_env(environ, host=DEFAULT_HOST, allow=()):
-    """The environment of `gh`: the fixed allowlist, the token pair of this host, and the names opted in."""
+def private_env(root, config_dir=None):
+    """Make the private directories under `root` (mode 0700) and return the variables that point `gh` at them."""
+    names = {"HOME": "home", "XDG_CONFIG_HOME": "xdg-config", "XDG_CACHE_HOME": "xdg-cache",
+             "XDG_DATA_HOME": "xdg-data", "XDG_STATE_HOME": "xdg-state", "TMPDIR": "tmp", "GH_CONFIG_DIR": "gh"}
+    env = {}
+    for name, sub in names.items():
+        path = os.path.join(root, sub)
+        os.mkdir(path, 0o700)
+        env[name] = path
+    if config_dir is not None:
+        env["GH_CONFIG_DIR"] = config_dir
+    return env
+
+
+def child_env(environ, host=DEFAULT_HOST, allow=(), private=None):
+    """The environment of `gh`: the fixed allowlist, the token pair of this host, the names opted in, and the
+    private directories. The caller's HOME and every XDG or config variable are never copied."""
     env = {}
     tokens = TOKENS_DOTCOM if host.lower() == DEFAULT_HOST else TOKENS_OTHER
     for name in (*ENV_ALLOW, *tokens, *(n for n in allow if n in OPT_IN)):
@@ -106,6 +128,7 @@ def child_env(environ, host=DEFAULT_HOST, allow=()):
         if clean_value(value):
             env[name] = value
     env.update(ENV_FORCE)
+    env.update(private or {})
     return env
 
 
@@ -122,8 +145,8 @@ def allow_name(text):
 
 
 class Gh:
-    def __init__(self, path, popen, env):
-        self.path, self.popen, self.env = path, popen, env
+    def __init__(self, path, popen, env, fd=None):
+        self.path, self.popen, self.env, self.fd = path, popen, env, fd
 
     def call(self, args):
         """Return (exit code, stdout text). Reads are bounded, the child is killed on overflow or after the deadline.
@@ -132,8 +155,11 @@ class Gh:
         """
         limit = threads.ANSWER_LIMIT
         try:
+            extra = {}
+            if self.fd is not None:  # run the very file that was checked, not whatever the path names by now
+                extra = {"executable": f"/proc/self/fd/{self.fd}", "pass_fds": (self.fd,)}
             proc = self.popen([self.path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, env=self.env, close_fds=True)
+                              stderr=subprocess.PIPE, env=self.env, close_fds=True, **extra)
         except (OSError, ValueError):  # ValueError: NUL or lone surrogate in argv
             raise _cli.CodedError(_cli.TOOL_UNAVAILABLE) from None
         out = bytearray()
@@ -249,22 +275,69 @@ def configured_host(config_arg, base):
     return config.read(base / config_arg, base).get("tracker", {}).get("host")
 
 
-def check_gh_path(text):
-    """An explicit `gh`: an absolute path to a regular file, not a symlink, that no group or other can write."""
+def _safe_dir_chain(directory):
+    """Every directory from / to `directory` (links resolved) is not writable by group or others, unless it is a
+    root-owned sticky directory (such as /tmp). Raises the confinement error otherwise."""
+    path = os.path.realpath(directory)
+    parts = [p for p in path.split(os.sep) if p]
+    current = os.sep
+    for part in ["", *parts]:
+        current = os.path.join(current, part) if part else os.sep
+        st = os.lstat(current)
+        if not stat.S_ISDIR(st.st_mode):
+            raise ShitError(CONFINEMENT)
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+            raise ShitError(CONFINEMENT)
+    return path
+
+
+def open_gh(text):
+    """An explicit `gh`: absolute path, regular file (no symlink), executable, not writable by group or others,
+    in a directory chain that no other user can write. Returns (path, open file descriptor); the caller closes it."""
     if not isinstance(text, str) or not os.path.isabs(text) or ".." in text.split(os.sep) or chr(0) in text:
         raise ShitError(USAGE)
     try:
-        st = os.lstat(text)
+        before = os.lstat(text)
+        _safe_dir_chain(os.path.dirname(text))
+        fd = os.open(text, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         raise ShitError(PRECONDITION) from None
     except OSError:
         raise ShitError(CONFINEMENT) from None
-    if not stat.S_ISREG(st.st_mode) or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or not os.access(text, os.X_OK):
+    try:
+        st = os.fstat(fd)
+        same = (st.st_dev, st.st_ino) == (before.st_dev, before.st_ino)
+        if (not same or not stat.S_ISREG(st.st_mode) or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or not os.access(text, os.X_OK)):
+            raise ShitError(CONFINEMENT)
+    except BaseException:
+        os.close(fd)
+        raise
+    return text, fd
+
+
+def check_config_dir(text):
+    """The opt-in `gh` configuration directory: absolute, existing, owned by you, mode 0700, no symlink in the path."""
+    if not isinstance(text, str) or not os.path.isabs(text) or ".." in text.split(os.sep) or chr(0) in text:
+        raise ShitError(USAGE)
+    current = os.sep
+    try:
+        for part in [p for p in text.split(os.sep) if p]:
+            current = os.path.join(current, part)
+            st = os.lstat(current)
+            if stat.S_ISLNK(st.st_mode):
+                raise ShitError(CONFINEMENT)
+    except FileNotFoundError:
+        raise ShitError(PRECONDITION) from None
+    except OSError:
+        raise ShitError(CONFINEMENT) from None
+    st = os.lstat(text)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
         raise ShitError(CONFINEMENT)
     return text
 
 
-def make_handler(popen, which, environ, cwd):
+def make_handler(popen, which, environ, cwd, tmpdir):
     def handler(args):
         base = Path(cwd) if cwd is not None else Path.cwd()
         allow = tuple(args.allow_env or ())
@@ -278,30 +351,45 @@ def make_handler(popen, which, environ, cwd):
         if plan["host"] is not None and plan["host"].lower() != host:
             raise ShitError(REJECTED)
         plan = {**plan, "host": host}
-        path = check_gh_path(args.gh) if args.gh is not None else which("gh", path=environ.get("PATH"))
-        if path is None:
-            raise _cli.CodedError(_cli.TOOL_UNAVAILABLE)
-        return execute(plan, Gh(path, popen, child_env(environ, host, allow)))
+        config_dir = check_config_dir(args.gh_config_dir) if args.gh_config_dir is not None else None
+        fd = None
+        if args.gh is not None:
+            path, fd = open_gh(args.gh)
+        else:
+            path = which("gh", path=environ.get("PATH"))
+        try:
+            if path is None:
+                raise _cli.CodedError(_cli.TOOL_UNAVAILABLE)
+            with tempfile.TemporaryDirectory(prefix="shit-threads-", dir=tmpdir) as root:
+                env = child_env(environ, host, allow, private_env(root, config_dir))
+                # No /proc: the path itself is used and the race on it is a documented residual.
+                use_fd = fd if os.path.isdir("/proc/self/fd") else None
+                return execute(plan, Gh(path, popen, env, use_fd))
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     return handler
 
 
-def build(popen, which, environ, cwd):
+def build(popen, which, environ, cwd, tmpdir=None):
     parser = _cli.SafeParser(prog="threads_run")
     parser.add_argument("--config", default=None, help="configuration file whose [tracker] host is trusted "
                         "(default: none, so github.com)")
     parser.add_argument("--gh", default=None, help="absolute path of the gh program (default: first on PATH)")
+    parser.add_argument("--gh-config-dir", default=None, help="absolute path of a gh configuration directory you own "
+                        "(mode 0700) to use instead of an empty private one")
     parser.add_argument("--allow-env", action="append", type=allow_name, default=None, metavar="NAME",
                         help="pass one proxy, certificate or gh settings variable (repeatable; never a token)")
     parser.add_argument("plan", help="plan file from `shit threads`, below the working directory")
-    parser.set_defaults(func=make_handler(popen, which, environ, cwd))
+    parser.set_defaults(func=make_handler(popen, which, environ, cwd, tmpdir))
     return parser
 
 
-def main(argv=None, popen=subprocess.Popen, which=shutil.which, environ=None, cwd=None):
+def main(argv=None, popen=subprocess.Popen, which=shutil.which, environ=None, cwd=None, tmpdir=None):
     environ = os.environ if environ is None else environ
     args = sys.argv[1:] if argv is None else argv
-    return _cli.run(lambda: build(popen, which, environ, cwd), args)
+    return _cli.run(lambda: build(popen, which, environ, cwd, tmpdir), args)
 
 
 if __name__ == "__main__":
