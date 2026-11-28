@@ -16,7 +16,7 @@ The dependency graph, durable queue and per-task leases are implemented in `shit
 
 ## Review threads
 
-`shit threads` lists the unresolved review threads of a pull request and applies replies and resolutions from a strict dispositions file, for any repository and pull request, through the GitHub CLI. See [docs/threads.md](docs/threads.md).
+`shit threads` validates a strict dispositions file and prints the exact `gh api` request plan for listing, replying to and resolving the review threads of any pull request; it never starts a process. A small launcher, `scripts/threads_run.py`, sits outside the package and runs the plan with the GitHub CLI when you run it yourself. See [docs/threads.md](docs/threads.md).
 
 ## Contributing
 

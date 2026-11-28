@@ -15,7 +15,7 @@ name = "<project name>"
 # Issue tracker reference as owner/repo. Used to build issue lines in briefs and reports.
 # Default: none, required.
 repository = "<owner/repo>"
-# Optional. Host name of the code host that `shit threads` talks to, for a self-hosted server (no scheme,
+# Optional. Host name of the code host that `shit threads` plans requests for, for a self-hosted server (no scheme,
 # no port, no path). Default when absent: the GitHub CLI's own default host.
 # host = "git.example.org"
 

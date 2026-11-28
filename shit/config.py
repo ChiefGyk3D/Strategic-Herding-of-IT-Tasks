@@ -178,6 +178,11 @@ def parse(text):
     return out
 
 
+def check_host(value):
+    """Validate a `[tracker] host` value on its own (used when a request plan carries the host)."""
+    return _check_value("host", value)
+
+
 def read(path, base=None):
     """Read at most MAX_BYTES + 1 bytes from a regular file (no symlink, no FIFO) and validate it."""
     data = read_bounded(path, MAX_BYTES, base)

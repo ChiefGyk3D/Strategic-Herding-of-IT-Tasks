@@ -1,14 +1,14 @@
-"""Tests for the review-thread tool (issue 55): list, then reply and resolve from a dispositions file.
+"""Tests for the review-thread plan builder (issue 55): `shit threads list|apply` prints a request plan as data.
 
 Run: python3 -m unittest discover -s tests -v
 
-The GitHub CLI is replaced by a fake runner, so no test touches the network. Each refusal has an accepted
-twin, and the "nothing written" rule is checked by counting the write calls the fake saw.
+shit/threads.py never starts a process (H-29d in test_hostile.py); the launcher that does is tested in
+test_threads_run.py. Each refusal here has an accepted twin, and "nothing is printed on refusal" is checked.
 Exit codes are the shared table in docs/exit-codes.md.
 """
 
+import copy
 import json
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,9 +17,9 @@ import _bootstrap  # noqa: F401  (puts the repository root on sys.path)
 from _helpers import run_main
 
 from shit import config, records, threads
+from shit.errors import ShitError
 
 REPO = "example-owner/example-repo"
-GH = "/fake/bin/gh"
 
 
 def node(thread_id="T1", comment_id=101, path="a.py", line=3, body="please fix", resolved=False, outdated=False,
@@ -39,35 +39,6 @@ def page(nodes, more=False, cursor="c1"):
     return {"data": {"repository": {"pullRequest": {"reviewThreads": block}}}}
 
 
-RESOLVED_OK = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
-
-
-class FakeGh:
-    """Scripted stand-in for subprocess.run. `pages` answers the thread query in order."""
-
-    def __init__(self, pages=None, reply_rc=0, resolve=None, read_rc=0, raw=None):
-        self.pages = list(pages if pages is not None else [page([node()])])
-        self.reply_rc = reply_rc
-        self.resolve = RESOLVED_OK if resolve is None else resolve
-        self.read_rc = read_rc
-        self.raw = raw
-        self.calls = []
-
-    def __call__(self, argv, **kwargs):
-        self.calls.append((list(argv), kwargs))
-        text = " ".join(argv)
-        if "-X POST" in text:
-            return subprocess.CompletedProcess(argv, self.reply_rc, "{}", "stderr-secret-text")
-        if "resolveReviewThread" in text:
-            return subprocess.CompletedProcess(argv, 0, json.dumps(self.resolve), "")
-        if self.raw is not None:
-            return subprocess.CompletedProcess(argv, self.read_rc, self.raw, "")
-        return subprocess.CompletedProcess(argv, self.read_rc, json.dumps(self.pages.pop(0)), "")
-
-    def writes(self):
-        return [c for c in self.calls if "-X POST" in " ".join(c[0]) or "resolveReviewThread" in " ".join(c[0])]
-
-
 class Case(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -75,216 +46,113 @@ class Case(unittest.TestCase):
         self.dir = Path(self._tmp.name).resolve()
 
     def file(self, rows, name="disp.json"):
-        path = self.dir / name
-        path.write_text(rows if isinstance(rows, str) else json.dumps(rows), encoding="utf-8")
+        (self.dir / name).write_text(rows if isinstance(rows, str) else json.dumps(rows), encoding="utf-8")
         return name
 
-    def go(self, argv, fake, gh=GH):
-        return run_main(lambda a: threads.main(a, runner=fake, gh_path=gh, cwd=self.dir), argv)
-
-
-class ListTests(Case):
-    def test_lists_unresolved_current_threads_grouped_by_file(self):
-        fake = FakeGh([page([
-            node("T1", 101, "b.py", 7, "second"),
-            node("T2", 102, "a.py", 3, "first"),
-            node("T3", 103, "a.py", 4, "done", resolved=True),
-            node("T4", 104, "a.py", 5, "old", outdated=True),
-        ])])
-        code, out, err = self.go(["threads", "list", REPO, "9"], fake)
-        self.assertEqual((code, err), (0, ""))
-        lines = out.splitlines()
-        self.assertEqual(lines[0], "a.py")
-        self.assertIn("102 a.py:3 reviewer-one: first", lines[1])
-        self.assertEqual(lines[2], "b.py")
-        self.assertNotIn("103", out)
-        self.assertNotIn("104", out)
-        self.assertEqual(lines[-1], f"2 unresolved thread(s) on {REPO}#9")
-        self.assertEqual(fake.writes(), [])
-
-    def test_empty_list_is_success(self):
-        code, out, _ = self.go(["threads", "list", REPO, "9"], FakeGh([page([])]))
-        self.assertEqual(code, 0)
-        self.assertIn("no unresolved threads", out)
-
-    def test_follows_pages(self):
-        fake = FakeGh([page([node("T1", 101)], more=True, cursor="next"), page([node("T2", 102, "z.py")])])
-        code, out, _ = self.go(["threads", "list", REPO, "9"], fake)
-        self.assertEqual(code, 0)
-        self.assertIn("101", out)
-        self.assertIn("102", out)
-        self.assertIn("cursor=next", " ".join(fake.calls[1][0]))
-
-    def test_page_cap_is_refused_not_cut(self):
-        fake = FakeGh([page([node("T1", 101)], more=True, cursor="n")] * (threads.MAX_PAGES + 1))
-        code, out, _ = self.go(["threads", "list", REPO, "9"], fake)
-        self.assertEqual(code, 8)
-        self.assertEqual(out, "")
-
-    def test_body_is_one_line_cut_and_escaped(self):
-        body = "line one\nline two\x1b[31m red " + "x" * 400
-        code, out, _ = self.go(["threads", "list", REPO, "9"], FakeGh([page([node(body=body)])]))
-        self.assertEqual(code, 0)
-        self.assertNotIn("\x1b", out)
-        self.assertEqual(len(out.splitlines()), 3)
-        self.assertLessEqual(len(out.splitlines()[1]), 400)
-
-    def test_bidi_and_zero_width_are_escaped(self):
-        body = "a" + chr(0x202E) + "b" + chr(0x200B) + "c"
-        _, out, _ = self.go(["threads", "list", REPO, "9"], FakeGh([page([node(body=body)])]))
-        self.assertNotIn(chr(0x202E), out)
-        self.assertNotIn(chr(0x200B), out)
-
-    def test_bad_answer_shape_fails_closed(self):
-        for pages in ([{"data": {}}], [{"errors": [{"message": "x"}]}], [page([node(comment_id=True)])],
-                      [page([node(comment_id=0)])], [page([node(thread_id="bad id!")])]):
-            with self.subTest(pages=str(pages)[:40]):
-                code, _, _ = self.go(["threads", "list", REPO, "9"], FakeGh(pages))
-                self.assertEqual(code, 8)
-
-    def test_unreadable_json_and_duplicate_keys_fail_closed(self):
-        for raw in ("not json", '{"data": 1, "data": 2}', ""):
-            with self.subTest(raw=raw):
-                code, _, _ = self.go(["threads", "list", REPO, "9"], FakeGh(raw=raw))
-                self.assertEqual(code, 8)
-
-    def test_gh_failure_is_closed_and_stderr_is_not_shown(self):
-        code, out, err = self.go(["threads", "list", REPO, "9"], FakeGh(read_rc=1, raw="{}"))
-        self.assertEqual(code, 8)
-        self.assertNotIn("stderr-secret-text", out + err)
-
-    def test_missing_gh_is_tool_unavailable(self):
-        code, _, _ = self.go(["threads", "list", REPO, "9"], FakeGh(), gh=None)
-        self.assertEqual(code, 11)
-
-    def test_runner_that_cannot_start_is_tool_unavailable(self):
-        def boom(argv, **kw):
-            raise FileNotFoundError("gh")
-
-        code, _, _ = self.go(["threads", "list", REPO, "9"], boom)
-        self.assertEqual(code, 11)
-
-    def test_timeout_is_tool_unavailable(self):
-        def slow(argv, **kw):
-            raise subprocess.TimeoutExpired(argv, 1)
-
-        code, _, _ = self.go(["threads", "list", REPO, "9"], slow)
-        self.assertEqual(code, 11)
-
-    def test_call_is_bounded_and_has_no_shell_and_no_stdin(self):
-        fake = FakeGh()
-        self.go(["threads", "list", REPO, "9"], fake)
-        argv, kwargs = fake.calls[0]
-        self.assertEqual(argv[0], GH)
-        self.assertIsInstance(argv, list)
-        self.assertFalse(kwargs.get("shell", False))
-        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
-        self.assertEqual(kwargs["timeout"], threads.CALL_TIMEOUT)
-        self.assertIs(kwargs["check"], False)
-
-    def test_usage_errors(self):
-        for argv in (["threads", "list", "noslash", "9"], ["threads", "list", REPO, "0"],
-                     ["threads", "list", REPO, "-3"], ["threads", "list", "../x/y", "9"],
-                     ["threads", "list", "a/b;rm", "9"], ["threads", "list", REPO],
-                     ["threads", "list", REPO, "x"], ["threads", "apply", REPO, "9"]):
-            with self.subTest(argv=argv):
-                fake = FakeGh()
-                code, out, err = self.go(argv, fake)
-                self.assertEqual(code, 2)
-                self.assertEqual(fake.calls, [])
-                self.assertNotIn("noslash", out + err)
-
-
-class HostTests(Case):
-    def conf(self, extra=""):
-        path = self.dir / "config.toml"
+    def conf(self, extra="", name="config.toml"):
         text = (
             "schema_version = 1\n[project]\nname = \"p\"\n[tracker]\nrepository = \"o/r\"\n" + extra +
             "[review]\ndestination = \"reviewer\"\n[storage]\nroot = \".shit\"\n"
             "[log]\nfile = \".shit/events.jsonl\"\n[local_model]\ncontext_tokens = 32768\n"
         )
-        path.write_text(text, encoding="utf-8")
-        return "config.toml"
+        (self.dir / name).write_text(text, encoding="utf-8")
+        return name
 
-    def test_no_config_passes_no_hostname(self):
-        fake = FakeGh()
-        self.go(["threads", "list", REPO, "9"], fake)
-        self.assertNotIn("--hostname", fake.calls[0][0])
+    def go(self, argv):
+        return run_main(lambda a: threads.main(a, cwd=self.dir), ["threads", *argv])
 
+    def plan(self, argv):
+        code, out, err = self.go(argv)
+        self.assertEqual((code, err), (0, ""), argv)
+        self.assertEqual(len(out.splitlines()), 1)
+        return json.loads(out)
+
+
+class ListPlanTests(Case):
+    def test_list_plan_is_one_read_request(self):
+        plan = self.plan(["list", REPO, "9"])
+        self.assertEqual(plan["kind"], "list")
+        self.assertEqual((plan["repo"], plan["pr"], plan["host"]), (REPO, 9, None))
+        (request,) = plan["requests"]
+        self.assertEqual(request["op"], "read_threads")
+        self.assertEqual(request["fields"], {"owner": "example-owner", "name": "example-repo", "number": 9})
+        self.assertEqual(request["query"], threads.QUERY)
+
+    def test_usage_errors_print_nothing_and_name_nothing(self):
+        for argv in (["list", "noslash", "9"], ["list", REPO, "0"], ["list", REPO, "-3"], ["list", "../x/y", "9"],
+                     ["list", "a/b;rm", "9"], ["list", REPO], ["list", REPO, "x"], ["apply", REPO, "9"], ["bogus"]):
+            with self.subTest(argv=argv):
+                code, out, err = self.go(argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertNotIn("noslash", err)
+
+    def test_no_token_or_credential_is_in_a_plan(self):
+        text = self.go(["list", REPO, "9"])[1].lower()
+        for word in ("token", "authorization", "password", "secret"):
+            self.assertNotIn(word, text)
+
+
+class HostTests(Case):
     def test_host_comes_from_configuration(self):
-        fake = FakeGh()
-        code, _, _ = self.go(["threads", "--config", self.conf('host = "git.example.org"\n'), "list", REPO, "9"],
-                             fake)
-        self.assertEqual(code, 0)
-        argv = fake.calls[0][0]
-        self.assertEqual(argv[argv.index("--hostname") + 1], "git.example.org")
+        plan = self.plan(["--config", self.conf('host = "git.example.org"\n'), "list", REPO, "9"])
+        self.assertEqual(plan["host"], "git.example.org")
 
-    def test_config_without_host_passes_no_hostname(self):
-        fake = FakeGh()
-        self.go(["threads", "--config", self.conf(), "list", REPO, "9"], fake)
-        self.assertNotIn("--hostname", fake.calls[0][0])
+    def test_config_without_host_has_no_host(self):
+        self.assertIsNone(self.plan(["--config", self.conf(), "list", REPO, "9"])["host"])
 
-    def test_bad_host_in_config_is_rejected_by_the_config_contract(self):
-        for bad in ("a b", "-x.example", "x/../y", "host:99999999", "", "<host>", "ex ample.org"):
+    def test_no_config_has_no_host(self):
+        self.assertIsNone(self.plan(["list", REPO, "9"])["host"])
+
+    def test_bad_host_is_rejected_by_the_config_contract(self):
+        for bad in ("a b", "-x.example", "x/../y", "host:99999999", "", "<host>", "ex ample.org", "http://x.example"):
             with self.subTest(bad=bad):
                 text = (self.dir / self.conf()).read_text().replace("[review]", f'host = "{bad}"\n[review]')
                 with self.assertRaises(Exception) as ctx:
                     config.parse(text)
                 self.assertEqual(getattr(ctx.exception, "code", None), 3)
 
-    def test_unreadable_config_is_refused_before_any_call(self):
-        fake = FakeGh()
+    def test_unreadable_config_is_refused(self):
         (self.dir / "bad.toml").write_text("schema_version = ", encoding="utf-8")
-        code, _, _ = self.go(["threads", "--config", "bad.toml", "list", REPO, "9"], fake)
-        self.assertEqual(code, 3)
-        self.assertEqual(fake.calls, [])
-        code, _, _ = self.go(["threads", "--config", "missing.toml", "list", REPO, "9"], fake)
-        self.assertEqual(code, 9)
-        self.assertEqual(fake.calls, [])
+        for name, want in (("bad.toml", 3), ("missing.toml", 9), ("../x.toml", 5)):
+            with self.subTest(name=name):
+                code, out, _ = self.go(["--config", name, "list", REPO, "9"])
+                self.assertEqual((code, out), (want, ""))
 
-    def test_host_applies_to_writes_too(self):
-        fake = FakeGh([page([node("T1", 101)])])
+    def test_host_is_in_every_request_argument_list(self):
         name = self.file([{"comment_id": 101, "action": "reply_resolve", "body": "done"}])
-        code, _, _ = self.go(["threads", "--config", self.conf('host = "git.example.org"\n'), "apply", REPO, "9",
-                              name], fake)
-        self.assertEqual(code, 0)
-        for argv, _ in fake.calls:
-            self.assertIn("--hostname", argv)
+        plan = self.plan(["--config", self.conf('host = "git.example.org"\n'), "apply", REPO, "9", name])
+        for request in plan["requests"]:
+            args = threads.request_args(plan, request, thread_id="T1")
+            self.assertEqual(args[args.index("--hostname") + 1], "git.example.org")
 
 
-class ApplyTests(Case):
-    def apply(self, rows, fake=None, **kw):
-        fake = fake or FakeGh([page([node("T1", 101), node("T2", 102, "b.py")])])
-        name = self.file(rows, **kw)
-        code, out, err = self.go(["threads", "apply", REPO, "9", name], fake)
-        return code, out, err, fake
+class ApplyPlanTests(Case):
+    def apply(self, rows, **kw):
+        return self.go(["apply", REPO, "9", self.file(rows, **kw)])
 
-    def test_reply_resolve_and_skip_are_carried_out_in_order(self):
+    def test_replies_come_before_resolves_and_skips_are_dropped(self):
         rows = [
             {"comment_id": 101, "action": "reply_resolve", "body": "Fixed."},
             {"comment_id": 102, "action": "skip"},
+            {"comment_id": 103, "action": "reply", "body": "Kept on purpose."},
+            {"comment_id": 104, "action": "reply_resolve", "body": "Done."},
         ]
-        code, out, err, fake = self.apply(rows)
-        self.assertEqual((code, err), (0, ""))
-        self.assertEqual(out.splitlines(), ["replied 101", "resolved 101", "skip 102"])
-        writes = fake.writes()
-        self.assertEqual(len(writes), 2)
-        self.assertIn(f"repos/{REPO}/pulls/9/comments/101/replies", writes[0][0])
-        self.assertIn("body=Fixed.", writes[0][0])
-        self.assertIn("id=T1", writes[1][0])
+        plan = self.plan(["apply", REPO, "9", self.file(rows)])
+        ops = [(r["op"], r.get("comment_id")) for r in plan["requests"]]
+        self.assertEqual(ops, [("read_threads", None), ("reply", 101), ("reply", 103), ("reply", 104),
+                               ("resolve", 101), ("resolve", 104)])
+        reply = plan["requests"][1]
+        self.assertEqual(reply["endpoint"], f"repos/{REPO}/pulls/9/comments/101/replies")
+        self.assertEqual(reply["method"], "POST")
+        self.assertEqual(reply["fields"], {"body": "Fixed."})
+        self.assertEqual(plan["requests"][4]["query"], threads.MUTATION)
 
-    def test_reply_only_does_not_resolve(self):
-        code, out, _, fake = self.apply([{"comment_id": 101, "action": "reply", "body": "Kept on purpose."}])
-        self.assertEqual(code, 0)
-        self.assertEqual(len(fake.writes()), 1)
-        self.assertNotIn("resolved", out)
+    def test_all_skip_plan_has_only_the_read(self):
+        plan = self.plan(["apply", REPO, "9", self.file([{"comment_id": 5, "action": "skip"}])])
+        self.assertEqual([r["op"] for r in plan["requests"]], ["read_threads"])
 
-    def test_body_cannot_be_read_as_an_option(self):
-        _, _, _, fake = self.apply([{"comment_id": 101, "action": "reply", "body": "-X DELETE"}])
-        argv = fake.writes()[0][0]
-        self.assertEqual(argv[argv.index("-f") + 1], "body=-X DELETE")
-
-    def test_every_bad_file_writes_nothing(self):
+    def test_every_bad_file_prints_nothing(self):
         good = {"comment_id": 101, "action": "reply", "body": "ok"}
         cases = {
             "not a list": {"comment_id": 101},
@@ -301,122 +169,210 @@ class ApplyTests(Case):
             "body not text": [good, {"comment_id": 102, "action": "reply", "body": 5}],
             "skip with body": [good, {"comment_id": 102, "action": "skip", "body": "x"}],
             "nul body": [good, {"comment_id": 102, "action": "reply", "body": "a\x00b"}],
+            "tab body": [good, {"comment_id": 102, "action": "reply", "body": "a\tb"}],
+            "bidi body": [good, {"comment_id": 102, "action": "reply", "body": "a" + chr(0x202E) + "b"}],
             "long body": [good, {"comment_id": 102, "action": "reply", "body": "x" * (threads.MAX_BODY + 1)}],
             "repeat id": [good, {"comment_id": 101, "action": "skip"}],
-            "unknown thread": [good, {"comment_id": 999, "action": "skip"}],
             "too many": [{"comment_id": n, "action": "skip"} for n in range(1, threads.MAX_ITEMS + 2)],
         }
         for label, rows in cases.items():
             with self.subTest(label):
-                code, out, _, fake = self.apply(rows)
-                self.assertIn(code, (3, 9), label)
-                self.assertEqual(fake.writes(), [], label)
-                self.assertEqual(out, "")
+                code, out, _ = self.apply(rows)
+                self.assertEqual((code, out), (3, ""), label)
 
-    def test_unknown_thread_is_precondition_missing(self):
-        code, _, _, fake = self.apply([{"comment_id": 999, "action": "skip"}])
-        self.assertEqual(code, 9)
-        self.assertEqual(fake.writes(), [])
-
-    def test_resolved_or_outdated_thread_is_not_a_target(self):
-        fake = FakeGh([page([node("T1", 101, resolved=True), node("T2", 102, outdated=True)])])
-        code, _, _, fake = self.apply([{"comment_id": 101, "action": "reply", "body": "x"}], fake)
-        self.assertEqual(code, 9)
-        self.assertEqual(fake.writes(), [])
+    def test_a_body_at_the_limit_and_a_newline_are_accepted(self):
+        code, _, _ = self.apply([{"comment_id": 1, "action": "reply", "body": "a\n" + "x" * (threads.MAX_BODY - 2)}])
+        self.assertEqual(code, 0)
 
     def test_lone_surrogate_in_body_is_refused(self):
-        raw = '[{"comment_id": 101, "action": "reply", "body": "a\\ud800b"}]'
-        code, _, _, fake = self.apply(raw)
-        self.assertEqual(code, 3)
-        self.assertEqual(fake.writes(), [])
+        code, out, _ = self.apply('[{"comment_id": 101, "action": "reply", "body": "a\\ud800b"}]')
+        self.assertEqual((code, out), (3, ""))
 
     def test_hostile_json_is_refused(self):
         for raw in ('[{"comment_id": 101, "comment_id": 101, "action": "skip"}]', "[NaN]", "﻿[]",
                     "[" * 20 + "]" * 20, "not json", "\xff"):
             with self.subTest(raw=raw[:20]):
-                code, _, _, fake = self.apply(raw)
+                code, out, _ = self.apply(raw)
                 self.assertIn(code, (3, 7))
-                self.assertEqual(fake.writes(), [])
+                self.assertEqual(out, "")
 
     def test_oversize_file_is_input_limit(self):
-        big = json.dumps([{"comment_id": 101, "action": "reply", "body": "x" * 100}] * 2) + " " * threads.FILE_LIMIT
-        code, _, _, fake = self.apply(big)
-        self.assertEqual(code, 7)
-        self.assertEqual(fake.calls, [])
+        big = json.dumps([{"comment_id": 1, "action": "skip"}]) + " " * threads.FILE_LIMIT
+        self.assertEqual(self.apply(big)[0], 7)
 
     def test_file_must_be_a_regular_file_below_the_base(self):
-        fake = FakeGh()
-        outside = self.dir.parent / "elsewhere.json"
-        for arg in ("missing.json", "../elsewhere.json", str(outside), "sub"):
-            with self.subTest(arg=arg):
-                (self.dir / "sub").mkdir(exist_ok=True)
-                code, _, _ = self.go(["threads", "apply", REPO, "9", arg], fake)
-                self.assertIn(code, (5, 9))
-                self.assertEqual(fake.calls, [])
+        (self.dir / "sub").mkdir()
         real = self.dir / "real.json"
         real.write_text("[]", encoding="utf-8")
         (self.dir / "link.json").symlink_to(real)
-        code, _, _ = self.go(["threads", "apply", REPO, "9", "link.json"], fake)
-        self.assertEqual(code, 5)
-        self.assertEqual(fake.calls, [])
+        for arg, want in (("missing.json", 9), ("../elsewhere.json", 5), ("/etc/hostname", 5), ("sub", 5),
+                          ("link.json", 5)):
+            with self.subTest(arg=arg):
+                code, out, _ = self.go(["apply", REPO, "9", arg])
+                self.assertEqual((code, out), (want, ""))
 
-    def test_first_failed_reply_stops_and_is_not_retried(self):
-        rows = [{"comment_id": 101, "action": "reply", "body": "a"}, {"comment_id": 102, "action": "reply", "body": "b"}]
-        code, out, err, fake = self.apply(rows, FakeGh([page([node("T1", 101), node("T2", 102)])], reply_rc=1))
-        self.assertEqual(code, 8)
-        self.assertEqual(len(fake.writes()), 1)
-        self.assertIn("0 of 2 done", out)
-        self.assertNotIn("stderr-secret-text", out + err)
 
-    def test_failed_second_reply_keeps_first_and_reports_count(self):
-        class Flaky(FakeGh):
-            def __call__(self, argv, **kw):
-                if "-X POST" in " ".join(argv) and len([c for c in self.calls if "-X POST" in " ".join(c[0])]) == 1:
-                    self.calls.append((list(argv), kw))
-                    return subprocess.CompletedProcess(argv, 1, "", "")
-                return super().__call__(argv, **kw)
+class PageTests(unittest.TestCase):
+    def test_unresolved_current_threads_only(self):
+        found, more, cursor = threads.parse_page(page([
+            node("T1", 101), node("T2", 102, resolved=True), node("T3", 103, outdated=True),
+        ], more=True, cursor="next"))
+        self.assertEqual([t["comment_id"] for t in found], [101])
+        self.assertEqual((more, cursor), (True, "next"))
 
-        rows = [{"comment_id": 101, "action": "reply", "body": "a"}, {"comment_id": 102, "action": "reply", "body": "b"}]
-        code, out, _, _ = self.apply(rows, Flaky([page([node("T1", 101), node("T2", 102)])]))
-        self.assertEqual(code, 8)
-        self.assertIn("replied 101", out)
-        self.assertIn("1 of 2 done", out)
+    def test_bad_answer_shape_fails_closed(self):
+        for data in ({"data": {}}, {"errors": [{"message": "x"}]}, page([node(comment_id=True)]),
+                     page([node(comment_id=0)]), page([node(thread_id="bad id!")]),
+                     page([], more="yes"), page([], more=True, cursor=""), [], "x"):
+            with self.subTest(data=str(data)[:40]):
+                with self.assertRaises(Exception) as ctx:
+                    threads.parse_page(data)
+                self.assertEqual(ctx.exception.code, 8)
 
-    def test_resolve_must_report_resolved(self):
-        for answer in ({"data": {"resolveReviewThread": {"thread": {"isResolved": False}}}},
-                       {"errors": [{"message": "x"}], "data": {"resolveReviewThread": {"thread": {"isResolved": True}}}},
-                       {"data": None}, {}, {"data": {"resolveReviewThread": {"thread": {"isResolved": "true"}}}}):
-            with self.subTest(answer=str(answer)[:50]):
-                rows = [{"comment_id": 101, "action": "reply_resolve", "body": "a"},
-                        {"comment_id": 102, "action": "reply", "body": "b"}]
-                code, out, _, fake = self.apply(rows, FakeGh([page([node("T1", 101), node("T2", 102)])],
-                                                             resolve=answer))
-                self.assertEqual(code, 8)
-                self.assertIn("replied 101", out)
-                self.assertEqual(len(fake.writes()), 2)  # reply + resolve attempt; the second row never ran
+    def test_read_answer_is_strict(self):
+        self.assertEqual(threads.read_answer('{"a": 1}'), {"a": 1})
+        for raw in ("not json", '{"a": 1, "a": 2}', "", "[NaN]"):
+            with self.subTest(raw=raw):
+                with self.assertRaises(Exception) as ctx:
+                    threads.read_answer(raw)
+                self.assertEqual(ctx.exception.code, 8)
 
-    def test_resolve_is_only_after_an_accepted_reply(self):
-        _, _, _, fake = self.apply([{"comment_id": 101, "action": "reply_resolve", "body": "a"}],
-                                   FakeGh([page([node("T1", 101)])], reply_rc=1))
-        self.assertEqual(len(fake.writes()), 1)
-        self.assertNotIn("resolveReviewThread", " ".join(fake.writes()[0][0]))
+    def test_check_targets(self):
+        found = threads.parse_page(page([node("T1", 101)]))[0]
+        threads.check_targets(found, [101])
+        with self.assertRaises(Exception) as ctx:
+            threads.check_targets(found, [101, 999])
+        self.assertEqual(ctx.exception.code, 9)
 
-    def test_no_token_is_read_or_passed(self):
-        _, _, _, fake = self.apply([{"comment_id": 101, "action": "skip"}])
-        for argv, _kw in fake.calls:
-            self.assertFalse(any("token" in a.lower() for a in argv))
+    def test_list_lines_are_grouped_one_line_cut_and_escaped(self):
+        body = "line one\nline two\x1b[31m red " + chr(0x202E) + chr(0x200B) + "x" * 400
+        found = threads.parse_page(page([node("T1", 1, "b.py", 7, body), node("T2", 2, "a.py", 3, "first")]))[0]
+        lines = threads.format_list(found, REPO, 9)
+        self.assertEqual(lines[0], "a.py")
+        self.assertEqual(lines[2], "b.py")
+        self.assertEqual(lines[-1], f"2 unresolved thread(s) on {REPO}#9")
+        text = "\n".join(lines)
+        for bad in ("\x1b", chr(0x202E), chr(0x200B)):
+            self.assertNotIn(bad, text)
+        self.assertEqual(len(lines), 5)
+        self.assertLessEqual(len(lines[3]), 400)
+
+    def test_empty_list_line(self):
+        self.assertEqual(threads.format_list([], REPO, 9), [f"no unresolved threads on {REPO}#9"])
+
+
+class PlanValidationTests(Case):
+    def good(self):
+        rows = [{"comment_id": 101, "action": "reply_resolve", "body": "Fixed."},
+                {"comment_id": 102, "action": "reply", "body": "Kept."}]
+        return self.plan(["apply", REPO, "9", self.file(rows)])
+
+    def check(self, plan):
+        return threads.parse_plan(json.dumps(plan).encode())
+
+    def refused(self, plan, code=3):
+        with self.assertRaises(Exception) as ctx:
+            self.check(plan)
+        self.assertEqual(ctx.exception.code, code)
+
+    def test_a_printed_plan_is_accepted(self):
+        plan = self.good()
+        self.assertEqual(self.check(plan), plan)
+        self.assertEqual(self.check(self.plan(["list", REPO, "9"]))["kind"], "list")
+
+    def test_every_tamper_is_refused(self):
+        def mut(fn):
+            plan = copy.deepcopy(self.good())
+            fn(plan)
+            return plan
+
+        tampers = {
+            "extra top key": lambda p: p.update(extra=1),
+            "missing key": lambda p: p.pop("host"),
+            "schema": lambda p: p.update(schema="other"),
+            "version": lambda p: p.update(schema_version=2),
+            "kind": lambda p: p.update(kind="delete"),
+            "list kind with replies": lambda p: p.update(kind="list"),
+            "repo": lambda p: p.update(repo="a/b;rm"),
+            "repo dots": lambda p: p.update(repo="../x"),
+            "pr zero": lambda p: p.update(pr=0),
+            "pr bool": lambda p: p.update(pr=True),
+            "host bad": lambda p: p.update(host="a b"),
+            "host not text": lambda p: p.update(host=5),
+            "endpoint": lambda p: p["requests"][1].update(endpoint="repos/other/x/pulls/1/comments/101/replies"),
+            "endpoint mismatch id": lambda p: p["requests"][1].update(comment_id=999),
+            "method": lambda p: p["requests"][1].update(method="DELETE"),
+            "query text": lambda p: p["requests"][0].update(query=threads.QUERY + " "),
+            "mutation text": lambda p: p["requests"][3].update(query="mutation{deleteRepository}"),
+            "read fields": lambda p: p["requests"][0]["fields"].update(owner="someone"),
+            "extra request key": lambda p: p["requests"][1].update(extra=1),
+            "reply extra field": lambda p: p["requests"][1]["fields"].update(label="x"),
+            "unknown op": lambda p: p["requests"][1].update(op="delete"),
+            "resolve without reply": lambda p: p["requests"].append(
+                {"op": "resolve", "method": "POST", "endpoint": "graphql", "query": threads.MUTATION,
+                 "comment_id": 555, "fields": {}}),
+            "resolve before reply": lambda p: p["requests"].insert(1, p["requests"].pop(3)),
+            "body tab": lambda p: p["requests"][1]["fields"].update(body="a\tb"),
+            "empty body": lambda p: p["requests"][1]["fields"].update(body=" "),
+            "no requests": lambda p: p.update(requests=[]),
+            "requests not list": lambda p: p.update(requests="x"),
+            "first not read": lambda p: p["requests"].pop(0),
+        }
+        for label, fn in tampers.items():
+            with self.subTest(label):
+                self.refused(mut(fn))
+
+    def test_hostile_json_and_size(self):
+        for raw in (b"[]", b"not json", b'{"a":1,"a":2}', b"\xef\xbb\xbf{}", b"[" * 30 + b"]" * 30):
+            with self.subTest(raw=raw[:12]):
+                with self.assertRaises(Exception) as ctx:
+                    threads.parse_plan(raw)
+                self.assertIn(ctx.exception.code, (3, 7))
+        with self.assertRaises(Exception) as ctx:
+            threads.parse_plan(b" " * (threads.PLAN_LIMIT + 1))
+        self.assertEqual(ctx.exception.code, 7)
+
+
+class RequestArgsTests(Case):
+    def test_body_is_a_field_value_never_an_option(self):
+        plan = self.plan(["apply", REPO, "9", self.file([{"comment_id": 1, "action": "reply", "body": "-X DELETE"}])])
+        args = threads.request_args(plan, plan["requests"][1])
+        self.assertEqual(args[args.index("-f") + 1], "body=-X DELETE")
+        self.assertEqual(args[:2], ["api", "-X"])
+
+    def test_resolve_needs_a_clean_thread_id(self):
+        plan = self.plan(["apply", REPO, "9", self.file([{"comment_id": 1, "action": "reply_resolve", "body": "x"}])])
+        resolve = plan["requests"][2]
+        self.assertIn("id=T1", threads.request_args(plan, resolve, thread_id="T1"))
+        for bad in (None, "", "a b", "x;y", 5):
+            with self.subTest(bad=bad), self.assertRaises(ShitError):
+                threads.request_args(plan, resolve, thread_id=bad)
+
+    def test_cursor_is_added_only_after_the_first_page(self):
+        plan = self.plan(["list", REPO, "9"])
+        self.assertNotIn("cursor=n1", threads.request_args(plan, plan["requests"][0]))
+        self.assertIn("cursor=n1", threads.request_args(plan, plan["requests"][0], cursor="n1"))
+
+    def test_resolved_ok_requires_true_and_no_errors(self):
+        ok = {"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}
+        self.assertTrue(threads.resolved_ok(ok))
+        for bad in ({"data": {"resolveReviewThread": {"thread": {"isResolved": False}}}},
+                    {**ok, "errors": [{"message": "x"}]}, {"data": None}, {},
+                    {"data": {"resolveReviewThread": {"thread": {"isResolved": "true"}}}}, []):
+            with self.subTest(bad=str(bad)[:40]):
+                self.assertFalse(threads.resolved_ok(bad))
 
 
 class ParseValueTests(unittest.TestCase):
-    """records.parse_value: strict JSON of any top-level type, used for the dispositions file and gh answers."""
+    """records.parse_value: strict JSON of any top-level type, used for the dispositions file and plans."""
 
     def test_accepts_list_and_respects_depth_and_size(self):
         self.assertEqual(records.parse_value(b'[{"a": 1}]', limit=100, max_depth=2), [{"a": 1}])
         with self.assertRaises(Exception) as ctx:
-            records.parse_value(b'[[[1]]]', limit=100, max_depth=2)
+            records.parse_value(b"[[[1]]]", limit=100, max_depth=2)
         self.assertEqual(ctx.exception.code, 7)
         with self.assertRaises(Exception) as ctx:
-            records.parse_value(b'[1, 2, 3]', limit=3, max_depth=2)
+            records.parse_value(b"[1, 2, 3]", limit=3, max_depth=2)
         self.assertEqual(ctx.exception.code, 7)
 
     def test_refuses_duplicates_constants_bom_and_surrogates(self):
