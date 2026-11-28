@@ -39,9 +39,11 @@ mode-0700 directory made for this run and removed afterwards. Your own HOME is n
 of yours (hosts, `api_host`, `http_unix_socket`, aliases, pager, extensions, proxy) applies. The token then comes
 only from the token variable pair. Any other variable of yours is dropped, GH_HOST included.
 If you rely on `gh auth login`, `--gh-config-dir PATH` opts in one configuration directory: absolute, an existing
-directory you own, mode 0700, no symlink in the path (exit 5 otherwise, 2 if relative, 9 if missing). GH_CONFIG_DIR
-is then that path and HOME stays private. Residual: a `config.yml` or `hosts.yml` in that directory can still redirect
-traffic or name a socket, so only point it at a directory only you can write.
+directory you own, mode 0700, no symlink in the path, and no group- or other-writable directory above it unless it is
+a root-owned sticky one (exit 5 otherwise, 2 if relative, 9 if missing). It is opened once and checked by descriptor, and
+GH_CONFIG_DIR is /proc/self/fd/N for that descriptor (the path itself where there is no /proc, with a race on the path);
+HOME stays private. Residual: a `config.yml` or `hosts.yml` in that directory can still redirect traffic or name a
+socket, so the trust boundary covers whoever can write there or replace it through a parent you did not check.
 Proxy and certificate variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY, SSL_CERT_FILE, SSL_CERT_DIR,
 REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and similar) can send the token through a server of someone else's choosing, so the
 launcher refuses to start (exit 3, naming the variable) when one is set. `--allow-env NAME` (repeatable) opts one such
@@ -145,8 +147,8 @@ def allow_name(text):
 
 
 class Gh:
-    def __init__(self, path, popen, env, fd=None):
-        self.path, self.popen, self.env, self.fd = path, popen, env, fd
+    def __init__(self, path, popen, env, fd=None, extra_fds=()):
+        self.path, self.popen, self.env, self.fd, self.extra_fds = path, popen, env, fd, tuple(extra_fds)
 
     def call(self, args):
         """Return (exit code, stdout text). Reads are bounded, the child is killed on overflow or after the deadline.
@@ -157,7 +159,10 @@ class Gh:
         try:
             extra = {}
             if self.fd is not None:  # run the very file that was checked, not whatever the path names by now
-                extra = {"executable": f"/proc/self/fd/{self.fd}", "pass_fds": (self.fd,)}
+                extra["executable"] = f"/proc/self/fd/{self.fd}"
+            keep = tuple(f for f in (self.fd, *self.extra_fds) if f is not None)
+            if keep:
+                extra["pass_fds"] = keep
             proc = self.popen([self.path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, env=self.env, close_fds=True, **extra)
         except (OSError, ValueError):  # ValueError: NUL or lone surrogate in argv
@@ -316,25 +321,34 @@ def open_gh(text):
     return text, fd
 
 
-def check_config_dir(text):
-    """The opt-in `gh` configuration directory: absolute, existing, owned by you, mode 0700, no symlink in the path."""
+def open_config_dir(text):
+    """The opt-in `gh` configuration directory: absolute, existing, owned by you, mode 0700, no symlink in the path,
+    and every directory above it not writable by group or others (a root-owned sticky directory such as /tmp is
+    fine). The directory is opened once and checked through that descriptor. Returns (path, descriptor)."""
     if not isinstance(text, str) or not os.path.isabs(text) or ".." in text.split(os.sep) or chr(0) in text:
         raise ShitError(USAGE)
     current = os.sep
     try:
         for part in [p for p in text.split(os.sep) if p]:
             current = os.path.join(current, part)
-            st = os.lstat(current)
-            if stat.S_ISLNK(st.st_mode):
+            if stat.S_ISLNK(os.lstat(current).st_mode):
                 raise ShitError(CONFINEMENT)
+        before = os.lstat(text)
+        _safe_dir_chain(os.path.dirname(text))
+        fd = os.open(text, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         raise ShitError(PRECONDITION) from None
     except OSError:
         raise ShitError(CONFINEMENT) from None
-    st = os.lstat(text)
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
-        raise ShitError(CONFINEMENT)
-    return text
+    try:
+        st = os.fstat(fd)
+        same = (st.st_dev, st.st_ino) == (before.st_dev, before.st_ino)
+        if not same or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700:
+            raise ShitError(CONFINEMENT)
+    except BaseException:
+        os.close(fd)
+        raise
+    return text, fd
 
 
 def make_handler(popen, which, environ, cwd, tmpdir):
@@ -351,23 +365,31 @@ def make_handler(popen, which, environ, cwd, tmpdir):
         if plan["host"] is not None and plan["host"].lower() != host:
             raise ShitError(REJECTED)
         plan = {**plan, "host": host}
-        config_dir = check_config_dir(args.gh_config_dir) if args.gh_config_dir is not None else None
-        fd = None
-        if args.gh is not None:
-            path, fd = open_gh(args.gh)
-        else:
-            path = which("gh", path=environ.get("PATH"))
+        fds = []
         try:
+            config_dir = None
+            if args.gh_config_dir is not None:
+                config_dir, cfd = open_config_dir(args.gh_config_dir)
+                fds.append(cfd)
+            fd = None
+            if args.gh is not None:
+                path, fd = open_gh(args.gh)
+                fds.append(fd)
+            else:
+                path = which("gh", path=environ.get("PATH"))
             if path is None:
                 raise _cli.CodedError(_cli.TOOL_UNAVAILABLE)
+            # The descriptor paths keep the program and the directory that were checked, whatever the paths name
+            # later. No /proc: the paths themselves are used and the race on them is a documented residual.
+            proc = os.path.isdir("/proc/self/fd")
+            if config_dir is not None and proc:
+                config_dir = f"/proc/self/fd/{cfd}"
             with tempfile.TemporaryDirectory(prefix="shit-threads-", dir=tmpdir) as root:
                 env = child_env(environ, host, allow, private_env(root, config_dir))
-                # No /proc: the path itself is used and the race on it is a documented residual.
-                use_fd = fd if os.path.isdir("/proc/self/fd") else None
-                return execute(plan, Gh(path, popen, env, use_fd))
+                return execute(plan, Gh(path, popen, env, fd if proc else None, [cfd] if config_dir and proc else ()))
         finally:
-            if fd is not None:
-                os.close(fd)
+            for open_fd in fds:
+                os.close(open_fd)
 
     return handler
 

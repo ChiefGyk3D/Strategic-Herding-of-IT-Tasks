@@ -610,9 +610,40 @@ class PrivateEnvTests(Case):
         cfg = self.good_config_dir()
         self.assertEqual(self.go("--gh-config-dir", str(cfg))[0], 0)
         call = self.calls()[0]
-        self.assertEqual(call["vals"]["GH_CONFIG_DIR"], str(cfg))
+        self.assertRegex(call["vals"]["GH_CONFIG_DIR"], r"^/proc/self/fd/\d+$")  # the checked directory, by descriptor
         self.assertIn("git_protocol", call["config_seen"])
         self.assertTrue(call["vals"]["HOME"].startswith(str(self.tmp)))
+
+    def test_a_writable_parent_of_the_config_dir_is_refused_with_no_call(self):
+        self.fake()
+        shared = self.dir / "shared"
+        shared.mkdir()
+        cfg = shared / "optcfg"
+        cfg.mkdir(mode=0o700)
+        (cfg / "config.yml").write_text("git_protocol: https\n", encoding="utf-8")
+        for mode in (0o777, 0o775, 0o757, 0o1777):  # sticky but owned by this user is refused too
+            with self.subTest(mode=oct(mode)):
+                shared.chmod(mode)
+                self.assertEqual(self.go("--gh-config-dir", str(cfg))[0], 5)
+        shared.chmod(0o755)
+        self.assertEqual(self.go("--gh-config-dir", str(cfg))[0], 0)
+        self.assertEqual(len(self.calls()), 1)  # only the accepted run called gh
+
+    def test_swapping_the_config_dir_after_the_check_does_not_change_what_gh_reads(self):
+        self.fake()
+        cfg = self.good_config_dir()
+
+        def swap_then_start(argv, **kw):
+            os.rename(cfg, self.dir / "moved")
+            cfg.mkdir(mode=0o700)
+            (cfg / "config.yml").write_text("http_unix_socket: /attacker/socket\n", encoding="utf-8")
+            return subprocess.Popen(argv, **kw)
+
+        code, out, _ = self.go("--gh-config-dir", str(cfg), popen=swap_then_start)
+        self.assertEqual(code, 0, out)
+        seen = self.calls()[0]["config_seen"]
+        self.assertIn("git_protocol", seen)
+        self.assertNotIn("attacker", seen)
 
     def test_the_opt_in_config_dir_is_validated(self):
         self.fake()

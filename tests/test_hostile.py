@@ -735,6 +735,7 @@ class NetworkDenial(unittest.TestCase):
         self.assertGreaterEqual(len(files), 10)
         for path in files:
             self.assertEqual(process_launch_uses(path.read_text()), set(), path.relative_to(ROOT).as_posix())
+            self.assertEqual(os_surface_findings(path.read_text()), set(), path.relative_to(ROOT).as_posix())
         # Outside the package the only program that may launch a process is named here, exactly. A new script
         # that launches one fails this test until a person adds it with a reason.
         launchers = {"refresh.py": "regenerates the starter set", "threads_run.py": "runs a review-thread plan with gh"}
@@ -768,6 +769,42 @@ class NetworkDenial(unittest.TestCase):
         for src in good:
             with self.subTest(src=src):
                 self.assertEqual(process_launch_uses(src), set(), src)
+
+
+    def test_os_module_object_never_escapes_in_the_package(self):
+        """H-29h the os module object is only ever used through an allowlisted attribute of the filesystem."""
+        bad = (
+            "import os\na = [os]\na[0].system('id')", "import os\n(o,) = (os,)\no.system('id')",
+            "import os\nf = (lambda: os)()\nf.system('id')", "import os\nx = os", "import os\nx = {'k': os}",
+            "import os\nprint(os)", "import os\ndef f():\n    return os", "import os\nys = [os for _ in range(1)]",
+            "import os\nz = os if True else None", "import os\nos.system('id')", "import os\nos.popen('id')",
+            "import os\nos.execv('/bin/id', [])", "import os\nos.__dict__['system']('id')", "import os as o",
+            "import os\nimport posix", "import nt", "from os import *", "from os import system", "from os import path as p",
+            "from os.path import join", "from posix import fork", "import os\ndef f(os):\n    return os.system('id')",
+            "import os\ngetattr(os, 'sys' + 'tem')('id')", "import os\ngetattr(os, 'system')('id')",
+            "import os\nos = None", "import os\nfor os in []:\n    pass", "import os\nx = os,\n",
+            "import os\nmap(os.system, ['id'])", "import os\nsorted([1], key=os)", "import os\nos[0]",
+            "import os\nclass C:\n    m = os", "import os\nwith os as o:\n    pass",
+        )
+        for src in bad:
+            with self.subTest(src=src):
+                self.assertTrue(os_surface_findings(src), src)
+        good = ("import os\nos.path.join('a')", "import os\nfd = os.open('x', os.O_RDONLY | os.O_NOFOLLOW)",
+                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nos.close(3)\nos.fstat(3)",
+                "from os import path, sep", "import os\nx = os.environ.get('A')", "import re\nos2 = re.compile('x')",
+                "import os\nwith os.fdopen(3, 'rb') as fh:\n    fh.read()", "x = 1")
+        for src in good:
+            with self.subTest(src=src):
+                self.assertEqual(os_surface_findings(src), set(), src)
+
+    def test_the_os_allowlist_has_no_process_launcher_and_is_all_used(self):
+        """H-29i the allowlist names no launching function and every name on it is used somewhere in the package."""
+        self.assertFalse({a for a in OS_ALLOWED_ATTRS if _launches(a)})
+        used = set()
+        for path in (ROOT / "shit").rglob("*.py"):
+            used |= {n.attr for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Attribute)
+                     and isinstance(n.value, ast.Name) and n.value.id == "os"}
+        self.assertEqual(OS_ALLOWED_ATTRS - used - {"path"}, set(), "an allowlisted name the package does not use")
 
 
 def imported_roots(source):
@@ -839,6 +876,49 @@ def process_launch_uses(source):
             literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
             if isinstance(target, ast.Name) and target.id in aliases and not (literal and not _launches(name.value)):
                 found.add("getattr on a process-capable module")
+    return found
+
+
+# The only `os` attributes the package uses, computed from the tree and reviewed: file-descriptor and path
+# primitives, none of which starts a process. Anything else on `os`, or `os` used as a value, is a finding.
+OS_ALLOWED_ATTRS = frozenset({
+    "O_APPEND", "O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK", "O_RDONLY", "O_RDWR",
+    "O_WRONLY", "close", "dup", "environ", "fchmod", "fdopen", "fspath", "fstat", "fsync", "getcwd", "geteuid",
+    "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "rename", "sep", "stat", "unlink", "write",
+})
+
+
+def os_surface_findings(source):
+    """Conservative rule: `os`, `posix` and `nt` may appear only as `import os`, `from os import <allowed>`, or the
+    value of an attribute access whose attribute is in OS_ALLOWED_ATTRS (or `getattr(os, "<allowed>", ...)`).
+
+    Any other use of the module object (assignment, container element, call argument, return, lambda or
+    comprehension capture, subscript, alias, star import, a parameter named like it) is a finding.
+    """
+    tree = ast.parse(source)
+    parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in OS_MODULES and (a.name != "os" or a.asname):
+                    found.add(f"import {a.name} as {a.asname}")
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in OS_MODULES:
+            if node.module != "os":
+                found.add(f"from {node.module}")
+            found |= {f"from os import {a.name}" for a in node.names if a.name not in OS_ALLOWED_ATTRS or a.asname}
+        elif isinstance(node, ast.arg) and node.arg in OS_MODULES:
+            found.add(f"parameter {node.arg}")
+        elif isinstance(node, ast.Name) and node.id in OS_MODULES:
+            up = parent.get(node)
+            attribute_ok = isinstance(up, ast.Attribute) and up.value is node and up.attr in OS_ALLOWED_ATTRS
+            call_ok = (
+                isinstance(up, ast.Call) and isinstance(up.func, ast.Name) and up.func.id == "getattr"
+                and up.args and up.args[0] is node and len(up.args) >= 2 and not up.keywords
+                and isinstance(up.args[1], ast.Constant) and up.args[1].value in OS_ALLOWED_ATTRS
+            )
+            if not isinstance(node.ctx, ast.Load) or not (attribute_ok or call_ok):
+                found.add(f"{node.id} used as a value or with a disallowed attribute (line {node.lineno})")
     return found
 
 
