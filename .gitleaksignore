@@ -1,0 +1,5 @@
+# False positive, issue 55 (PR 70): commit 8954a10 added a module docstring in scripts/threads_run.py that lists
+# the NAMES of the sign-in variables the launcher passes to gh. It holds no secret value. The rule matched the
+# prose around those names. The head of the branch no longer lists them, but the scan reads every commit of the
+# pull request, so this one old commit stays flagged. The scan reads this file from the base commit only.
+8954a10f29b638dd65cdfc6365796c7b84a41c9f:scripts/threads_run.py:generic-api-key:34
