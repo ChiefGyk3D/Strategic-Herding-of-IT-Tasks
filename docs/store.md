@@ -188,6 +188,61 @@ The order is the one of "Invariants across statements": the entry before the lea
 
 **Not done here.** `dispatch_failed` and its backoff (Q-RET-04, Q-RET-05; `queue.py` writes none either), an unleased `fail` or `hold` by a human (the table allows it; `queue.py` has none), capability tags and capacity (Q-CLAIM-04 second half, Q-CLAIM-06), `base_sha256` (OQ-7, issue 18), the `QUEUE.md` view, parallelism metrics, `orphan_removed` (a database has no stray lease file), the CLI switch and removal of the file queue (C7). The apply targets are checked as repository-relative paths (no empty, `.` or `..` component, not under `.shit`: exit code 5 as Q-SER-07) but not resolved against the working tree; the adapter or the dispatcher of issue 18 does that. A key is looked up by scanning the log for its message (no index): the log is small; an index is a later schema change.
 
+## Concurrency and crash harness (issue 65, C8)
+
+Test infrastructure for the queue operations above. It lives in `tests/` and changes nothing in `shit/`. The C3 and C4 tests kill one child at each numbered fault point and race two claimants; this harness adds many processes, kills at random times, a model to compare with, and proof that it notices breakage.
+
+| File | What it is |
+|---|---|
+| `tests/store_worker.py` | One worker process: random queue operations on a shared database, a journal of every won claim and every refusal a healthy run never gives, a snapshot check of every invariant every few operations |
+| `tests/store_harness.py` | The drivers (`run_workers`, `kill_rounds`, `stage_sweep`), `check_invariants`, the mutations and `mutated_root` |
+| `tests/store_model.py` | A pure model of the queue lifecycle and the generator of operation sequences |
+| `tests/test_store_harness.py` | The tests that use all of it, and the negative cases |
+
+**Run it.** `python3 -m unittest discover -s tests -p test_store_harness.py` (the default size takes about 30 seconds and is part of the full discover). Long mode, which is opt-in: `SHIT_HARNESS_LONG=1 python3 -m unittest discover -s tests -p test_store_harness.py`. Real databases in temporary directories; nothing about SQLite is mocked.
+
+| Variable | Default (long) | Meaning |
+|---|---|---|
+| `SHIT_HARNESS_SEED` | random per run | Seed of every random choice. A failure prints it; set it to repeat the operation stream of each worker and the kill schedule |
+| `SHIT_HARNESS_WORKERS` | 3 (6) | Worker processes |
+| `SHIT_HARNESS_OPS` | 80 (1500) | Operations per worker in the concurrency run (it also stops at `SHIT_HARNESS_SECONDS`) |
+| `SHIT_HARNESS_SECONDS` | 20 (120) | Time limit of the concurrency run |
+| `SHIT_HARNESS_ROUNDS` | 4 (25) | Rounds of the kill driver |
+| `SHIT_HARNESS_ROUND_SECONDS` | 1.5 (4) | Length of one kill round; the kills fall inside it |
+| `SHIT_HARNESS_SCALE` | 30 | Logical seconds per real second. At 30 the shortest lease (60 logical seconds) lasts two real seconds, so expiry and reclaim happen during a run |
+| `SHIT_HARNESS_BUSY_MS` | 30000 | Busy timeout the workers pass to `connect` |
+| `SHIT_HARNESS_MODEL_SEEDS` | 3 (40) | Number of generated sequences (seeds 1 to N) compared with the model |
+| `SHIT_HARNESS_MODEL_LENGTH` | 120 (300) | Operations per generated sequence |
+| `SHIT_HARNESS_LONG` | unset | `1` selects the long defaults above |
+
+**What it does.**
+
+1. *Concurrency run.* The workers perform random operations (new tasks, enqueue, claim, start, renew, release, submit, fail, hold, reopen, approve, complete, reclaim, maintain, apply start and finish, edges) on one database, mostly the operation a task's state invites and sometimes another, with valid, stale and invented leases. They share a logical clock (real elapsed time times `SHIT_HARNESS_SCALE`), so leases expire. After it, nothing may have been busy (exit code 13 with a 30 second timeout means a lock is not taken as the design says), no worker may have died with an exception that is not a `ShitError`, and no snapshot check may have found anything.
+2. *Kill driver.* Rounds of workers; this process sends SIGKILL to random workers at random times. A kill is not aimed at COMMIT, but with `synchronous=FULL` most of the time of an operation is the commit, so a uniform random time lands inside it often. Odd rounds also make each worker kill itself at a random fault point of the operation it is running. After every kill, `verify` and `verify_tasks` run on one read snapshot while the survivors keep writing; after every round the database is checked at rest, and a write must go through at once (a dead process holds no lock). `stage_sweep` is the deterministic part: a claim, a renewal and a submit, each killed at every fault point it reaches, with the invariants checked after each.
+3. *Lifecycle model.* A pure state machine written from `docs/queue-spec.md` (not from the store) says, for each generated operation, whether the store must accept it, with which exit code, and what every task, lease and apply slot must look like afterwards, including lazy expiry (a refused operation keeps no expiry, because it rolls back) and the attempt limit. After every operation the store must agree, and at the end the model must agree with `queue_records.replay` of the log.
+4. *Mutation checks.* A copy of the package is made in a temporary directory, one text of `shit/store.py` is replaced (it must match exactly once), and the part of the harness named for it must report something. A control copy with no change must report nothing.
+
+| Mutation | Noticed by |
+|---|---|
+| `BEGIN IMMEDIATE` replaced by a deferred `BEGIN` | the concurrency run: store busy (13) under contention |
+| the busy timeout ignored (0) | the concurrency run: store busy (13) |
+| the lease row never written after a claim | the concurrency run: the snapshot check finds `claim_without_lease` |
+| the lease row deleted before its apply slots (the order the trigger forbids) | the model: an accepted submit or hold is refused |
+| a COMMIT between the claim's entry and its lease row | the sweep: a kill after the entry leaves `claim_without_lease` |
+
+**Invariants checked** (`check_invariants`): `verify` (deep) and `verify_tasks` are empty; `queue_records.replay` accepts the whole log; the queue hash chain is contiguous (numbers, previous hashes); one winner per claim (the generations of a task are 1, 2, 3 ..., no lease id repeats, every claim a worker was told it won is in the log exactly once, no two workers were told the same generation); a lease row exists exactly when the replayed log says a lease is live, with the same lease id.
+
+**What it proves, and its limits.**
+
+- It shows that the invariants hold across random interleavings and random kills of the operations as implemented, and that the checks notice the listed breakages. It does not prove the absence of a bug: a random run covers what it happens to reach, and the default is small on purpose.
+- The interleaving of processes is the operating system's. A seed repeats the operations of each worker and the kill schedule, not the order in which the processes meet.
+- A SIGKILL ends a process; the operating system, and the file system, stay up. Power loss, a torn sector, a lost fsync or a full disk are not simulated, so what `synchronous=FULL` buys is trusted here, not tested.
+- A kill by a timer lands near COMMIT often but not exactly there; the deterministic sweep covers the fault points between statements, and SQLite's own atomic commit covers the rest.
+- Workers and the checks use one database file on one local file system. Network and shared file systems are not covered.
+- The queue hash chain's digests are not recomputed (the harness cannot rebuild the stored line byte for byte); the events chain's digests are, by `verify_tasks`.
+- The model covers the operations with no dependency edges and no decisions or records; the differential test (`tests/test_store_queue_differential.py`) covers edges, records and exit-code parity with the file queue.
+- A worker that sees exit code 8 (a stale clock reading against a newer entry, or an ambiguous commit) opens a new connection and goes on: with a shared logical clock a few operations are refused this way in every run, which is the designed fail-closed answer, not a finding.
+
 ## Not built yet
 
 The hash-chained export, the CLI switch, and removal of the file queue.

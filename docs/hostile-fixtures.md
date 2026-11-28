@@ -56,3 +56,7 @@ Rows marked `none` have no risk-register row. They are gaps in `docs/threat-mode
 - TM-09 (fail-closed hooks): the check command is not on main.
 - Device nodes (TM-05): creating one needs privilege, so H-17 tests the type check against block and character device modes rather than a real node.
 - A local attacker who can rewrite both `events.jsonl` and `events.chain` consistently is accepted by design (stage one is not signed; see the threat model residual risks). H-22 shows the recomputed-chain case is still stopped by the per-event rules (duplicate id).
+
+## Store concurrency and crash harness
+
+The SQLite store's harness (`tests/test_store_harness.py`, `docs/store.md`, "Concurrency and crash harness") builds its hostile conditions at run time: processes that race, a SIGKILL at a random point, and deliberate breakages of a copy of `shit/store.py`. It has no fixture files and no rows in the table above; the mutation list and what notices each one are in `docs/store.md`.
