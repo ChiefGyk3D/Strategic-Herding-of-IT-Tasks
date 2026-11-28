@@ -622,11 +622,12 @@ def _db_path(project):
     return os.path.join(project._root, DB_NAME)
 
 
-def _check_file(st):
-    """Regular file, one link, owned by this user, permission bits within owner read and write.
+def _check_file(st, *, allow_unlinked=False):
+    """Regular file, owned here, private; one link, or zero only for an already-open SQLite sidecar.
 
     The whole mode is compared, so setuid, setgid, sticky, owner-execute, group and other bits all refuse."""
-    if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid()
+    links = (0, 1) if allow_unlinked else (1,)
+    if (not stat.S_ISREG(st.st_mode) or st.st_nlink not in links or st.st_uid != os.geteuid()
             or stat.S_IMODE(st.st_mode) & ~_PRIVATE_FILE):
         raise ShitError(CONFINEMENT)
 
@@ -699,45 +700,50 @@ def _uri(path):
     return "file:" + path.replace("%", "%25").replace("?", "%3f").replace("#", "%23") + "?mode=rw"
 
 
-class _SidecarMoved(Exception):
-    """A -wal or -shm file changed identity while the database was being opened (retried once)."""
-
-
 _SIDECARS = ("-wal", "-shm", "-journal")
+try:
+    _SIDECAR_OPEN = os.O_PATH
+except AttributeError:  # non-Linux fallback: O_NONBLOCK keeps special files from blocking before fstat refuses them
+    _SIDECAR_OPEN = os.O_RDONLY | os.O_NONBLOCK
 
 
-def _verify_sidecars(path, snapshot, final):
-    """After open: every sidecar that exists must be a safe file and the same file that was there before the open."""
+def _verify_sidecars(project):
+    """Refuse an unsafe SQLite sidecar, while accepting its normal create/remove transitions."""
     for suffix in _SIDECARS:
-        sidecar = path + suffix
-        now = _lstat(sidecar, required=False)  # a wide mode, link or foreign owner refuses here
-        before = snapshot[suffix]
-        if now is None and before is None:
+        name = DB_NAME + suffix
+        try:
+            named = os.stat(name, dir_fd=project._fd, follow_symlinks=False)
+        except FileNotFoundError:
+            named = None
+        except OSError as exc:
+            raise _os_error(exc) from None
+        if named is not None:
+            _check_file(named)
+        try:
+            fd = os.open(name, _SIDECAR_OPEN | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=project._fd)
+        except FileNotFoundError:
             continue
-        if now is None or (before is not None and (before.st_dev, before.st_ino) != (now.st_dev, now.st_ino)):
-            if final:
-                raise ShitError(CONFINEMENT)
-            raise _SidecarMoved
+        except OSError as exc:
+            raise _os_error(exc) from None
+        try:
+            _check_file(os.fstat(fd), allow_unlinked=True)
+        except OSError as exc:
+            raise _os_error(exc) from None
+        finally:
+            os.close(fd)
 
 
 def _open(project, busy_timeout_ms, initialize):
     _check_floor()
     timeout = _timeout(busy_timeout_ms)
-    # A sidecar can legitimately be replaced when another process closes the last connection while this one
-    # opens. One retry takes a fresh snapshot; a second change refuses.
-    for final in (False, True):
-        try:
-            return _open_once(project, timeout, initialize, final)
-        except _SidecarMoved:
-            continue
-    raise ShitError(CONFINEMENT)
+    return _open_once(project, timeout, initialize)
 
 
-def _open_once(project, timeout, initialize, final):
+def _open_once(project, timeout, initialize):
     _check_directory(project)
     path = _db_path(project)
     before = _lstat(path, required=True)
-    snapshot = {suffix: _lstat(path + suffix, required=False) for suffix in _SIDECARS}
+    _verify_sidecars(project)
     conn = None
     try:
         # (ms + 0.5) / 1000 so the conversion to whole milliseconds inside sqlite3 never rounds down.
@@ -757,7 +763,7 @@ def _open_once(project, timeout, initialize, final):
         _check_settings(conn, timeout)
         if fingerprint(conn) != PINNED_FINGERPRINT:
             raise ShitError(FAILED_CLOSED)
-        _verify_sidecars(path, snapshot, final)
+        _verify_sidecars(project)
         _check_directory(project)
         return conn
     except BaseException as exc:
