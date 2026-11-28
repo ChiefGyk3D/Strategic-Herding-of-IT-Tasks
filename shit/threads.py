@@ -95,8 +95,22 @@ def read_answer(text):
         raise
 
 
+def _text_or_none(value, allow_none):
+    """A declared string field: the value must be text (or null where the schema allows it), never coerced."""
+    if value is None and allow_none:
+        return ""
+    if not isinstance(value, str):
+        raise TypeError("text field")
+    return value
+
+
 def parse_page(data):
-    """One page of the thread query: (unresolved current threads, has_next_page, end_cursor)."""
+    """One page of the thread query: (unresolved current threads, has_next_page, end_cursor).
+
+    Every field is type-checked as declared (booleans are real booleans, text is text, ids are integers) and
+    nothing is coerced: a wrong type anywhere is the failed-closed code, so a malformed answer can never pass as
+    a valid unresolved thread or a valid cursor.
+    """
     found = []
     try:
         if data.get("errors"):
@@ -105,23 +119,42 @@ def parse_page(data):
         more = block["pageInfo"]["hasNextPage"]
         if not isinstance(more, bool):
             raise TypeError("hasNextPage")
-        cursor = str(block["pageInfo"]["endCursor"] or "")
-        for item in block["nodes"]:
-            if item["isResolved"] or item["isOutdated"]:
+        end = block["pageInfo"]["endCursor"]
+        if end is not None and not isinstance(end, str):
+            raise TypeError("endCursor")  # a number or an object is not a cursor, whatever str() would make of it
+        cursor = end or ""
+        nodes = block["nodes"]
+        if not isinstance(nodes, list):
+            raise TypeError("nodes")
+        for item in nodes:
+            resolved, outdated = item["isResolved"], item["isOutdated"]
+            if not isinstance(resolved, bool) or not isinstance(outdated, bool):
+                raise TypeError("isResolved or isOutdated")
+            if resolved or outdated:
                 continue
-            first = item["comments"]["nodes"][0]
+            comments = item["comments"]["nodes"]
+            if not isinstance(comments, list):
+                raise TypeError("comments")
+            first = comments[0]
             comment_id, thread_id = first["databaseId"], item["id"]
             if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id < 1:
                 raise ValueError("comment id")
             if not isinstance(thread_id, str) or not _THREAD_ID.fullmatch(thread_id):
                 raise ValueError("thread id")
+            line = item["line"]
+            if line is not None and (isinstance(line, bool) or not isinstance(line, int)):
+                raise TypeError("line")
+            author = first["author"]
+            if author is not None and not isinstance(author, dict):
+                raise TypeError("author")
+            login = _text_or_none(author["login"] if author is not None else None, True)
             found.append({
                 "thread_id": thread_id,
                 "comment_id": comment_id,
-                "path": str(item.get("path") or "?"),
-                "line": str(item.get("line") or "?"),
-                "author": str((first.get("author") or {}).get("login") or "?"),
-                "body": str(first.get("body") or ""),
+                "path": _text_or_none(item["path"], False) or "?",
+                "line": str(line) if line is not None else "?",
+                "author": login or "?",
+                "body": _text_or_none(first["body"], False),
             })
     except _cli.CodedError:
         raise

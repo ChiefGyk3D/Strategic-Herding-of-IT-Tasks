@@ -60,6 +60,7 @@ file or thread not found; 11 `gh` is missing, cannot start or timed out.
 import os
 import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -192,9 +193,11 @@ class Gh:
         self.path, self.popen, self.env, self.fd, self.extra_fds = path, popen, env, fd, tuple(extra_fds)
 
     def call(self, args):
-        """Return (exit code, stdout text). Reads are bounded, the child is killed on overflow or after the deadline.
+        """Return (exit code, stdout bytes). Reads are bounded; on overflow or after the deadline the whole process group dies.
 
-        A command that cannot start or times out is the tool-unavailable code; output past the limit is code 7.
+        The child runs in its own session, so its children share its process group; a failure kills that group (not
+        only `gh`) and reaps it. A command that cannot start or times out is the tool-unavailable code; output past
+        the limit is code 7. The bytes are decoded by the caller, strictly, only where an answer is needed.
         """
         limit = threads.ANSWER_LIMIT
         try:
@@ -205,7 +208,7 @@ class Gh:
             if keep:
                 extra["pass_fds"] = keep
             proc = self.popen([self.path, *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, env=self.env, close_fds=True, **extra)
+                              stderr=subprocess.PIPE, env=self.env, close_fds=True, start_new_session=True, **extra)
         except (OSError, ValueError):  # ValueError: NUL or lone surrogate in argv
             raise _cli.CodedError(_cli.TOOL_UNAVAILABLE) from None
         out = bytearray()
@@ -245,7 +248,11 @@ class Gh:
         finally:
             sel.close()
             if failure is not None:
-                proc.kill()
+                # Before reaping, so the process group id still belongs to this child and cannot have been reused.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
             try:
                 proc.wait(timeout=10)
             except (OSError, subprocess.TimeoutExpired):
@@ -254,17 +261,17 @@ class Gh:
                 stream.close()
         if failure is not None:
             raise failure
-        try:
-            text = bytes(out).decode("utf-8")
-        except UnicodeDecodeError:
-            raise threads.closed() from None
-        return int(proc.returncode), text
+        return int(proc.returncode), bytes(out)
 
     def json(self, args):
         code, out = self.call(args)
         if code != 0:
             raise threads.closed()  # the stderr of `gh` can echo request text: it is never read
-        return threads.read_answer(out)
+        try:
+            text = out.decode("utf-8")  # strict: invalid UTF-8 is a wrong answer, the same exit as any malformed one
+        except UnicodeDecodeError:
+            raise threads.closed() from None
+        return threads.read_answer(text)
 
 
 def read_threads(gh, plan, read_request):

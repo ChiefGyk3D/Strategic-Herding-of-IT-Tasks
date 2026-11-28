@@ -63,6 +63,16 @@ state[kind] += 1
 json.dump(state, open(state_path, "w"))
 answers = cfg[kind]
 answer = answers[min(index, len(answers) - 1)]
+if answer.get("grandchild"):
+    pid = os.fork()
+    if pid == 0:
+        time.sleep(60)
+        os._exit(0)
+    open(os.path.join(here, "grandchild.pid"), "w").write(str(pid))
+if answer.get("raw_hex"):
+    sys.stdout.flush()
+    os.write(1, bytes.fromhex(answer["raw_hex"]))
+    sys.exit(answer.get("rc", 0))
 mode = answer.get("flood")
 if mode:
     stream = sys.stdout if mode == "out" else sys.stderr
@@ -1007,6 +1017,70 @@ class GhPathTests(Case):
             with self.subTest(arg=arg):
                 self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", arg)[0], want)
         self.assertEqual(self.calls(), [])
+
+
+class ProcessGroupAndBytesTests(Case):
+    def grandchild_gone(self, timeout=10):
+        pid = int((self.bin / "grandchild.pid").read_text())
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            try:  # a zombie still answers kill(0); reap it if it is ours (it is not: it was re-parented)
+                if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                    return True
+            except ChildProcessError:
+                pass
+            time.sleep(0.1)
+        return False
+
+    def test_a_timeout_kills_the_whole_process_group_not_only_gh(self):
+        from unittest import mock
+
+        self.fake(read=[{"out": {}, "sleep": 30, "grandchild": True}])
+        with mock.patch.object(launcher, "CALL_TIMEOUT", 1):
+            code, _, _ = self.run_plan(self.plan_file(kind="list"))
+        self.assertEqual(code, 11)
+        self.assertTrue(self.grandchild_gone(), "a grandchild of gh was left running")
+
+    def test_an_overflow_kills_the_whole_process_group_too(self):
+        self.fake(read=[{"out": {}, "flood": "out", "grandchild": True}])
+        code, _, _ = self.run_plan(self.plan_file(kind="list"))
+        self.assertEqual(code, 7)
+        self.assertTrue(self.grandchild_gone(), "a grandchild of gh was left running")
+
+    def test_the_child_is_started_in_its_own_session(self):
+        seen = {}
+
+        def spy(argv, **kw):
+            seen.update(kw)
+            return subprocess.Popen(argv, **kw)
+
+        self.fake()
+        self.run_plan(self.plan_file(kind="list"), popen=spy)
+        self.assertIs(seen.get("start_new_session"), True)
+
+    def test_invalid_utf8_in_an_answer_is_the_wrong_answer_exit_not_an_internal_error(self):
+        for raw in ("ff", "c328", "7b2261223a2022e28228227d", "e0"):  # lone bytes, truncated and overlong sequences
+            with self.subTest(raw=raw):
+                self.setUp()
+                self.fake(read=[{"out": "", "raw_hex": raw}])
+                code, out, _ = self.run_plan(self.plan_file(kind="list"))
+                self.assertEqual((code, out), (8, ""))
+
+    def test_invalid_utf8_from_a_resolve_answer_stops_with_the_count(self):
+        rows = [{"comment_id": 101, "action": "reply_resolve", "body": "x"}]
+        self.fake(resolve=[{"out": "", "raw_hex": "ff"}])
+        code, out, _ = self.run_plan(self.plan_file(rows))
+        self.assertEqual(code, 8)
+        self.assertIn("1 of 2 done", out)
+
+    def test_a_reply_that_succeeded_is_not_undone_by_odd_bytes_in_its_unread_output(self):
+        self.fake(reply=[{"out": "", "raw_hex": "ff"}])
+        code, out, _ = self.run_plan(self.plan_file([{"comment_id": 101, "action": "reply", "body": "x"}]))
+        self.assertEqual((code, out.splitlines()), (0, ["replied 101"]))
 
 
 class PlacementTests(unittest.TestCase):

@@ -238,6 +238,57 @@ class PageTests(unittest.TestCase):
                     threads.read_answer(raw)
                 self.assertEqual(ctx.exception.code, 8)
 
+    def refused_page(self, data):
+        with self.assertRaises(Exception) as ctx:
+            threads.parse_page(data)
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_a_cursor_must_be_text_or_null(self):
+        # review thread 5: str() used to turn a number or an object into a valid-looking cursor
+        for bad in (123, 1.5, ["abc"], {"a": 1}, True):
+            with self.subTest(cursor=bad):
+                self.refused_page(page([node()], more=True, cursor=bad))
+                self.refused_page(page([node()], more=False, cursor=bad))
+        found, more, cursor = threads.parse_page(page([node()], more=False, cursor=None))
+        self.assertEqual((len(found), more, cursor), (1, False, ""))
+        self.assertEqual(threads.parse_page(page([node()], more=True, cursor="abc"))[2], "abc")
+        self.refused_page(page([node()], more=True, cursor=None))  # more pages but no cursor: still refused
+
+    def test_every_field_must_have_its_declared_type(self):
+        # review thread 6: isResolved 0 and isOutdated 0 used to pass as a valid unresolved thread
+        def changed(**fields):
+            item = node()
+            for key, value in fields.items():
+                if key in ("databaseId", "author", "body"):
+                    item["comments"]["nodes"][0][key] = value
+                else:
+                    item[key] = value
+            return page([item])
+
+        for label, data in {
+            "isResolved 0": changed(isResolved=0), "isResolved 1": changed(isResolved=1),
+            "isResolved null": changed(isResolved=None), "isResolved text": changed(isResolved="false"),
+            "isOutdated 0": changed(isOutdated=0), "isOutdated null": changed(isOutdated=None),
+            "isOutdated text": changed(isOutdated="no"),
+            "resolved thread with a bad outdated flag": changed(isResolved=True, isOutdated=0),
+            "id number": changed(id=5), "id null": changed(id=None), "path number": changed(path=5),
+            "path null": changed(path=None), "line text": changed(line="3"), "line bool": changed(line=True),
+            "line float": changed(line=3.5), "author text": changed(author="rev"), "author list": changed(author=[]),
+            "login number": changed(author={"login": 5}), "body number": changed(body=5), "body null": changed(body=None),
+            "databaseId text": changed(databaseId="101"), "databaseId float": changed(databaseId=101.0),
+            "nodes not a list": {"data": {"repository": {"pullRequest": {"reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": {"a": 1}}}}}},
+            "comments not a list": changed(comments={"nodes": {"a": 1}}),
+            "data not a dict": [],
+        }.items():
+            with self.subTest(label):
+                self.refused_page(data)
+        # the accepted twins: real booleans, a null line, a null author
+        ok = changed(line=None, author=None)
+        found = threads.parse_page(ok)[0]
+        self.assertEqual((found[0]["line"], found[0]["author"]), ("?", "?"))
+        self.assertEqual(threads.parse_page(page([node(resolved=True), node(outdated=True)]))[0], [])
+
     def test_check_targets(self):
         found = threads.parse_page(page([node("T1", 101)]))[0]
         threads.check_targets(found, [101])
