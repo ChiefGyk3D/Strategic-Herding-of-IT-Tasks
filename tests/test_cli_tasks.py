@@ -31,39 +31,256 @@ class Cli(unittest.TestCase):
 
     def new_task(self):
         self.run_cli("init")
-        self.ok("task", "create", "t1", "--title", "T", "--summary", "S", "--owner", "human", "--actor", "human")
+        self.ok(
+            "task",
+            "create",
+            "t1",
+            "--title",
+            "T",
+            "--summary",
+            "S",
+            "--owner",
+            "human",
+            "--actor",
+            "human",
+        )
 
     def test_whole_flow_by_hand(self):
         self.new_task()
-        self.ok("task", "move", "t1", "running", "--actor", "wrapper", "--reason", "start")
+        self.ok(
+            "task", "move", "t1", "running", "--actor", "wrapper", "--reason", "start"
+        )
         (self.repo / "n.txt").write_text("x")
-        self.ok("evidence", "add", "t1", "ev1", "--path", "n.txt", "--description", "d", "--actor", "wrapper")
-        self.ok("report", "add", "t1", "r1", "--outcome", "success", "--summary", "s", "--evidence", "ev1",
-                "--actor", "wrapper")
-        self.ok("task", "move", "t1", "review", "--actor", "wrapper", "--reason", "done")
-        self.ok("review", "add", "t1", "v1", "--report", "r1", "--verdict", "pass", "--summary", "s",
-                "--actor", "human")
-        self.assertEqual(self.run_cli("close", "t1", "--actor", "human", "--reason", "x")[0], 4)
-        self.ok("decision", "add", "t1", "d1", "--status", "accepted", "--question", "q", "--choice", "c",
-                "--rationale", "r", "--actor", "human")
+        self.ok(
+            "evidence",
+            "add",
+            "t1",
+            "ev1",
+            "--path",
+            "n.txt",
+            "--description",
+            "d",
+            "--actor",
+            "wrapper",
+        )
+        self.ok(
+            "report",
+            "add",
+            "t1",
+            "r1",
+            "--outcome",
+            "success",
+            "--summary",
+            "s",
+            "--evidence",
+            "ev1",
+            "--actor",
+            "wrapper",
+        )
+        self.ok(
+            "task", "move", "t1", "review", "--actor", "wrapper", "--reason", "done"
+        )
+        self.ok(
+            "review",
+            "add",
+            "t1",
+            "v1",
+            "--report",
+            "r1",
+            "--verdict",
+            "pass",
+            "--summary",
+            "s",
+            "--actor",
+            "human",
+        )
+        self.assertEqual(
+            self.run_cli("close", "t1", "--actor", "human", "--reason", "x")[0], 4
+        )
+        self.ok(
+            "decision",
+            "add",
+            "t1",
+            "d1",
+            "--status",
+            "accepted",
+            "--question",
+            "q",
+            "--choice",
+            "c",
+            "--rationale",
+            "r",
+            "--actor",
+            "human",
+        )
         self.ok("task", "move", "t1", "approved", "--actor", "human", "--reason", "ok")
-        self.assertEqual(self.ok("close", "t1", "--actor", "human", "--reason", "x")["state"], "closed")
+        self.assertEqual(
+            self.ok("close", "t1", "--actor", "human", "--reason", "x")["state"],
+            "closed",
+        )
         self.assertEqual(self.ok("decision", "show", "d1")["status"], "accepted")
         self.assertEqual(self.ok("task", "show", "t1")["state"], "closed")
 
+    def test_sqlite_backend_whole_flow_and_unified_store_commands(self):
+        (self.repo / "config.toml").write_text("""schema_version = 1
+[project]
+name = "example-project"
+[tracker]
+repository = "example-owner/example-repo"
+[review]
+destination = "reviewer"
+[storage]
+root = ".shit"
+[log]
+file = ".shit/events.jsonl"
+[local_model]
+context_tokens = 32768
+[store]
+backend = "sqlite"
+""")
+        self.assertEqual(self.ok("init", "--backend", "sqlite"), {"initialized": True})
+        self.ok(
+            "task",
+            "create",
+            "t1",
+            "--title",
+            "T",
+            "--summary",
+            "S",
+            "--owner",
+            "human",
+            "--actor",
+            "human",
+        )
+        self.ok(
+            "task", "move", "t1", "running", "--actor", "wrapper", "--reason", "start"
+        )
+        (self.repo / "n.txt").write_text("x")
+        self.ok(
+            "evidence",
+            "add",
+            "t1",
+            "ev1",
+            "--path",
+            "n.txt",
+            "--description",
+            "d",
+            "--actor",
+            "wrapper",
+        )
+        self.ok(
+            "report",
+            "add",
+            "t1",
+            "r1",
+            "--outcome",
+            "success",
+            "--summary",
+            "s",
+            "--evidence",
+            "ev1",
+            "--actor",
+            "wrapper",
+        )
+        self.ok(
+            "task", "move", "t1", "review", "--actor", "wrapper", "--reason", "done"
+        )
+        self.ok(
+            "review",
+            "add",
+            "t1",
+            "v1",
+            "--report",
+            "r1",
+            "--verdict",
+            "pass",
+            "--summary",
+            "s",
+            "--actor",
+            "human",
+        )
+        self.assertEqual(
+            self.run_cli("close", "t1", "--actor", "human", "--reason", "x")[0], 4
+        )
+        self.ok(
+            "decision",
+            "add",
+            "t1",
+            "d1",
+            "--status",
+            "accepted",
+            "--question",
+            "q",
+            "--choice",
+            "c",
+            "--rationale",
+            "r",
+            "--actor",
+            "human",
+        )
+        self.ok("task", "move", "t1", "approved", "--actor", "human", "--reason", "ok")
+        self.assertEqual(
+            self.ok("close", "t1", "--actor", "human", "--reason", "x")["state"],
+            "closed",
+        )
+        self.assertEqual(self.ok("decision", "show", "d1")["status"], "accepted")
+        self.assertEqual(self.ok("task", "show", "t1")["state"], "closed")
+        code, out, err = self.run_cli("check")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("store: queue 0 tasks", out)
+        code, out, err = self.run_cli("audit", "verify")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("audit-export: ok", out)
+
+    def test_default_init_keeps_file_backend(self):
+        self.assertEqual(self.ok("init"), {"initialized": True})
+        self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
+
     def test_model_cannot_approve_or_accept(self):
         self.new_task()
-        code, _, err = self.run_cli("decision", "add", "t1", "d1", "--status", "accepted", "--question", "q",
-                                    "--choice", "c", "--rationale", "r", "--actor", "model")
+        code, _, err = self.run_cli(
+            "decision",
+            "add",
+            "t1",
+            "d1",
+            "--status",
+            "accepted",
+            "--question",
+            "q",
+            "--choice",
+            "c",
+            "--rationale",
+            "r",
+            "--actor",
+            "model",
+        )
         self.assertEqual((code, err), (10, "shit: human approval required\n"))
-        self.ok("task", "move", "t1", "blocked", "--actor", "human", "--reason", "r", "--blocked-reason", "x",
-                "--blocking-item", "y")
+        self.ok(
+            "task",
+            "move",
+            "t1",
+            "blocked",
+            "--actor",
+            "human",
+            "--reason",
+            "r",
+            "--blocked-reason",
+            "x",
+            "--blocking-item",
+            "y",
+        )
 
     def test_usage_errors_are_2_and_never_echo_input(self):
         secret = "S3CRET-VALUE"
-        cases = (["nope", secret], ["task", "create", secret],
-                 ["task", "move", "t1", secret, "--actor", "human", "--reason", "r"], ["task", "show"],
-                 ["decision", "add", "t1", "d1", "--actor", secret], [], ["task", "--bogus", secret])
+        cases = (
+            ["nope", secret],
+            ["task", "create", secret],
+            ["task", "move", "t1", secret, "--actor", "human", "--reason", "r"],
+            ["task", "show"],
+            ["decision", "add", "t1", "d1", "--actor", secret],
+            [],
+            ["task", "--bogus", secret],
+        )
         for argv in cases:
             code, out, err = self.run_cli(*argv)
             self.assertEqual(code, 2, argv)
@@ -71,17 +288,43 @@ class Cli(unittest.TestCase):
 
     def test_abbreviated_option_is_usage_error(self):
         self.run_cli("init")
-        code, _, _ = self.run_cli("task", "create", "t1", "--tit", "T", "--summary", "S", "--owner", "human",
-                                  "--actor", "human")
+        code, _, _ = self.run_cli(
+            "task",
+            "create",
+            "t1",
+            "--tit",
+            "T",
+            "--summary",
+            "S",
+            "--owner",
+            "human",
+            "--actor",
+            "human",
+        )
         self.assertEqual(code, 2)
 
     def test_errors_print_only_fixed_text(self):
         marker = "zz-marker-zz"
         self.run_cli("init")
-        cases = ((["task", "show", marker], 9),
-                 (["evidence", "add", "t1", "e", "--path", f"../{marker}", "--description", "d",
-                   "--actor", "human"], 5),
-                 (["task", "show", "../" + marker], 3))
+        cases = (
+            (["task", "show", marker], 9),
+            (
+                [
+                    "evidence",
+                    "add",
+                    "t1",
+                    "e",
+                    "--path",
+                    f"../{marker}",
+                    "--description",
+                    "d",
+                    "--actor",
+                    "human",
+                ],
+                5,
+            ),
+            (["task", "show", "../" + marker], 3),
+        )
         for argv, code in cases:
             c, out, err = self.run_cli(*argv)
             self.assertEqual(c, code, argv)
@@ -93,16 +336,38 @@ class Cli(unittest.TestCase):
 
     def test_output_is_ascii_escaped(self):
         self.run_cli("init")
-        out = self.ok("task", "create", "t1", "--title", "café", "--summary", "S", "--owner", "human",
-                      "--actor", "human")
+        out = self.ok(
+            "task",
+            "create",
+            "t1",
+            "--title",
+            "café",
+            "--summary",
+            "S",
+            "--owner",
+            "human",
+            "--actor",
+            "human",
+        )
         self.assertEqual(out["title"], "café")
         _, text, _ = self.run_cli("task", "show", "t1")
         self.assertTrue(text.isascii())
 
     def test_control_characters_in_arguments_rejected_3(self):
         self.run_cli("init")
-        code, _, _ = self.run_cli("task", "create", "t1", "--title", "a\x1b[2Jb", "--summary", "S", "--owner",
-                                  "human", "--actor", "human")
+        code, _, _ = self.run_cli(
+            "task",
+            "create",
+            "t1",
+            "--title",
+            "a\x1b[2Jb",
+            "--summary",
+            "S",
+            "--owner",
+            "human",
+            "--actor",
+            "human",
+        )
         self.assertEqual(code, 3)
 
     def test_modules_import_no_process_or_net_modules(self):
