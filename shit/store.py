@@ -817,12 +817,16 @@ def init_store(project, busy_timeout_ms=None, adopt_empty=False):
     A store that already exists is verified, never rewritten. A file this call did not create is refused unless it
     is a complete store; `adopt_empty=True` is the explicit recovery for a crash between creating the file and
     installing the schema (only a brand-new empty database is then initialized, anything else still refuses).
+    The argument is validated before any file is created, and a failure after this call created the file removes
+    that file (never one it did not create).
 
     The umask is process-wide while this runs; call it from a single-threaded setup step.
     """
     _check_floor()
+    _timeout(busy_timeout_ms)  # an invalid argument must fail before any file exists
     _check_directory(project)
     old = os.umask(stat.S_IRWXG | stat.S_IRWXO)
+    created = None
     try:
         try:
             fd = os.open(DB_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, DB_MODE,
@@ -833,12 +837,33 @@ def init_store(project, busy_timeout_ms=None, adopt_empty=False):
             raise _os_error(exc) from None
         if fd is not None:
             try:
+                st = os.fstat(fd)
+                created = (st.st_dev, st.st_ino)
                 os.fchmod(fd, DB_MODE)
             finally:
                 os.close(fd)
         _open(project, busy_timeout_ms, initialize=fd is not None or adopt_empty).close()
+    except BaseException:
+        if created is not None:
+            _remove_created(project, created)
+        raise
     finally:
         os.umask(old)
+
+
+def _remove_created(project, identity):
+    """Remove the database this call created, and the SQLite files its failed open left, by name inside the pinned
+    directory. A name that is no longer the file this call created (another inode) is left alone."""
+    for suffix in ("", *_SIDECARS):
+        name = DB_NAME + suffix
+        try:
+            st = os.stat(name, dir_fd=project._fd, follow_symlinks=False)
+            if suffix == "" and (st.st_dev, st.st_ino) != identity:
+                return  # the main file was replaced: it is not ours, and neither are its side files
+            if stat.S_ISREG(st.st_mode):
+                os.unlink(name, dir_fd=project._fd)
+        except OSError:
+            continue
 
 
 def connect(project, busy_timeout_ms=None):

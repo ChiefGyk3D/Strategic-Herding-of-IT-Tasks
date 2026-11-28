@@ -1401,11 +1401,7 @@ class JsonProbeTests(Base):
         for name in ("json_valid", "json_type", "json_array_length", "json_extract"):
             with self.subTest(function=name), mock.patch.object(store.sqlite3, "connect", self.broken_connect(name)):
                 self.assertEqual(code_of(store.init_store, self.proj), errors.FAILED_CLOSED)
-                raw = sqlite3.connect(self.db, isolation_level=None)
-                try:
-                    self.assertEqual(raw.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
-                finally:
-                    raw.close()
+                self.assertFalse(self.db.exists())  # the refused init left nothing behind
 
     def test_the_probe_passes_on_a_normal_runtime(self):
         store.init_store(self.proj)
@@ -1433,16 +1429,44 @@ class InitTests(Base):
         self.assertEqual(code_of(store.init_store, self.proj, adopt_empty=True), errors.FAILED_CLOSED)
         self.assertEqual(self.db.read_bytes(), b"not a database" * 100)
 
-    def test_a_failure_in_the_middle_of_the_schema_leaves_an_empty_database(self):
+    def sidecars(self):
+        return [n for n in os.listdir(self.db.parent) if n.startswith(store.DB_NAME)]
+
+    def test_an_invalid_timeout_creates_no_file(self):
+        for bad in (-1, 600001, 1.5, True, "5"):
+            with self.subTest(bad=bad):
+                self.assertEqual(code_of(store.init_store, self.proj, busy_timeout_ms=bad), errors.USAGE)
+                self.assertEqual(self.sidecars(), [])
+
+    def test_a_failure_after_creation_removes_the_file_this_call_created(self):
         broken = [*store.schema_statements()[:12], "CREATE TABLE (broken"]
         with mock.patch.object(store, "schema_statements", lambda: broken):
             self.assertIsNotNone(code_of(store.init_store, self.proj))
-        raw = sqlite3.connect(self.db, isolation_level=None)
-        self.addCleanup(raw.close)
-        self.assertEqual(raw.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
-        self.assertEqual(raw.execute("PRAGMA user_version").fetchone()[0], 0)
-        raw.close()
-        store.init_store(self.proj, adopt_empty=True)  # recoverable
+        self.assertEqual(self.sidecars(), [])  # no database and no sqlite side files
+        store.init_store(self.proj)  # nothing left behind, so a plain init works
+        store.connect(self.proj).close()
+
+    def test_a_pre_existing_file_is_never_removed_by_a_failed_init(self):
+        os.close(os.open(self.db, os.O_CREAT | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR))
+        broken = [*store.schema_statements()[:12], "CREATE TABLE (broken"]
+        with mock.patch.object(store, "schema_statements", lambda: broken):
+            self.assertIsNotNone(code_of(store.init_store, self.proj, adopt_empty=True))
+        self.assertTrue(self.db.exists())
+        self.db.unlink()
+        self.db.write_bytes(b"x" * 10)
+        os.chmod(self.db, stat.S_IRUSR | stat.S_IWUSR)
+        self.assertEqual(code_of(store.init_store, self.proj), errors.FAILED_CLOSED)
+        self.assertEqual(self.db.read_bytes(), b"x" * 10)
+
+    def test_a_name_that_no_longer_is_the_created_file_is_left_alone(self):
+        def swap_then_fail(*args, **kwargs):
+            os.unlink(self.db)
+            self.db.write_bytes(b"someone else's file")
+            raise ShitError(errors.FAILED_CLOSED)
+
+        with mock.patch.object(store, "_open", swap_then_fail):
+            self.assertEqual(code_of(store.init_store, self.proj), errors.FAILED_CLOSED)
+        self.assertEqual(self.db.read_bytes(), b"someone else's file")
 
     def test_a_replaced_store_directory_is_refused(self):
         store.init_store(self.proj)
