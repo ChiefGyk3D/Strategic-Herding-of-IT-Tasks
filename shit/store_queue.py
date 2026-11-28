@@ -151,7 +151,8 @@ def reclaim(project, task_id, actor, *, now=None, config=None, busy_timeout_ms=N
 
 def apply_start(project, presented, targets, *, now=None, config=None, busy_timeout_ms=None):
     return _run(project, lambda conn, at, key, met: store.queue_apply_start(conn, presented, targets, at,
-                                                                             config=config, met=met, key=key),
+                                                                             config=config, met=met, key=key,
+                                                                             project=project),
                 now, config, busy_timeout_ms)
 
 

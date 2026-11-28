@@ -8,7 +8,7 @@ from pathlib import Path
 
 from _bootstrap import make_git_dir
 
-from shit import artifacts, cli_tasks, commands
+from shit import artifacts, cli_tasks, commands, log, project, queue, task
 
 
 class Cli(unittest.TestCase):
@@ -262,6 +262,63 @@ backend = "sqlite"
         code, _out, err = self.run_cli("init", "--backend", "sqlite")
         self.assertEqual((code, err), (9, "shit: precondition missing\n"))
         self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
+
+    def test_file_backend_artifact_catalog_is_derived_from_its_definitions(self):
+        expected = {
+            project.LOCK_NAME,
+            *project.SUBDIRS,
+            log.LOG_PATH,
+            log.CHAIN_PATH,
+            task.PENDING,
+            *commands.DIRS.values(),
+            queue.QUEUE,
+            queue.CHAIN,
+            queue.DEPS,
+            queue.PENDING,
+            queue.ANCHOR,
+            queue.VIEW,
+            queue.LEASES,
+        }
+        self.assertEqual(set(cli_tasks.FILE_BACKEND_ARTIFACTS), expected)
+
+    def test_sqlite_init_refuses_every_state_bearing_file_backend_artifact(self):
+        (self.repo / "config.toml").write_text("""schema_version = 1
+[project]
+name = "example-project"
+[tracker]
+repository = "example-owner/example-repo"
+[review]
+destination = "reviewer"
+[storage]
+root = ".shit"
+[log]
+file = ".shit/events.jsonl"
+[local_model]
+context_tokens = 32768
+[store]
+backend = "sqlite"
+""")
+        state = self.repo / ".shit"
+        for name in cli_tasks.FILE_BACKEND_ARTIFACTS:
+            if name in (project.LOCK_NAME, *project.SUBDIRS):
+                continue
+            with self.subTest(name=name):
+                self.run_cli("init", "--backend", "files")
+                path = state / name
+                if name in {*commands.DIRS.values(), queue.DEPS, queue.LEASES}:
+                    path.mkdir(exist_ok=True)
+                    (path / "state.json").write_text("{}")
+                else:
+                    path.write_text("state")
+                code, _out, err = self.run_cli("init", "--backend", "sqlite")
+                self.assertEqual((code, err), (9, "shit: precondition missing\n"))
+                self.assertFalse((state / "store.sqlite3").exists())
+                if path.is_dir():
+                    (path / "state.json").unlink()
+                    if name not in project.SUBDIRS:
+                        path.rmdir()
+                else:
+                    path.unlink()
 
     def test_model_cannot_approve_or_accept(self):
         self.new_task()

@@ -11,6 +11,7 @@ package with one deliberate breakage in `shit/store.py` and require them to noti
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 import store_harness as harness
 import store_model
@@ -91,10 +92,19 @@ class MutationTests(Quiet):
                         f"{mutation.name} was not detected by its named guard: {found[:3]}",
                     )
 
+    def test_default_mutation_seed_is_fixed_and_random_seed_is_long_run_only(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            first = harness.Settings.from_env()
+            second = harness.Settings.from_env()
+        self.assertEqual(first.seed, second.seed)
+        with mock.patch.dict("os.environ", {"SHIT_HARNESS_LONG": "1"}, clear=True), \
+                mock.patch.object(harness.secrets, "randbelow", side_effect=(11, 12)):
+            self.assertEqual((harness.Settings.from_env().seed, harness.Settings.from_env().seed), (11, 12))
+
     def test_an_unmutated_copy_is_not_flagged(self):
         """The negative control: the same detectors say nothing about a copy with no breakage."""
         with tempfile.TemporaryDirectory(prefix="shit-mutation-") as directory:
-            for detector in ("processes", "sweep", "model"):
+            for detector in ("barrier", "processes", "sweep", "model"):
                 control = harness.Mutation("control-" + detector, "def _fault(stage):", "def _fault(stage):", detector)
                 with self.subTest(detector=detector):
                     self.assertEqual(harness.detect(self.settings, control, directory), [])

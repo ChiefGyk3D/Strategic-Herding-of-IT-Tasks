@@ -75,7 +75,7 @@ class Settings:
         long = os.environ.get("SHIT_HARNESS_LONG") == "1"
         seed = os.environ.get("SHIT_HARNESS_SEED")
         return cls(
-            seed=int(seed) if seed else secrets.randbelow(2 ** 31),
+            seed=int(seed) if seed else (secrets.randbelow(2 ** 31) if long else 1729),
             workers=_int("SHIT_HARNESS_WORKERS", 6 if long else 3),
             ops=_int("SHIT_HARNESS_OPS", 1500 if long else 80),
             seconds=_float("SHIT_HARNESS_SECONDS", 120.0 if long else 20.0),
@@ -445,8 +445,9 @@ class Mutation:
 
 MUTATIONS = (
     Mutation("drop-begin-immediate", 'try:\n        conn.execute("BEGIN IMMEDIATE")\n    except sqlite3.Error as exc:\n        raise map_error(exc) from None\n    try:\n        yield conn',
-             'try:\n        conn.execute("BEGIN")\n    except sqlite3.Error as exc:\n        raise map_error(exc) from None\n    try:\n        yield conn', "processes", "exit code 13"),
-    Mutation("ignore-busy-timeout", "    timeout = _timeout(busy_timeout_ms)\n", "    timeout = 0\n", "processes", "exit code 13"),
+             'try:\n        conn.execute("BEGIN")\n    except sqlite3.Error as exc:\n        raise map_error(exc) from None\n    try:\n        yield conn', "barrier", "drop-begin-immediate busy-snapshot exit code 13"),
+    Mutation("ignore-busy-timeout", "    timeout = _timeout(busy_timeout_ms)\n", "    timeout = 0\n", "barrier",
+             "ignore-busy-timeout premature exit code 13"),
     Mutation("skip-lease-row", "def _insert_lease(conn, lease):\n    _require_transaction(conn)\n",
              "def _insert_lease(conn, lease):\n    _require_transaction(conn)\n    return\n", "processes", "claim_without_lease"),
     Mutation("drop-lease-before-slots",
@@ -460,6 +461,58 @@ MUTATIONS = (
              '    _require_transaction(conn)\n    conn.execute("COMMIT")\n    conn.execute("BEGIN IMMEDIATE")\n'
              '    conn.execute("INSERT INTO leases (task_id,', "sweep", "claim_without_lease"),
 )
+
+
+BARRIER_CHILD = r'''import json, sqlite3, sys, threading, time
+from pathlib import Path
+spec = json.loads(sys.argv[1])
+sys.path.insert(0, spec["root"])
+from shit import store
+from shit.errors import ShitError
+from shit.project import Project
+repo = Path(spec["directory"]) / "repo"
+repo.mkdir(parents=True)
+project = Project.init(repo)
+store.init_store(project)
+finding = ""
+if spec["name"] == "drop-begin-immediate":
+    first = store.connect(project, busy_timeout_ms=20)
+    second = store.connect(project, busy_timeout_ms=20)
+    try:
+        try:
+            with store.write_transaction(first):
+                first.execute("SELECT count(*) FROM tasks").fetchone()
+                second.execute("BEGIN IMMEDIATE")
+                second.execute("PRAGMA user_version = 1")
+                second.execute("COMMIT")
+                try:
+                    first.execute("PRAGMA user_version = 2")
+                except sqlite3.Error as exc:
+                    if store.map_error(exc).code == 13:
+                        finding = "drop-begin-immediate busy-snapshot exit code 13"
+        except ShitError:
+            pass
+    finally:
+        first.close(); second.close()
+elif spec["name"] == "ignore-busy-timeout":
+    path = repo / ".shit" / store.DB_NAME
+    holder = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    timer = threading.Thread(target=lambda: (time.sleep(0.15), holder.execute("COMMIT")))
+    timer.start()
+    candidate = store.connect(project, busy_timeout_ms=500)
+    started = time.monotonic()
+    try:
+        try:
+            with store.write_transaction(candidate):
+                candidate.execute("PRAGMA user_version = 3")
+        except ShitError as exc:
+            if exc.code == 13 and time.monotonic() - started < 0.1:
+                finding = "ignore-busy-timeout premature exit code 13"
+    finally:
+        timer.join(); candidate.close(); holder.close()
+print(json.dumps({"finding": finding}))
+'''
 
 
 def mutated_root(directory, mutation):
@@ -486,9 +539,22 @@ def run_model_in_process(root, seeds, length):
     return result["problems"], result["seen"]
 
 
+def barrier_detect(root, mutation, directory):
+    """Causal checks for the two concurrency mutations, with the competing write/lock under explicit barriers."""
+    spec = {"root": str(root), "name": mutation.name, "directory": str(Path(directory) / (mutation.name + "-barrier"))}
+    proc = subprocess.run([sys.executable, "-I", "-c", BARRIER_CHILD, json.dumps(spec)], capture_output=True,
+                          timeout=30, check=False)
+    if proc.returncode != 0:
+        return [f"barrier detector exited {proc.returncode}"]
+    finding = json.loads(proc.stdout.decode())["finding"]
+    return [finding] if finding else []
+
+
 def detect(settings, mutation, directory):
     """The problems the harness reports against a copy of the package carrying `mutation` (empty: it did not notice)."""
     root = mutated_root(directory, mutation)
+    if mutation.detector == "barrier":
+        return barrier_detect(root, mutation, directory)
     if mutation.detector == "model":
         return run_model_in_process(root, range(1, 4), 120)[0]
     if mutation.detector == "sweep":
