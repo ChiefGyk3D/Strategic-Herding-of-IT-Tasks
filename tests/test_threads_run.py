@@ -49,7 +49,8 @@ seen = {{n: os.environ.get(n) for n in names}}
 modes = {{n: (oct(os.stat(v).st_mode & 0o777) if v and os.path.isdir(v) else None) for n, v in seen.items()}}
 with open(os.path.join(here, "calls.jsonl"), "a") as log:
     log.write(json.dumps({{"argv": argv, "env": sorted(os.environ), "stdin_tty": sys.stdin.isatty(), "vals": seen,
-                          "modes": modes, "config_seen": resolved_config(), "me": here}}) + "\\n")
+                          "modes": modes, "config_seen": resolved_config(), "me": here,
+                          "real": {{n: os.path.realpath(v) for n, v in seen.items() if v}}}}) + "\\n")
 text = " ".join(argv)
 if "-X POST" in text:
     kind = "reply"
@@ -557,7 +558,8 @@ class PrivateEnvTests(Case):
         self.assertEqual(self.go(environ=env)[0], 0)
         call = self.calls()[0]
         for name, value in call["vals"].items():
-            self.assertTrue(value.startswith(str(self.tmp) + os.sep), (name, value))
+            self.assertRegex(value, r"^/proc/self/fd/\d+/[a-z-]+$", name)  # through the held descriptor
+            self.assertTrue(call["real"][name].startswith(str(self.tmp) + os.sep), (name, call["real"][name]))
             self.assertNotIn(str(home), value)
             self.assertEqual(call["modes"][name], "0o700", name)
         self.assertEqual(len(set(call["vals"].values())), len(call["vals"]))
@@ -600,6 +602,71 @@ class PrivateEnvTests(Case):
         self.assertEqual(list(self.tmp.iterdir()), [])
         self.assertEqual(self.calls(), [])
 
+    def test_a_root_swapped_before_launch_is_refused_and_nothing_runs(self):
+        from unittest import mock
+
+        self.fake()
+        real = launcher.make_private_root
+
+        def make_then_swap(base):
+            root, fd = real(base)
+            os.rename(root, root + "-moved")
+            os.mkdir(root, 0o700)
+            return root, fd
+
+        with mock.patch.object(launcher, "make_private_root", make_then_swap):
+            code, out, _ = self.go()
+        self.assertEqual(code, 5)
+        self.assertIn("changed before launch", out)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_root_swapped_while_gh_runs_is_reported_and_gh_still_used_the_checked_directory(self):
+        self.fake()
+
+        def swap_then_start(argv, **kw):
+            home = kw["env"]["HOME"]
+            checked = os.path.dirname(os.path.realpath(home))
+            os.rename(checked, checked + "-moved")
+            os.mkdir(checked, 0o700)
+            os.mkdir(os.path.join(checked, "gh"), 0o700)
+            with open(os.path.join(checked, "gh", "config.yml"), "w") as fh:
+                fh.write("api_host: attacker.example\n")
+            return subprocess.Popen(argv, **kw)
+
+        code, out, _ = self.go(popen=swap_then_start)
+        self.assertEqual(code, 5)
+        self.assertIn("replaced while gh ran", out)
+        self.assertIsNone(self.calls()[0]["config_seen"])  # the child read the checked directory, not the planted one
+        for path in self.tmp.iterdir():  # what the test itself left behind: both were created by this run
+            shutil.rmtree(path)
+
+    def test_without_proc_the_paths_are_used_and_identity_is_still_checked(self):
+        from unittest import mock
+
+        self.fake()
+        with mock.patch.object(launcher, "has_proc", return_value=False):
+            code, _, _ = self.go()
+        self.assertEqual(code, 0)
+        call = self.calls()[0]
+        self.assertTrue(call["vals"]["HOME"].startswith(str(self.tmp) + os.sep))
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def test_private_env_through_a_descriptor_makes_every_directory_relative_to_it(self):
+        base = self.dir / "b"
+        base.mkdir(mode=0o700)
+        root, fd = launcher.make_private_root(str(base))
+        try:
+            env = launcher.private_env(root, None, fd)
+            self.assertEqual({v.split("/")[5] for v in env.values()}, {"home", "xdg-config", "xdg-cache", "xdg-data",
+                                                                       "xdg-state", "tmp", "gh"})
+            self.assertTrue(all(v.startswith(f"/proc/self/fd/{fd}/") for v in env.values()))
+            self.assertTrue(launcher.root_unchanged(root, fd))
+            os.rename(root, root + "-x")
+            self.assertFalse(launcher.root_unchanged(root, fd))
+        finally:
+            os.close(fd)
+            shutil.rmtree(root + "-x")
+
     def good_config_dir(self, mode=0o700):
         path = self.dir / "ghcfg"
         path.mkdir(exist_ok=True)
@@ -614,7 +681,7 @@ class PrivateEnvTests(Case):
         call = self.calls()[0]
         self.assertRegex(call["vals"]["GH_CONFIG_DIR"], r"^/proc/self/fd/\d+$")  # the checked directory, by descriptor
         self.assertIn("git_protocol", call["config_seen"])
-        self.assertTrue(call["vals"]["HOME"].startswith(str(self.tmp)))
+        self.assertTrue(call["real"]["HOME"].startswith(str(self.tmp)))
 
     def test_a_writable_parent_of_the_config_dir_is_refused_with_no_call(self):
         self.fake()
@@ -703,7 +770,7 @@ class TempBaseTests(Case):
             code, _, _ = self.run_plan(self.plan_file(kind="list"))
         self.assertEqual(code, 0)
         self.assertEqual(list(attacker.iterdir()), [])
-        home = self.calls()[0]["vals"]["HOME"]
+        home = self.calls()[0]["real"]["HOME"]
         self.assertFalse(home.startswith(str(attacker)))
         self.assertTrue(any(home.startswith(base) for base, _ in launcher.default_bases()), home)
 

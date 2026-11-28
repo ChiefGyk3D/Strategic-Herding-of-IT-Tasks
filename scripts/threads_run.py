@@ -110,18 +110,56 @@ def clean_value(value):
     return isinstance(value, str) and not any(unicodedata.category(c) in ("Cc", "Cs") for c in value)
 
 
-def private_env(root, config_dir=None):
-    """Make the private directories under `root` (mode 0700) and return the variables that point `gh` at them."""
+def has_proc():
+    return os.path.isdir("/proc/self/fd")
+
+
+def private_env(root, config_dir=None, root_fd=None):
+    """Make the private directories under `root` (mode 0700) and return the variables that point `gh` at them.
+
+    With `root_fd` (and /proc) the directories are made relative to that descriptor and the variables name them as
+    /proc/self/fd/N/<name>, so what `gh` uses is the directory that was checked, whatever the path names later.
+    """
     names = {"HOME": "home", "XDG_CONFIG_HOME": "xdg-config", "XDG_CACHE_HOME": "xdg-cache",
              "XDG_DATA_HOME": "xdg-data", "XDG_STATE_HOME": "xdg-state", "TMPDIR": "tmp", "GH_CONFIG_DIR": "gh"}
     env = {}
     for name, sub in names.items():
-        path = os.path.join(root, sub)
-        os.mkdir(path, 0o700)
-        env[name] = path
+        if root_fd is not None:
+            os.mkdir(sub, 0o700, dir_fd=root_fd)
+            env[name] = f"/proc/self/fd/{root_fd}/{sub}"
+        else:
+            path = os.path.join(root, sub)
+            os.mkdir(path, 0o700)
+            env[name] = path
     if config_dir is not None:
         env["GH_CONFIG_DIR"] = config_dir
     return env
+
+
+def root_unchanged(root, fd):
+    """True while the path still names the directory that was checked (device, inode, owner, mode)."""
+    try:
+        now, held = os.lstat(root), os.fstat(fd)
+    except OSError:
+        return False
+    return ((now.st_dev, now.st_ino) == (held.st_dev, held.st_ino) and stat.S_ISDIR(now.st_mode)
+            and now.st_uid == os.geteuid() and stat.S_IMODE(now.st_mode) == 0o700)
+
+
+def remove_root(root, fd, proc):
+    """Remove what this run made. Through the descriptor where there is /proc; the directory itself only if the path
+    still names it (otherwise it is left in place and the caller has already reported the change)."""
+    if proc:
+        for name in os.listdir(fd):
+            shutil.rmtree(f"/proc/self/fd/{fd}/{name}", ignore_errors=True)
+    elif root_unchanged(root, fd):
+        shutil.rmtree(root, ignore_errors=True)
+        return
+    if root_unchanged(root, fd):
+        try:
+            os.rmdir(root)
+        except OSError:
+            pass
 
 
 def child_env(environ, host=DEFAULT_HOST, allow=(), private=None):
@@ -442,7 +480,7 @@ def make_handler(popen, which, environ, cwd, bases):
                 raise _cli.CodedError(_cli.TOOL_UNAVAILABLE)
             # The descriptor paths keep the program and the directory that were checked, whatever the paths name
             # later. No /proc: the paths themselves are used and the race on them is a documented residual.
-            proc = os.path.isdir("/proc/self/fd")
+            proc = has_proc()
             if config_dir is not None and proc:
                 config_dir = f"/proc/self/fd/{cfd}"
             base = pick_base(bases if bases is not None else default_bases())
@@ -452,10 +490,18 @@ def make_handler(popen, which, environ, cwd, bases):
             root, root_fd = make_private_root(base)
             fds.append(root_fd)
             try:
-                env = child_env(environ, host, allow, private_env(root, config_dir))
-                return execute(plan, Gh(path, popen, env, fd if proc else None, [cfd] if config_dir and proc else ()))
+                if not root_unchanged(root, root_fd):  # re-verified immediately before launch
+                    return CONFINEMENT, ["refused: the private directory changed before launch; nothing was run"]
+                env = child_env(environ, host, allow, private_env(root, config_dir, root_fd if proc else None))
+                extra = ([cfd] if config_dir and proc else []) + ([root_fd] if proc else [])
+                code, lines = execute(plan, Gh(path, popen, env, fd if proc else None, extra))
+                if not root_unchanged(root, root_fd):  # and again after the child exits
+                    lines.append("warning: the private directory was replaced while gh ran; its contents are not "
+                                 "trusted and it was left in place")
+                    return CONFINEMENT, lines
+                return code, lines
             finally:
-                shutil.rmtree(root, ignore_errors=True)
+                remove_root(root, root_fd, proc)
         finally:
             for open_fd in fds:
                 os.close(open_fd)

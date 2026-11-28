@@ -757,7 +757,16 @@ class NetworkDenial(unittest.TestCase):
             "import os\ngetattr(os, 'sys' + 'tem')('true')", "import os\nx = os\nx.system('true')",
             "import os\nos.__dict__['sys' + 'tem']('id')", "import os\nvars(os)['system']('id')",
             "import os\nobject.__getattribute__(os, 'system')('id')", "import os\nglobals()['os'].system('id')",
-            "import sys\nsys.modules['os'].system('id')", "from operator import attrgetter",
+            "import sys\nsys.modules['os'].system('id')",
+            "import builtins\nbuiltins.__import__('subprocess').run(['/bin/true'])",
+            "import builtins\nbuiltins.exec('import os; os.system(\"id\")')", "import builtins",
+            "import sys\ngetattr(sys, 'modules')['os'].system('id')", "import sys as s\ngetattr(s, 'mod' + 'ules')",
+            "import sys\nm = sys.modules", "from sys import modules", "import sys as s\ns.modules['os']",
+            "().__class__.__bases__[0].__subclasses__()", "x.__class__.__mro__", "f.__code__", "f.__closure__",
+            "import types", "import inspect", "import gc\ngc.get_objects()", "from types import FunctionType",
+            "import marshal", "x = o.__reduce__()", "obj.__import__('os')", "mod.eval('1')", "mod.exec('1')",
+            "import json\ngetattr(json, 'loads')", "__builtins__",
+            "import functools\ngetattr(functools, 'x')", "from operator import attrgetter",
             "import operator\noperator.attrgetter('system')(__import__('os'))", "import os\nlocals()['os']",
             "import os\nos.__getattribute__('system')", "compile('1', 'f', 'eval')",
         )
@@ -767,7 +776,9 @@ class NetworkDenial(unittest.TestCase):
         good = ("import os\nos.path.join('a')", "import os\nos.path.realpath(os.fspath('a'))",
                 "import os\nx = os.path.isabs('a') and os.path.normpath('b')", "import os\nos.path.commonpath(['a'])",
                 "import os\nos.path.abspath('a')", "from os import fspath, sep", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
-                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nold = os.umask(0o77)\nos.readlink('/proc/self/fd/3')", "import re\nre.compile('x')", "import hashlib")
+                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nold = os.umask(0o77)\nos.readlink('/proc/self/fd/3')", "import re\nre.compile('x')", "import hashlib",
+                "import sys\nsys.stdout.write('x')", "x = type(1) is int\nsuper().__init__()",
+                "import json\nx = json.dumps({})")
         for src in good:
             with self.subTest(src=src):
                 self.assertEqual(process_launch_uses(src), set(), src)
@@ -833,14 +844,16 @@ def imported_roots(source):
 
 
 LAUNCH_MODULES = {"subprocess", "_posixsubprocess", "multiprocessing", "pty", "importlib", "runpy", "ctypes", "_ctypes",
-                  "pdb", "code", "idlelib"}
+                  "pdb", "code", "idlelib", "builtins", "__builtin__", "types", "inspect", "gc", "marshal", "imp"}
 OS_MODULES = {"os", "posix", "nt"}
 LAUNCH_OS_ATTRS = ("system", "popen", "fork", "forkpty", "startfile", "posix_spawn", "posix_spawnp", "plock")
 LAUNCH_OS_PREFIXES = ("exec", "spawn")
-DYNAMIC_NAMES = {"__import__", "eval", "exec", "vars", "globals", "locals", "compile", "breakpoint"}
+DYNAMIC_NAMES = {"__import__", "eval", "exec", "vars", "globals", "locals", "compile", "breakpoint", "__builtins__", "builtins"}
 # Reflection that reaches a module's contents without naming them: never needed by the package.
 REFLECTION_ATTRS = {"__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__", "__subclasses__",
-                    "__loader__", "__spec__", "attrgetter", "methodcaller"}
+                    "__loader__", "__spec__", "attrgetter", "methodcaller", "__import__", "exec", "eval", "breakpoint",
+                    "vars", "globals", "locals", "modules", "__class__", "__bases__", "__base__", "__mro__",
+                    "__code__", "__closure__", "__func__", "__self__", "__reduce__", "__reduce_ex__"}
 
 
 def _launches(attr):
@@ -857,6 +870,7 @@ def process_launch_uses(source):
     found = set()
     aliases = set(OS_MODULES)
     tree = ast.parse(source)
+    modules = {(a.asname or a.name).split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -868,6 +882,8 @@ def process_launch_uses(source):
             aliases |= {t.id for t in node.targets if isinstance(t, ast.Name)}
         elif isinstance(node, ast.ImportFrom) and node.module:
             root = node.module.split(".")[0]
+            found |= {f"from {node.module} import {a.name}" for a in node.names
+                      if a.name in REFLECTION_ATTRS or a.name in DYNAMIC_NAMES}
             if root in LAUNCH_MODULES:
                 found.add(f"from {node.module}")
             if root == "operator":
@@ -891,6 +907,8 @@ def process_launch_uses(source):
             literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
             if isinstance(target, ast.Name) and target.id in aliases and not (literal and not _launches(name.value)):
                 found.add("getattr on a process-capable module")
+            elif isinstance(target, ast.Name) and target.id in modules and target.id not in aliases:
+                found.add("getattr on an imported module")
     return found
 
 
