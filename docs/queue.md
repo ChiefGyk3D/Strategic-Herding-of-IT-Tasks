@@ -2,6 +2,8 @@
 
 **SELF-REVIEW:** like `docs/queue-spec.md`, this is the implementer's own account. A human peer review is still required. The spec is the authority; this file says what was built, how it maps to the spec, what was left out and what still needs a human decision.
 
+Phase 2 note: the SQLite summary and status sections are current. Later file-layout passages are retained as explicitly historical design context and are not implementation claims.
+
 **Scope of the protection (read first).** The queue, leases and recovery in issue 17 protect against crashes, races and mistakes of cooperating workers that run as the same operating-system user. They do not protect against a hostile process of that user (it can read every lease id, plant or rewrite any file under `.shit`, and ignore the advisory lock), nor against a rewrite or restore of the whole store. Multi-tenant or adversarial use needs an operating-system identity boundary, a credential service that holds the secrets outside the workers' reach (issue #48). Every "proves", "refuses" and "fails closed" below is meant inside that scope.
 
 ## What exists
@@ -10,14 +12,12 @@
 |---|---|
 | `shit/dependencies.py` | Shard validation and bytes, in-memory graph validation, cycle detection (iterative), missing-node detection, add (single and batch) and remove edge, readiness helpers. Pure functions. |
 | `shit/queue_records.py` | `queue-entry` and `lease` validation, the transition table, per-kind field rules, configuration ranges and `replay`, which rebuilds every task's queue state from the log and rejects impossible sequences. |
-| `shit/queue.py` | Storage and operations: `enqueue`, `add_edge`, `add_edges`, `remove_edge`, `claim`, `start`, `renew`, `release`, `submit`, `fail`, `hold`, `reopen`, `complete`, `reclaim`, `status`, `render_view`. |
-| `shit/store.py` (queue section), `shit/store_queue.py` | The same operations on the SQLite store (issue 61, C4): one write transaction each, the adapter with the names of `queue.py`. The file queue stays until C7. See `docs/store.md`, "Queue operations". |
+| `shit/store.py` (queue section), `shit/store_queue.py` | SQLite queue operations: one write transaction each, with a project-level adapter. |
+| `shit/queue.py` | Import-compatible names that forward to `store_queue`; it contains no file protocol. |
 | `shit/project.py` | Two confined helpers: `list_dir` and `create_exclusive` (create-if-absent by temp file and hard link, never follows a symlink). |
 | `shit/task.py` | `_transition_locked` split out of `transition` so a queue commit can run a lifecycle step under the lock it already holds; `create_task` refuses an id that appears in the event log (Q-RES-01). |
 
-Files under `.shit`: `queue.jsonl` with the sidecar `queue.chain`, `deps/<task-id>.json` (one dependency shard per dependent task), `leases/<task-id>.json`, `queue-pending.json` (the commit point, present only during a mutation) and the generated `QUEUE.md`.
-
-Every operation takes the store lock, refuses with exit code 8 if a `queue-pending.json` exists (only `queue.recover` finishes a queue commit; a task-only `pending.json` is finished after the planner proved the queue), loads and verifies everything (chain, replay, graph, lifecycle agreement), runs maintenance (orphan leases, missing lease files, expiry, waiting to ready) and then does its own step. A queue state that the recovery planner cannot verify is exit code 8 and nothing is written before the planner's proof (Q-REC-02); maintenance steps after it are separate committed steps, and an orphan lease file is deleted only after its `orphan_removed` entry has committed, and the entry is not repeated after a crash between the two.
+Queue entries, dependency edges, leases, and apply slots are rows in `store.sqlite3`. Each mutation uses one `BEGIN IMMEDIATE` transaction. Record bodies remain files by design; their digests and sizes are indexed in the database.
 
 ## Decisions recorded by the owner (2026-11-27)
 
@@ -74,7 +74,7 @@ The spec text now matches the code.
 
 - Capability tags (Q-CLAIM-06) and execution capacity by resource class (Q-CLAIM-04 second half): the claim request has no tag field and nothing counts leases per worker. Issue 18 owns routing and capacity.
 - `dispatch_failed` backoff and the consecutive-failure hold (Q-RET-04, Q-RET-05): the entry kind and `not_before` are validated and honored on claim (Q-RET-06), but nothing writes them. Issue 18's dispatcher does.
-- The file backend does not produce apply markers. The SQLite backend exposes apply start and finish and serializes lexical canonical target keys, including ancestor/descendant overlap. Apply priority and `base_sha256` remain unimplemented there, so Q-SER-04 and Q-SER-06 are not claimed.
+- The store exposes apply start and finish and serializes lexical canonical target keys, including ancestor/descendant overlap. Apply priority and `base_sha256` remain unimplemented, so Q-SER-04 and Q-SER-06 are not claimed.
 - Parallelism metrics (Q-MET-01 to Q-MET-06).
 - A command-line front end for the queue. The library API is complete for a human worker; a CLI wrapper is not written.
 - A task-level `shit check` comparison of queue and lifecycle: the queue verifies the agreement itself on every operation.

@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from shit import commands
 from shit import task as task_mod
 from shit.project import Project
 
@@ -114,8 +115,16 @@ class RepoCase(unittest.TestCase):
         for n, (to, actor) in enumerate(path, start=1):
             if state == "open":
                 break
-            task_mod.transition(self.proj, tid, to, actor, "step", now=stamp(n))
-            used = n
+            if to == "approved":
+                commands.add_decision(self.proj, task_id=tid, decision_id=f"decision-{tid}", status="accepted",
+                                      question="Approve?", choice="Yes.", rationale="Reviewed.", actor="human",
+                                      now=stamp(n))
+                self._next_minute = base + n + 1
+                task_mod.transition(self.proj, tid, to, actor, "step", now=stamp(n + 1))
+                used = n + 1
+            else:
+                task_mod.transition(self.proj, tid, to, actor, "step", now=stamp(n))
+                used = n
             if to == state:
                 break
         self._next_minute = base + used + 1
@@ -130,7 +139,6 @@ class RepoCase(unittest.TestCase):
         self.put(f"briefs/{tid}.md", BRIEF)
         self.put(f"reports/{tid}.md", REPORT)
         self.put(f"cleanup/{tid}.md", CLEANUP)
-        self.put(f"decisions/{tid}.json", DECISION.replace('"t1"', f'"{tid}"'))
 
     def snapshot(self):
         out = {}

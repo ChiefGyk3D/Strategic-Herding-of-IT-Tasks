@@ -7,7 +7,7 @@ Read-only. Layout under `.shit/` (a missing file is exit 9, a present but invali
     reports/<id>.md       report whose first block is the evidence header (shit/evidence.py);
                           needed from `review` on
     cleanup/<id>.md       cleanup report with non-empty `removed:` and `kept:` lines; needed from `review` on
-    decisions/<id>.json   decision record by `human` with status accepted or rejected for this task;
+    indexed decisions     a decision record by `human` with status accepted or rejected for this task;
                           needed from `approved` on (the human disposition)
 
 The event log chain is verified too. Output is a fixed line per failed element, naming only the
@@ -18,7 +18,15 @@ import os
 import re
 import stat
 
-from . import _cli, brief, config, evidence, queue, records, store_check
+from . import (
+    _cli,
+    brief,
+    config,
+    evidence,
+    file_backend_state,
+    records,
+    store_check,
+)
 from ._text import check_text, decode
 from .errors import (
     BUSY,
@@ -31,7 +39,6 @@ from .errors import (
     USAGE,
     ShitError,
 )
-from .log import EventLog
 from .privacy import repo_root
 from .project import Project, bounded_names
 
@@ -206,17 +213,8 @@ def _check_element(failures, task_id, label, fn):
     return True
 
 
-def _check_task(project, task_id, failures):
-    try:
-        task = records.load_task(project.read(f"tasks/{task_id}.json"))
-    except _cli.EXPECTED as exc:
-        failures.add(_code(exc), task_id, "task record " + ("missing" if _code(exc) == PRECONDITION else "rejected"))
-        return
-    if task["id"] != task_id:
-        failures.add(REJECTED, task_id, "task record rejected")
-        return
-    state = task["state"]
-
+def _check_task(project, task_id, status, failures):
+    state = status["state"]
     if state in NEEDS_BRIEF:
         def check_brief():
             data = project.read(f"briefs/{task_id}.md", limit=brief.MAX_BYTES)
@@ -236,9 +234,8 @@ def _check_task(project, task_id, failures):
         _check_element(failures, task_id, "cleanup report",
                        lambda: _validate_cleanup(project.read(f"cleanup/{task_id}.md", limit=MAX_TEXT_BYTES + 1)))
 
-    if state in NEEDS_DISPOSITION:
-        _check_element(failures, task_id, "human disposition",
-                       lambda: _validate_disposition(task_id, project.read(f"decisions/{task_id}.json")))
+    if state in NEEDS_DISPOSITION and not status["human_disposition"]:
+        failures.add(PRECONDITION, task_id, "human disposition missing")
 
 
 def _task_ids(project):
@@ -277,31 +274,24 @@ def run_check(repo, task=None):
         if not stat.S_ISDIR(st.st_mode):
             raise ShitError(CONFINEMENT)
         failures = _Failures()
-        queue_line = None
         store_lines = []  # set below, once the project is read
-        ids, bad_names = _task_ids(project)
-        if bad_names:
-            failures.add(REJECTED, "tasks", "unexpected entry")
+        try:
+            statuses = store_check.task_statuses(project)
+        except _cli.EXPECTED as exc:
+            statuses = {}
+            failures.add(_code(exc), "store", "task records cannot be read")
+        ids = sorted(statuses)
+        if not statuses and file_backend_state.present(project):
+            failures.add(PRECONDITION, "store", "file backend is gone; start a new store")
         if task is not None:
             if task not in ids:
                 raise ShitError(PRECONDITION)
             ids = [task]
         for task_id in ids:
-            _check_task(project, task_id, failures)
-        events_ok = False
-        try:
-            EventLog(project).verify()
-            events_ok = True
-        except _cli.EXPECTED as exc:
-            failures.add(_code(exc), "events", "log rejected")
+            _check_task(project, task_id, statuses[task_id], failures)
         if _root_unchanged(repo, repo_fd, project, failures):
             _check_limits(repo_fd, failures)
             _root_unchanged(repo, repo_fd, project, failures)
-        if project.exists("pending.json"):
-            failures.add(REJECTED, "store", "unfinished commit; run any task command to recover")
-        findings, queue_line = queue.diagnose(project, events_ok)  # read-only: the queue state and any queue pending record
-        for code, text in findings:
-            failures.add(code, "queue", text)
         store_findings, store_lines, store_warnings = store_check.diagnose(project)  # read-only, from the SQLite store
         for code, text in store_findings:
             failures.add(code, "store", text)
@@ -311,8 +301,6 @@ def run_check(repo, task=None):
         os.close(repo_fd)
     code = failures.code()
     lines = [line for _, line in failures.items] + failures.warnings
-    if queue_line:
-        lines.append(queue_line)
     lines.extend(store_lines)
     lines.append(f"check: {'failed' if code else 'ok'} ({len(ids)} task{'s' if len(ids) != 1 else ''})")
     return code, lines

@@ -62,7 +62,7 @@ def _actor(p):
 def register(subparsers):
     """Add the task commands to an argparse subparsers object; each sets `func`."""
     p = _add_sub(subparsers, "init", help="create the .shit store")
-    p.add_argument("--backend", choices=("files", backend_name.SQLITE), default=None)
+    p.add_argument("--backend", default=None)
     p.set_defaults(func=_init)
 
     p = _add_sub(subparsers, "task", help="create, show or move a task")
@@ -152,16 +152,22 @@ def _open(ns):
 
 
 def _init(ns):
+    if ns.backend == "files":
+        error = ShitError(USAGE)
+        error.message = "file protocol was removed; start a new store"
+        raise error
+    if ns.backend not in (None, backend_name.SQLITE):
+        raise ShitError(USAGE)
     proj = project_mod.Project.init(_root(ns))
     try:
         configured = backend.resolve(proj.repo)
         if ns.backend is not None and ns.backend != configured.name:
             raise ShitError(USAGE)
-        selected = ns.backend or configured.name
-        if selected == backend_name.SQLITE:
-            if not proj.exists(store.DB_NAME) and file_backend_state.present(proj):
-                raise ShitError(PRECONDITION)
-            store.init_store(proj, configured.busy_timeout_ms)
+        if not proj.exists(store.DB_NAME) and file_backend_state.present(proj):
+            error = ShitError(PRECONDITION)
+            error.message = "file backend is gone; start a new store"
+            raise error
+        store.init_store(proj, configured.busy_timeout_ms)
     finally:
         proj.close()
     return {"initialized": True}

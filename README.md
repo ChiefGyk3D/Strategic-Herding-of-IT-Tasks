@@ -12,9 +12,9 @@ Four roles (implementer, reviewer, researcher, planner) and six packs (review-pr
 
 ## Queue (stage 3, in progress)
 
-The dependency graph, durable queue and per-task leases are implemented in `shit/dependencies.py`, `shit/queue.py` and `shit/queue_records.py`. The design is [docs/queue-spec.md](docs/queue-spec.md); what is built, what is deferred and what still needs a human decision is in [docs/queue.md](docs/queue.md).
+SQLite is the only task, record, dependency, queue, and lease backend. The implementation is in `shit/store.py`, `shit/store_tasks.py`, and `shit/store_queue.py`; record bodies remain files by design. The queue rules are in [docs/queue-spec.md](docs/queue-spec.md), with implementation notes in [docs/queue.md](docs/queue.md).
 
-The SQLite store that will replace the file queue is being built in steps; its foundation (confined connection, schema, fingerprint, error mapping) is `shit/store.py`, described in [docs/store.md](docs/store.md). Its hash-chained audit export, the offline verifier (`shit audit verify`) and the queue section of `shit check` are described in [docs/audit-export.md](docs/audit-export.md).
+The confined SQLite store, schema, fingerprint, error mapping, and operations are described in [docs/store.md](docs/store.md). Its hash-chained audit export, the offline verifier (`shit audit verify`) and the queue section of `shit check` are described in [docs/audit-export.md](docs/audit-export.md).
 
 Bounded work (directory width, byte budget, scan and lock-hold deadlines) is described in [docs/bounded-work.md](docs/bounded-work.md).
 

@@ -1,21 +1,21 @@
 """Bounded catalogs of backend artifacts below `.shit`."""
 
-from . import audit_export, commands, log, queue, store, task
+from . import audit_export, commands, log, store
 from .errors import PRECONDITION, ShitError
 from .project import LOCK_NAME, SUBDIRS
 
 FILE_ONLY_ARTIFACTS = (
     log.LOG_PATH,
     log.CHAIN_PATH,
-    task.PENDING,
-    queue.QUEUE,
-    queue.CHAIN,
-    queue.DEPS,
-    queue.LEGACY_GRAPH,
-    queue.PENDING,
-    queue.ANCHOR,
-    queue.VIEW,
-    queue.LEASES,
+    "pending.json",
+    "queue.jsonl",
+    "queue.chain",
+    "deps",
+    "dependencies.json",
+    "queue-pending.json",
+    "queue-anchor.json",
+    "QUEUE.md",
+    "leases",
 )
 SHARED_ARTIFACTS = (LOCK_NAME, *SUBDIRS, *commands.DIRS.values())
 SQLITE_ONLY_ARTIFACTS = (store.DB_NAME, audit_export.EXPORT_PATH)
@@ -23,7 +23,7 @@ SQLITE_ONLY_ARTIFACTS = (store.DB_NAME, audit_export.EXPORT_PATH)
 # Compatibility for callers that display or test the file-state catalog.
 FILE_BACKEND_ARTIFACTS = FILE_ONLY_ARTIFACTS
 
-_DIRECTORIES = {queue.DEPS, queue.LEASES}
+_DIRECTORIES = {"deps", "leases"}
 
 
 def present(project):

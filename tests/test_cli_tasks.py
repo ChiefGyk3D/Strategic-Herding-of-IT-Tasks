@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from _bootstrap import make_git_dir
+from _helpers import BRIEF, CLEANUP, REPORT
 
 from shit import (
     artifacts,
@@ -266,6 +267,12 @@ backend = "sqlite"
             store_queue.submit(proj, presented)
         finally:
             proj.close()
+        for task_id in ("t1", "queued"):
+            for directory in ("briefs", "reports", "cleanup"):
+                (self.repo / ".shit" / directory).mkdir(exist_ok=True)
+            (self.repo / ".shit" / "briefs" / f"{task_id}.md").write_text(BRIEF)
+            (self.repo / ".shit" / "reports" / f"{task_id}.md").write_text(REPORT)
+            (self.repo / ".shit" / "cleanup" / f"{task_id}.md").write_text(CLEANUP)
         code, out, err = self.run_cli("check")
         self.assertEqual((code, err), (0, ""))
         self.assertIn("store: queue 1 task (review 1)", out)
@@ -279,17 +286,20 @@ backend = "sqlite"
         self.assertEqual((code, err), (0, ""))
         self.assertIn("audit-export: ok", out)
 
-    def test_default_init_keeps_file_backend(self):
+    def test_default_init_creates_sqlite_store(self):
         self.assertEqual(self.ok("init"), {"initialized": True})
-        self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
+        self.assertTrue((self.repo / ".shit" / "store.sqlite3").exists())
 
-    def test_explicit_sqlite_init_requires_sqlite_in_configuration(self):
-        code, _out, err = self.run_cli("init", "--backend", "sqlite")
-        self.assertEqual((code, err), (2, "shit: usage error\n"))
+    def test_removed_file_backend_option_is_refused(self):
+        code, _out, err = self.run_cli("init", "--backend", "files")
+        self.assertEqual(code, 2)
+        self.assertIn("file protocol was removed", err)
+        self.assertIn("start a new store", err)
         self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
 
     def test_sqlite_init_refuses_existing_file_backend_state(self):
-        self.new_task()
+        (self.repo / ".shit").mkdir()
+        (self.repo / ".shit" / "events.jsonl").write_text("state")
         (self.repo / "config.toml").write_text("""schema_version = 1
 [project]
 name = "example-project"
@@ -307,7 +317,7 @@ context_tokens = 32768
 backend = "sqlite"
 """)
         code, _out, err = self.run_cli("init", "--backend", "sqlite")
-        self.assertEqual((code, err), (9, "shit: precondition missing\n"))
+        self.assertEqual((code, err), (9, "shit: file backend is gone; start a new store\n"))
         self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
 
     def test_file_backend_artifact_catalog_is_derived_from_its_definitions(self):
@@ -362,9 +372,9 @@ context_tokens = 32768
 backend = "sqlite"
 """)
         state = self.repo / ".shit"
+        state.mkdir()
         for name in file_backend_state.FILE_ONLY_ARTIFACTS:
             with self.subTest(name=name):
-                self.run_cli("init", "--backend", "files")
                 path = state / name
                 if name in {queue.DEPS, queue.LEASES}:
                     path.mkdir(exist_ok=True)
@@ -372,7 +382,7 @@ backend = "sqlite"
                 else:
                     path.write_text("state")
                 code, _out, err = self.run_cli("init", "--backend", "sqlite")
-                self.assertEqual((code, err), (9, "shit: precondition missing\n"))
+                self.assertEqual((code, err), (9, "shit: file backend is gone; start a new store\n"))
                 self.assertFalse((state / "store.sqlite3").exists())
                 if path.is_dir():
                     (path / "state.json").unlink()

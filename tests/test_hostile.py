@@ -12,6 +12,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import stat
 import tempfile
 import unittest
@@ -20,7 +21,7 @@ from pathlib import Path
 import _netguard
 from _bootstrap import make_git_dir
 
-from shit import cli_tasks, commands, records
+from shit import cli_tasks, commands, records, store
 from shit import task as task_mod
 from shit.errors import ShitError
 from shit.lifecycle import check_transition
@@ -147,13 +148,6 @@ class Hostile(unittest.TestCase):
         self.assertEqual(self.code(records.load_task, fixture("duplicate-key-nested.json")), 3)
         self.assertEqual(self.code(records.load_event, fixture("duplicate-key-event.jsonl").rstrip(b"\n")), 3)
 
-    def test_duplicate_key_planted_on_disk(self):
-        """H-02 a task file with a repeated key is refused through the CLI with exit 3."""
-        self.cli("init")
-        self.plant_task("duplicate-key-nested.json")
-        code, out, err = self.cli("task", "show", "hostile-task")
-        self.assertEqual((code, out, err), (3, "", "shit: record rejected\n"))
-
     def test_version_confusion(self):
         """H-03 schema_version true and 1.0 are not version 1."""
         self.assertEqual(self.code(records.load_task, fixture("version-true.json")), 3)
@@ -171,6 +165,8 @@ class Hostile(unittest.TestCase):
         self.assertEqual(self.code(records.load_task, b" " * (records.MAX_RECORD_BYTES + 1)), 7)
         self.assertEqual(self.code(records.load_event, b"[" * 200000), 7)
         self.cli("init")
+        commands.new_task(self.proj, task_id="hostile-task", title="t", summary="s", owner="human",
+                          actor="human", now=STAMP[1])
         self.plant_task("depth-9.json", b'{"pad":"' + b"x" * records.MAX_RECORD_BYTES + b'"}')
         self.assertEqual(self.cli("task", "show", "hostile-task")[0], 7)
 
@@ -182,6 +178,8 @@ class Hostile(unittest.TestCase):
     def test_hostile_characters_in_planted_task_are_refused(self):
         """H-06 a planted title or summary with bidi, escape, zero-width or NUL is rejected on load (exit 3)."""
         self.cli("init")
+        commands.new_task(self.proj, task_id="hostile-task", title="t", summary="s", owner="human",
+                          actor="human", now=STAMP[1])
         for name in ("bidi-title.json", "escape-title.json", "zero-width-summary.json"):
             self.plant_task(name)
             self.assertEqual(self.code(records.load_task, fixture(name)), 3, name)
@@ -257,23 +255,6 @@ class Hostile(unittest.TestCase):
             self.assertEqual(code, 10, actor)
         self.assertEqual(self.snapshot(), before)
 
-    def test_forged_non_human_decision_cannot_close(self):
-        """H-11 a decision file and event forged on disk with a non-human actor never lets close succeed."""
-        self.to_review()
-        self.move("approved", "human")
-        log = EventLog(self.proj)
-        record = commands._base("decision", "d9", "t1", "model", STAMP[40], status="accepted", question="q",
-                                choice="c", rationale="r")
-        data = commands.artifacts.dump("decision", record)
-        with self.proj.locked():
-            self.proj.ensure_dir("decisions")
-            self.proj.write_atomic("decisions/d9.json", data)
-            log.append(task_mod._event(log, "t1", "model", "decision_recorded",
-                                       commands._digest_message("decision", data), STAMP[40], record_id="d9"))
-        self.assertEqual(self.code(self.close), 10)
-        self.assertEqual(task_mod.get_task(self.proj, "t1")["state"], "approved")
-        self.assertEqual(self.cli("close", "t1", "--actor", "human", "--reason", "x")[0], 10)
-
     def test_non_human_review_cannot_unlock_close(self):
         """H-12 a passing review by the wrapper is not enough to close (exit 9)."""
         self.new()
@@ -325,10 +306,6 @@ class Hostile(unittest.TestCase):
         os.symlink(self.secret, self.shit / "tasks" / "t1.json")
         self.assertEqual(self.code(task_mod.get_task, self.proj, "t1"), 5)
         self.assertEqual(self.cli("task", "show", "t1")[0], 5)
-        # event log replaced by a symlink to outside
-        (self.shit / LOG_PATH).unlink()
-        os.symlink(self.secret, self.shit / LOG_PATH)
-        self.assertEqual(self.verify_code(), 5)
         # the store itself replaced by a symlink to a directory elsewhere
         self.proj.close()
         moved = self.outside / "moved-store"
@@ -356,10 +333,6 @@ class Hostile(unittest.TestCase):
         os.link(self.secret, self.repo / "hard.txt")
         self.assertEqual(self.code(commands.add_evidence, self.proj, task_id="t1", evidence_id="e1", path="hard.txt",
                                    description="d", actor="wrapper", now=STAMP[5]), 5)
-        os.link(self.shit / LOG_PATH, self.outside / "log-alias")
-        self.assertEqual(self.verify_code(), 5)
-        self.assertEqual(self.code(self.move, "running", "wrapper"), 5)
-        os.unlink(self.outside / "log-alias")
         os.link(self.shit / "tasks" / "t1.json", self.outside / "task-alias")
         self.assertEqual(self.code(task_mod.get_task, self.proj, "t1"), 5)
         self.assertEqual(self.secret.read_bytes(), b"outside-data")
@@ -373,20 +346,6 @@ class Hostile(unittest.TestCase):
                                    description="d", actor="wrapper", now=STAMP[5]), 5)
         os.mkfifo(self.shit / "tasks" / "p.json")
         self.assertEqual(self.code(self.proj.read, "tasks/p.json"), 5)
-        (self.shit / CHAIN_PATH).unlink()
-        os.mkfifo(self.shit / CHAIN_PATH)
-        self.assertEqual(self.verify_code(), 5)
-        self.proj.close()
-        (self.shit / "lock").unlink(missing_ok=True)
-        os.mkfifo(self.shit / "lock")
-        proj = Project.open(self.repo)
-        self.addCleanup(proj.close)
-
-        def locked():
-            with proj.locked():
-                pass
-
-        self.assertEqual(self.code(locked), 5)
 
     def test_sockets_and_directories_and_devices(self):
         """H-17 a socket, directory or device node in place of a regular file is refused (exit 5)."""
@@ -411,38 +370,8 @@ class Hostile(unittest.TestCase):
                                    description="d", actor="wrapper", now=STAMP[5]), 7)
         (self.shit / "tasks" / "t1.json").write_bytes(b" " * (records.MAX_RECORD_BYTES + 1))
         self.assertEqual(self.code(task_mod.get_task, self.proj, "t1"), 7)
-        lines = self.log_lines()
-        self.write_log([lines[0] + b" " * (records.MAX_RECORD_BYTES + 1)])
-        self.assertEqual(self.verify_code(), 7)
         self.assertEqual(self.code(commands.new_task, self.proj, task_id="t2", title="x" * 201, summary="s",
                                    owner="human", actor="human", now=STAMP[6]), 3)
-
-    def test_planted_pending_record_bomb(self):
-        """H-19 a deeply nested or forged pending.json is rejected (exit 3) and changes nothing."""
-        self.new()
-        before = self.snapshot()
-        for body in (b"[" * 200000, b'{"index":0}', b"\xff\xfe", b'{"index":0,"index":1}'):
-            (self.shit / "pending.json").write_bytes(body)
-            self.assertEqual(self.code(task_mod.get_task, self.proj, "t1"), 3, body[:12])
-        (self.shit / "pending.json").unlink()
-        self.assertEqual(self.snapshot(), before)
-
-    def test_forged_pending_with_wrong_chain(self):
-        """H-19b a pending.json whose chain entry does not follow the log is rejected, the log is untouched."""
-        self.new()
-        log = EventLog(self.proj)
-        record = task_mod.get_task(self.proj, "t1")
-        record = {**record, "state": "running", "updated_at": STAMP[9]}
-        record["history"] = [{"from": "open", "to": "running", "actor": "wrapper", "at": STAMP[9], "reason": "r"}]
-        with self.proj.locked():
-            prepared = log.prepare(task_mod._event(log, "t1", "wrapper", "state_transition", "State transition recorded.",
-                                                   STAMP[9], from_state="open", to_state="running"))
-        doc = {"index": prepared.index, "event_line": prepared.line.decode("ascii"), "chain_line": "0" * 64,
-               "task": record}
-        (self.shit / "pending.json").write_text(json.dumps(doc))
-        before = self.snapshot()
-        self.assertEqual(self.code(task_mod.get_task, self.proj, "t1"), 3)
-        self.assertEqual(self.snapshot(), before)
 
     # -- the event log and its chain -----------------------------------------------
 
@@ -450,79 +379,34 @@ class Hostile(unittest.TestCase):
         self.new()
         self.move("running", "wrapper")
         self.move("review", "wrapper")
-        self.assertEqual(len(self.log_lines()), 3)
+        conn = store.connect(self.proj)
+        self.addCleanup(conn.close)
+        self.assertEqual(len(store.list_events(conn)), 3)
+        return conn
 
     def test_chain_matches_independent_recomputation(self):
-        """H-20 the chain file equals sha256(previous hex, newline, line) computed here, not by the library."""
-        self.three_events()
+        """H-20 database event hashes equal sha256(previous hex, newline, line) computed independently."""
+        conn = self.three_events()
         previous = "0" * 64
         expected = []
-        for line in self.log_lines():
+        for event in store.list_events(conn):
+            line = records.dump_event(event)
             previous = hashlib.sha256(previous.encode() + b"\n" + line).hexdigest()
-            expected.append(previous.encode())
-        self.assertEqual(self.chain_lines(), expected)
+            expected.append(previous)
+        raw = sqlite3.connect(self.shit / store.DB_NAME)
+        self.addCleanup(raw.close)
+        self.assertEqual([row[0] for row in raw.execute("SELECT hash FROM events ORDER BY seq")], expected)
         self.assertEqual(GENESIS, "0" * 64)
         self.assertEqual(chain_hash(GENESIS, b"x"), hashlib.sha256(b"0" * 64 + b"\nx").hexdigest())
 
     def test_reordered_deleted_edited_events(self):
-        """H-21 swapping, deleting, truncating or editing events without the chain is detected (exit 3)."""
+        """H-21 editing a database event without its hash is detected and writers refuse with exit 8."""
         self.three_events()
-        lines, chain = self.log_lines(), self.chain_lines()
-        cases = {
-            "swap": ([lines[0], lines[2], lines[1]], chain, 3),
-            "delete-middle": ([lines[0], lines[2]], chain, 3),
-            "delete-middle-both": ([lines[0], lines[2]], [chain[0], chain[2]], 3),
-            "truncate-log": (lines[:2], chain, 3),
-            "truncate-chain": (lines, chain[:2], 3),
-            "empty-log": ([], chain, 3),
-            "edit-message": ([lines[0].replace(b"Task record created.", b"Task record Created."), *lines[1:]], chain, 3),
-            "edit-timestamp": ([lines[0], lines[1].replace(b"16:02:00", b"16:03:00"), lines[2]], chain, 3),
-            # an actor edit that is also a lifecycle violation is stopped by the event contract first (exit 4)
-            "edit-actor-illegal": ([lines[0], lines[1].replace(b'"wrapper"', b'"human"'), lines[2]], chain, 4),
-            "duplicate-line": (lines + [lines[2]], chain + [chain[2]], 3),
-            "append-without-chain": (lines + [lines[0].replace(b"event-0001", b"event-0004")], chain, 3),
-            "chain-uppercase": (lines, [chain[0].upper(), chain[1], chain[2]], 3),
-            "chain-garbage": (lines, [chain[0], b"\xff" * 64, chain[2]], 3),
-        }
-        for name, (log_lines, chain_lines, expected) in cases.items():
-            self.write_log(log_lines, chain_lines)
-            if not log_lines:
-                (self.shit / LOG_PATH).write_bytes(b"")
-            self.assertEqual(self.verify_code(), expected, name)
-        # the commands refuse to extend a forged log
-        self.write_log(lines[:2], chain)
-        self.assertEqual(self.code(self.move, "failed", "wrapper"), 3)
-        self.assertEqual(self.cli("task", "move", "t1", "failed", "--actor", "wrapper", "--reason", "x")[0], 3)
-
-    def test_log_shape_attacks(self):
-        """H-22 a blank line, a missing final newline, CRLF or a forged duplicate event id is rejected (exit 3)."""
-        self.three_events()
-        lines = self.log_lines()
-        raw = (self.shit / LOG_PATH)
-        raw.write_bytes(b"\n".join(lines))
-        self.assertEqual(self.verify_code(), 3)
-        raw.write_bytes(b"\n".join(lines[:1] + [b""] + lines[1:]) + b"\n")
-        self.assertEqual(self.verify_code(), 3)
-        raw.write_bytes(b"\r\n".join(lines) + b"\r\n")
-        self.assertEqual(self.verify_code(), 3)
-        # a forged event that repeats an id, with a valid chain entry (attacker recomputed it)
-        forged = lines + [lines[0]]
-        previous, chain_forged = GENESIS, []
-        for line in forged:
-            previous = chain_hash(previous, line)
-            chain_forged.append(previous.encode())
-        self.write_log(forged, chain_forged)
-        self.assertEqual(self.verify_code(), 3)
-
-    def test_forged_event_without_record(self):
-        """H-23 a chained event that points at a record file that does not exist is not trusted (exit 9)."""
-        self.to_review()
-        log = EventLog(self.proj)
-        with self.proj.locked():
-            log.append(task_mod._event(log, "t1", "human", "decision_recorded",
-                                       commands._digest_message("decision", b"{}"), STAMP[50], record_id="d1"))
-        self.assertEqual(self.code(commands.show, self.proj, "decision", "d1"), 9)
-        self.assertEqual(self.cli("decision", "show", "d1")[0], 9)
+        raw = sqlite3.connect(self.shit / store.DB_NAME, isolation_level=None)
+        self.addCleanup(raw.close)
+        raw.execute("DROP TRIGGER events_no_update")
+        raw.execute("UPDATE events SET message = 'altered' WHERE seq = 2")
+        self.assertEqual(self.cli("task", "move", "t1", "failed", "--actor", "wrapper", "--reason", "x")[0], 8)
 
     # -- tampered evidence and records ---------------------------------------------
 

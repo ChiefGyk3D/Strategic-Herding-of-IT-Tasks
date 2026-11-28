@@ -1,8 +1,7 @@
 """Tasks, events and records on the database store, with the signatures of `task.py` and `commands.py` (issue 61).
 
-This is the adapter layer for the port from the file protocol: a caller that used `task.create_task`, `task.transition`
-or one of the `commands` functions finds the same name and arguments here and gets the same result and the same exit
-codes. The file protocol is left in place until the CLI and the queue move over (issue 63); nothing here touches it.
+This is the store adapter layer: a caller that used `task.create_task`, `task.transition` or one of the `commands`
+functions finds the same name and arguments here and gets the same result and the same exit codes.
 
 A record BODY is still a file under `.shit/`, written to its final name before the database transaction and compared
 with its digest in the records index after it. The index row, the event and (for a task) the state change are one

@@ -40,6 +40,36 @@ def _queue_lines(conn, now):
     return lines
 
 
+def task_statuses(project):
+    """Current task states and human dispositions from one read-only snapshot; no store means no tasks."""
+    if not project.exists(store.DB_NAME):
+        return {}
+    try:
+        conn = store.connect(project)
+    except ShitError:
+        return {}
+    try:
+        with store.read_snapshot(conn):
+            statuses = {}
+            for row in store.list_records(conn):
+                if row["kind"] != "task":
+                    continue
+                body = store_tasks._read_body(project, "task", row["record_id"], row)
+                if store_tasks.records.load_task(body)["id"] != row["record_id"]:
+                    raise ShitError(FAILED_CLOSED)
+                task_id = row["record_id"]
+                decisions = [store_tasks._load(project, conn, "decision", record_id, task_id)
+                             for record_id in store.record_ids(conn, "decision", task_id)]
+                statuses[task_id] = {
+                    "state": store.get_task(conn, task_id)["state"],
+                    "human_disposition": any(item["actor"] == "human" and item["status"] in ("accepted", "rejected")
+                                             for item in decisions),
+                }
+            return statuses
+    finally:
+        conn.close()
+
+
 def diagnose(project, now=None):
     """([(exit code, text)], [summary lines], [warning lines]); all empty when the project has no store file."""
     findings, lines, warnings = [], [], []
@@ -55,7 +85,7 @@ def diagnose(project, now=None):
     try:
         with store.read_snapshot(conn):
             if file_backend_state.present(project):
-                findings.append((FAILED_CLOSED, "file-backend state is present beside the database"))
+                findings.append((FAILED_CLOSED, "file backend is gone; start a new store"))
             for name in store.verify(conn, deep=True) + store.verify_tasks(conn):
                 findings.append((FAILED_CLOSED, f"invariant {name} does not hold"))
             for name in store_tasks.verify_bodies(project, conn, include_orphans=True):
