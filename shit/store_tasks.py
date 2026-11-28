@@ -18,6 +18,7 @@ import hashlib
 from . import artifacts, commands, records, store
 from . import task as task_mod
 from .errors import (
+    CONFINEMENT,
     HUMAN_APPROVAL,
     ILLEGAL_TRANSITION,
     PRECONDITION,
@@ -61,15 +62,15 @@ def _digest(data):
 def _publish(project, kind, record_id, data):
     """Write `data` to the body's final name unless a body is already there. Returns the bytes now on disk.
 
-    The temp-and-link publication is atomic (a body appears complete or not at all), and the lock only serves the
-    cleanup of a pair that an earlier crash left half done. Nothing already on disk is overwritten."""
+    The temp-and-link publication is atomic (a body appears complete or not at all) and nothing already on disk is
+    overwritten, so two callers that race for one name cannot both win. No lock is taken: a crash between the link
+    and the removal of the temp name leaves a second link on the body, which every read then refuses (exit code 5);
+    that record id is unusable until the extra `.tmp-` name is removed by hand, and another id works."""
     path = _body_path(kind, record_id)
-    with project.locked(create=True):
-        project.ensure_dir(_directory(kind))
-        project.finish_publications(_directory(kind))
-        if project.create_exclusive(path, data, limit=_MAX_BODY):
-            return data
-        return project.read(path, limit=_MAX_BODY)
+    project.ensure_dir(_directory(kind))
+    if project.create_exclusive(path, data, limit=_MAX_BODY):
+        return data
+    return project.read(path, limit=_MAX_BODY)
 
 
 def _read_body(project, kind, record_id, index):
@@ -91,16 +92,20 @@ def _check_published(project, conn, kind, record_id):
 def verify_bodies(project, conn):
     """Read-only: names of the problems between the records index and the body files.
 
-    `body_missing` (no file under a recorded name) and `body_differs_from_index` (bytes that do not match the digest).
+    `body_missing` (no file under a recorded name), `body_unreadable` (a symlink, a second link or a special file there)
+    and `body_differs_from_index` (bytes that do not match the digest).
     A file with no index row is not a problem: it is what a crash between the body and the transaction leaves."""
     found = set()
     for row in store.list_records(conn):
         try:
             data = project.read(_body_path(row["kind"], row["record_id"]), limit=_MAX_BODY)
         except ShitError as exc:
-            if exc.code != PRECONDITION:
+            if exc.code == PRECONDITION:
+                found.add("body_missing")
+            elif exc.code == CONFINEMENT:
+                found.add("body_unreadable")  # a symlink, a second link, a special file
+            else:
                 raise
-            found.add("body_missing")
             continue
         if _digest(data) != (row["sha256"], row["size"]):
             found.add("body_differs_from_index")

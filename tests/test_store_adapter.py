@@ -323,15 +323,17 @@ class BodyTests(StoreCase):
         self.assertEqual(code_of(self.evidence, "ev-1", "ghost", T1), errors.PRECONDITION)
         self.assertFalse((self.shit / "evidence" / "ev-1.json").exists())
 
-    def test_a_publication_pair_left_by_a_crash_is_healed(self):
+    def test_a_publication_pair_left_by_a_crash_fails_closed_and_another_id_works(self):
         self.make()
         self.proj.ensure_dir("evidence")
         data = commands.artifacts.dump("evidence", commands._base(
             "evidence", "ev-1", "t1", "wrapper", T1, description="d", path="out.txt", sha256="0" * 64, size=1))
         self.proj.write_atomic("evidence/ev-1.json", data)
         os.link(self.shit / "evidence" / "ev-1.json", self.shit / "evidence" / ".tmp-deadbeef")
-        self.evidence()  # the second link would make every read refuse; publication removes the temp name
-        self.assertEqual(sorted(p.name for p in (self.shit / "evidence").iterdir()), ["ev-1.json"])
+        before = (self.count_rows("events"), self.count_rows("records"))
+        self.assertEqual(code_of(self.evidence), errors.CONFINEMENT)  # the second link makes the body unreadable
+        self.assertEqual((self.count_rows("events"), self.count_rows("records")), before)
+        self.evidence("ev-2")
         self.consistent()
 
 
@@ -380,7 +382,7 @@ class TamperTests(StoreCase):
         os.unlink(self.shit / "evidence" / "ev-1.json")
         os.symlink(outside, self.shit / "evidence" / "ev-1.json")
         self.assertEqual(code_of(store_tasks.show, self.proj, "evidence", "ev-1"), errors.CONFINEMENT)
-        self.assertEqual(code_of(store_tasks.verify_bodies, self.proj, self.conn()), errors.CONFINEMENT)
+        self.assertEqual(store_tasks.verify_bodies(self.proj, self.conn()), ["body_unreadable"])
 
 
 class StoreAccessTests(StoreCase):
