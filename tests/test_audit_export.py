@@ -728,6 +728,29 @@ class WriteFailureTests(Flow):
         self.assertEqual(self.export_bytes(), data)
 
 
+class LockTests(Flow):
+    def test_the_export_is_written_while_the_databases_write_lock_is_held(self):
+        self.task("a", enqueue=False)
+        self.unexported("b")  # the export is behind: the next write must replace it
+        seen = []
+
+        def probe(stage):
+            if stage != "before-write":
+                return
+            other = store.connect(self.proj, busy_timeout_ms=0)
+            try:
+                seen.append(code_of(lambda: store.write_transaction(other).__enter__()))
+            finally:
+                other.close()
+
+        conn = store.connect(self.proj)
+        self.addCleanup(conn.close)
+        with mock.patch.object(audit_export, "_fault", probe):
+            self.assertTrue(audit_export.sync(self.proj, conn))
+        self.assertEqual(seen, [errors.BUSY])
+        self.assertEqual(self.status().state, audit_export.CURRENT)
+
+
 class ConcurrencyTests(Flow):
     def test_concurrent_writers_leave_an_export_that_is_current_and_verifies(self):
         self.task("seed")
