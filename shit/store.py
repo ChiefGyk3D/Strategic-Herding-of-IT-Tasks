@@ -23,6 +23,7 @@ from .errors import (
     BUSY,
     CONFINEMENT,
     FAILED_CLOSED,
+    HUMAN_APPROVAL,
     ILLEGAL_TRANSITION,
     INPUT_LIMIT,
     INTERNAL,
@@ -33,7 +34,7 @@ from .errors import (
     USAGE,
     ShitError,
 )
-from .log import GENESIS
+from .log import GENESIS, chain_hash
 from .project import _os_error
 
 DB_NAME = "store.sqlite3"
@@ -1025,6 +1026,385 @@ def _verify_unmapped(conn, deep):
         found.add("foreign_key_violation")
     if deep and conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
         found.add("integrity_check_failed")
+    return sorted(found)
+
+
+# == C3: tasks, events and the records index (issue 61, epic 57) =========================================
+#
+# One helper is one `write_transaction`: every check and every read happens after BEGIN IMMEDIATE, then the writes
+# follow in a fixed order (task row, history row, index row, event). Record BODIES stay files. The caller writes the
+# body to its final name before calling a helper and compares its digest with the index row afterwards
+# (`shit/store_tasks.py`). The event hash is the file protocol's: sha256(previous hash, newline, the event's line).
+
+# Record kind -> (event kind, label of the event message). A kind without an entry is indexed with no event.
+_RECORD_EVENTS = {
+    "brief": ("brief_recorded", "Brief"), "evidence": ("evidence_recorded", "Evidence"),
+    "report": ("report_recorded", "Report"), "review": ("review_recorded", "Review"),
+    "decision": ("decision_recorded", "Decision"),
+}
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_PLACEHOLDER = "-"  # title and summary live in the task body file; the image checked here needs some text
+
+
+def _fault(stage):
+    """Fault-injection seam: tests replace it to abort a helper between two statements of its one transaction."""
+
+
+def _slug_or_reject(value):
+    if not isinstance(value, str) or not records.SLUG.fullmatch(value):
+        raise ShitError(REJECTED)
+    return value
+
+
+def _digest_or_reject(sha256, size):
+    if (not isinstance(sha256, str) or not _HEX64.fullmatch(sha256) or type(size) is not int
+            or not 0 <= size <= MAX_RECORD_BYTES):
+        raise ShitError(REJECTED)
+
+
+def record_message(kind, sha256):
+    """The fixed event message of a recorded body: it carries the digest, as the file protocol's did."""
+    return _RECORD_EVENTS[kind][1] + " record added; sha256 " + sha256 + "."
+
+
+@contextlib.contextmanager
+def read_snapshot(conn):
+    """One consistent read: every SELECT inside sees the same commit, and nothing is written (ends in ROLLBACK).
+
+    Reads outside a snapshot are fine for one statement; an operation that reads several rows (a task and its history)
+    uses this, so a writer that commits between two reads is not seen half way."""
+    try:
+        conn.execute("BEGIN")
+    except sqlite3.Error as exc:
+        raise map_error(exc) from None
+    try:
+        yield conn
+    except BaseException as exc:
+        _fail_transaction(conn, exc)  # always raises
+        raise
+    try:
+        conn.execute("ROLLBACK")
+    except BaseException:
+        _give_up(conn)  # always raises
+        raise
+    if _in_transaction(conn) is not False:
+        _give_up(conn)
+
+
+# -- reads (single statements; wrap several in `read_snapshot`) --------------------------------------------
+
+
+def _task_row(conn, task_id):
+    row = conn.execute("SELECT id, state, owner, created_at, updated_at, blocked_reason, blocking_item FROM tasks "
+                       "WHERE id = ?", (task_id,)).fetchone()
+    if row is None:
+        return None
+    task = {"id": row[0], "state": row[1], "owner": row[2], "created_at": row[3], "updated_at": row[4]}
+    if row[5] is not None:
+        task["blocked_reason"], task["blocking_item"] = row[5], row[6]
+    return task
+
+
+def _history_rows(conn, task_id):
+    return [{"from": a, "to": b, "actor": c, "at": d, "reason": e} for a, b, c, d, e in conn.execute(
+        "SELECT from_state, to_state, actor, at, reason FROM task_history WHERE task_id = ? ORDER BY id",
+        (task_id,)).fetchall()]
+
+
+def get_task(conn, task_id):
+    """The task row and its history as one dict (no title or summary: those are in the body file), or None."""
+    task = _task_row(conn, task_id)
+    if task is not None:
+        task["history"] = _history_rows(conn, task_id)
+    return task
+
+
+def _kind_or_reject(kind, allowed):
+    if kind not in allowed:
+        raise ShitError(REJECTED)
+    return kind
+
+
+def get_record(conn, kind, record_id):
+    """The index row of one record body (kind, id, task, digest, size, time), or None."""
+    _kind_or_reject(kind, RECORD_KINDS)
+    row = conn.execute("SELECT task_id, sha256, size, created_at FROM records WHERE kind = ? AND record_id = ?",
+                       (kind, record_id)).fetchone()
+    if row is None:
+        return None
+    return {"kind": kind, "record_id": record_id, "task_id": row[0], "sha256": row[1], "size": row[2],
+            "created_at": row[3]}
+
+
+def list_records(conn):
+    """Every index row, in a fixed order (kind, then id)."""
+    return [{"kind": kind, "record_id": record_id, "task_id": task_id, "sha256": sha256, "size": size}
+            for kind, record_id, task_id, sha256, size in conn.execute(
+                "SELECT kind, record_id, task_id, sha256, size FROM records ORDER BY kind, record_id").fetchall()]
+
+
+def _event_dict(row):
+    """An event as the record the file protocol dumped (same keys, same order), from the columns of one row."""
+    event = {"schema": "event-log", "schema_version": 1, "id": row[0], "task_id": row[1], "timestamp": row[2],
+             "actor": row[3], "event": row[4], "message": row[5]}
+    if row[6] is not None:
+        event["record_id"] = row[6]
+    if row[7] is not None:
+        event["from_state"], event["to_state"] = row[7], row[8]
+    if row[9] is not None:
+        event["exit_code"] = row[9]
+    return event
+
+
+def record_event(conn, kind, record_id):
+    """The event that recorded a body of `kind` (not a task, not a handoff), or None."""
+    _kind_or_reject(kind, _RECORD_EVENTS)
+    row = conn.execute("SELECT id, task_id, timestamp, actor, event, message, record_id, from_state, to_state, "
+                       "exit_code FROM events WHERE event = ? AND record_id = ?",
+                       (_RECORD_EVENTS[kind][0], record_id)).fetchone()
+    return None if row is None else _event_dict(row)
+
+
+def record_ids(conn, kind, task_id):
+    """Ids of the records of `kind` for `task_id`, in the order their events were written."""
+    _kind_or_reject(kind, _RECORD_EVENTS)
+    return [row[0] for row in conn.execute(
+        "SELECT e.record_id FROM events e JOIN records r ON r.kind = ? AND r.record_id = e.record_id "
+        "WHERE e.event = ? AND e.task_id = ? AND r.task_id = e.task_id ORDER BY e.seq",
+        (kind, _RECORD_EVENTS[kind][0], task_id)).fetchall()]
+
+
+def list_events(conn):
+    """Every event, oldest first, as the dicts the file protocol's log held."""
+    return [_event_dict(row) for row in conn.execute(
+        "SELECT id, task_id, timestamp, actor, event, message, record_id, from_state, to_state, exit_code "
+        "FROM events ORDER BY seq").fetchall()]
+
+
+# -- the events of one operation ----------------------------------------------------------------------------
+
+
+def _tip(conn):
+    """(sequence number, hash, timestamp) of the last event, or the genesis values when there is none."""
+    row = conn.execute("SELECT seq, hash, timestamp FROM events ORDER BY seq DESC LIMIT 1").fetchone()
+    return (0, GENESIS, "") if row is None else (row[0], row[1], row[2])
+
+
+def _next_event(conn, task_id, actor, kind, message, now, **extra):
+    """Build and validate the next event of the log and its hash. Read-only: the caller inserts it."""
+    seq, previous, stamp = _tip(conn)
+    if not isinstance(now, str) or now < stamp:  # event time never goes back (the file log checked the same)
+        raise ShitError(REJECTED)
+    event = {"schema": "event-log", "schema_version": 1, "id": "event-" + format(seq + 1, "04d"), "task_id": task_id,
+             "timestamp": now, "actor": actor, "event": kind, "message": message, "record_id": task_id, **extra}
+    line = records.dump_event(event)
+    return seq + 1, previous, chain_hash(previous, line), event
+
+
+def _image(task, history):
+    """The task as `records.validate_task` reads it, so the history is checked by the same code as before."""
+    image = {"schema": "task", "schema_version": 1, "id": task["id"], "title": _PLACEHOLDER, "summary": _PLACEHOLDER,
+             "state": task["state"], "owner": task["owner"], "created_at": task["created_at"],
+             "updated_at": task["updated_at"], "history": history}
+    for key in ("blocked_reason", "blocking_item"):
+        if key in task:
+            image[key] = task[key]
+    return image
+
+
+# -- writes: one helper, one transaction ------------------------------------------------------------------
+
+
+def create_task(conn, task, actor, body_sha256, body_size):
+    """Create a task: its row, the index row of its body file and the `task_created` event, in one transaction.
+
+    `task` is the validated image the body file holds (state open, no history, created equals updated)."""
+    records.validate_task(task)
+    if (task["state"] != "open" or task["history"] or task["created_at"] != task["updated_at"]
+            or "blocked_reason" in task or "blocking_item" in task):
+        raise ShitError(REJECTED)
+    _digest_or_reject(body_sha256, body_size)
+    with write_transaction(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task["id"],)).fetchone() is not None:
+            raise ShitError(USAGE)
+        seq, previous, digest, event = _next_event(conn, task["id"], actor, "task_created", "Task record created.",
+                                                   task["created_at"])
+        _fault("checked")
+        conn.execute("INSERT INTO tasks (id, state, owner, created_at, updated_at) VALUES (?, 'open', ?, ?, ?)",
+                     (task["id"], task["owner"], task["created_at"], task["updated_at"]))
+        _fault("task-row")
+        conn.execute("INSERT INTO records (kind, record_id, task_id, sha256, size, created_at) "
+                     "VALUES ('task', ?, ?, ?, ?, ?)", (task["id"], task["id"], body_sha256, body_size,
+                                                        task["created_at"]))
+        _fault("index-row")
+        conn.execute("INSERT INTO events (seq, id, task_id, timestamp, actor, event, message, record_id, from_state, "
+                     "to_state, exit_code, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+                     (seq, event["id"], event["task_id"], event["timestamp"], event["actor"], event["event"],
+                      event["message"], event["record_id"], previous, digest))
+
+
+def transition_task(conn, task_id, to, actor, reason, now, *, blocked_reason=None, blocking_item=None,
+                    precheck=None):
+    """Move a task: the new state, the history row and the `state_transition` event, in one transaction.
+
+    `precheck(current)` runs inside the transaction on the task row as read there (not the body file) and may raise.
+    Returns the task row after the change."""
+    _slug_or_reject(task_id)
+    with write_transaction(conn):
+        current = _task_row(conn, task_id)
+        if current is None:
+            raise ShitError(PRECONDITION)
+        frm = current["state"]
+        if to == "approved" and actor != "human" and (frm, to) in lifecycle.LEGAL:
+            raise ShitError(HUMAN_APPROVAL)
+        lifecycle.check_transition(frm, to, actor)
+        if precheck is not None:
+            precheck(current)
+        if not isinstance(now, str) or now < current["updated_at"]:
+            raise ShitError(REJECTED)
+        blocked = {}
+        if to == "blocked":
+            if not blocked_reason or not blocking_item:
+                raise ShitError(REJECTED)
+            blocked = {"blocked_reason": blocked_reason, "blocking_item": blocking_item}
+        elif blocked_reason is not None or blocking_item is not None:
+            raise ShitError(REJECTED)
+        step = {"from": frm, "to": to, "actor": actor, "at": now, "reason": reason}
+        after = {"id": task_id, "state": to, "owner": current["owner"], "created_at": current["created_at"],
+                 "updated_at": now, **blocked}
+        records.validate_task(_image(after, [*_history_rows(conn, task_id), step]))
+        seq, previous, digest, event = _next_event(conn, task_id, actor, "state_transition",
+                                                   "State transition recorded.", now, from_state=frm, to_state=to)
+        _fault("checked")
+        conn.execute("UPDATE tasks SET state = ?, updated_at = ?, blocked_reason = ?, blocking_item = ? WHERE id = ?",
+                     (to, now, blocked.get("blocked_reason"), blocked.get("blocking_item"), task_id))
+        _fault("task-updated")
+        conn.execute("INSERT INTO task_history (task_id, from_state, to_state, actor, at, reason) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (task_id, frm, to, actor, now, reason))
+        _fault("history-row")
+        conn.execute("INSERT INTO events (seq, id, task_id, timestamp, actor, event, message, record_id, from_state, "
+                     "to_state, exit_code, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                     (seq, event["id"], event["task_id"], event["timestamp"], event["actor"], event["event"],
+                      event["message"], event["record_id"], frm, to, previous, digest))
+    return after
+
+
+def add_record(conn, kind, record, body_sha256, body_size, check=None):
+    """Index a record body and write its event, in one transaction (a `handoff` has no event, only the row).
+
+    `record` holds the id, task id, actor and creation time of the body. `check(task)` runs inside the
+    transaction on the task row and may raise. A closed task takes no more records."""
+    _kind_or_reject(kind, RECORD_KINDS)
+    if kind == "task":
+        raise ShitError(REJECTED)  # a task's index row is written by create_task
+    record_id, task_id = _slug_or_reject(record.get("id")), _slug_or_reject(record.get("task_id"))
+    actor, stamp = record.get("actor"), record.get("created_at")
+    _digest_or_reject(body_sha256, body_size)
+    with write_transaction(conn):
+        current = _task_row(conn, task_id)
+        if current is None:
+            raise ShitError(PRECONDITION)
+        if current["state"] == "closed":
+            raise ShitError(ILLEGAL_TRANSITION)
+        if conn.execute("SELECT 1 FROM records WHERE kind = ? AND record_id = ?", (kind, record_id)).fetchone():
+            raise ShitError(USAGE)
+        if check is not None:
+            check(current)
+        planned = None
+        if kind in _RECORD_EVENTS:
+            planned = _next_event(conn, task_id, actor, _RECORD_EVENTS[kind][0], record_message(kind, body_sha256),
+                                  stamp, record_id=record_id)
+        elif actor not in lifecycle.ACTORS or not isinstance(stamp, str) or not records.TIMESTAMP.fullmatch(stamp):
+            raise ShitError(REJECTED)
+        _fault("checked")
+        conn.execute("INSERT INTO records (kind, record_id, task_id, sha256, size, created_at) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (kind, record_id, task_id, body_sha256, body_size, stamp))
+        _fault("record-row")
+        if planned is not None:
+            seq, previous, digest, event = planned
+            conn.execute("INSERT INTO events (seq, id, task_id, timestamp, actor, event, message, record_id, "
+                         "from_state, to_state, exit_code, prev_hash, hash) VALUES "
+                         "(?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+                         (seq, event["id"], event["task_id"], event["timestamp"], event["actor"], event["event"],
+                          event["message"], event["record_id"], previous, digest))
+
+
+# -- consistency of the task data ------------------------------------------------------------------------
+
+
+def verify_tasks(conn):
+    """Read-only: the names of the task, event and index invariants this database does not hold.
+
+    These span several statements, so a trigger cannot refuse them (a crash cannot produce them through the helpers
+    above, which write each operation in one transaction; a hand edit or a writer that skipped them can).
+    `verify` covers the chain links; this adds the event hashes, the task rows against their history and events, and
+    the records index against its events. An SQLite failure while reading raises the usual fixed `ShitError`."""
+    try:
+        return _verify_tasks_unmapped(conn)
+    except sqlite3.Error as exc:
+        raise map_error(exc) from None
+
+
+def _verify_tasks_unmapped(conn):
+    found = set()
+    events = []
+    for row in conn.execute("SELECT id, task_id, timestamp, actor, event, message, record_id, from_state, to_state, "
+                            "exit_code, prev_hash, hash FROM events ORDER BY seq").fetchall():
+        event = _event_dict(row)
+        try:
+            line = records.dump_event(event)
+        except ShitError:
+            found.add("event_invalid")
+            continue
+        if chain_hash(row[10], line) != row[11]:
+            found.add("event_hash_wrong")
+        events.append(event)
+    created, steps = {}, {}
+    for event in events:
+        if event["event"] == "task_created":
+            created[event["task_id"]] = event["timestamp"]
+        elif event["event"] == "state_transition":
+            steps.setdefault(event["task_id"], []).append(
+                (event["from_state"], event["to_state"], event["actor"], event["timestamp"]))
+    history = {}
+    for task_id, frm, to, actor, at in conn.execute(
+            "SELECT task_id, from_state, to_state, actor, at FROM task_history ORDER BY id").fetchall():
+        history.setdefault(task_id, []).append((frm, to, actor, at))
+    for task_id, state, created_at, updated_at in conn.execute(
+            "SELECT id, state, created_at, updated_at FROM tasks").fetchall():
+        rows = history.get(task_id, [])
+        previous = "open"
+        for frm, to, _actor, _at in rows:
+            if frm != previous:
+                found.add("task_differs_from_history")
+            previous = to
+        if state != previous or updated_at != (rows[-1][3] if rows else created_at):
+            found.add("task_differs_from_history")
+        if created.get(task_id) != created_at:
+            found.add("task_without_created_event")
+        if rows != steps.get(task_id, []):
+            found.add("history_differs_from_events")
+        if conn.execute("SELECT 1 FROM records WHERE kind = 'task' AND record_id = ? AND task_id = ?",
+                        (task_id, task_id)).fetchone() is None:
+            found.add("task_without_body_record")
+    recorded = {}
+    for event in events:
+        for kind, (event_kind, _label) in _RECORD_EVENTS.items():
+            if event["event"] == event_kind:
+                recorded[(kind, event["record_id"])] = event
+    indexed = set()
+    for kind, record_id, task_id, sha256 in conn.execute(
+            "SELECT kind, record_id, task_id, sha256 FROM records").fetchall():
+        if kind not in _RECORD_EVENTS:
+            continue  # a task body is checked above; a handoff has no event
+        indexed.add((kind, record_id))
+        event = recorded.get((kind, record_id))
+        if event is None or event["task_id"] != task_id:
+            found.add("record_without_event")
+        elif event["message"] != record_message(kind, sha256):
+            found.add("record_digest_differs_from_event")
+    if set(recorded) - indexed:
+        found.add("event_without_record")
     return sorted(found)
 
 
