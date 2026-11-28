@@ -61,8 +61,22 @@ ALLOWED_METHODS = {
     # dependency graph (issue 62)
     "_graph_task_exists": {"execute"}, "_graph_has_path": {"execute"}, "_graph_check_caps": {"execute"},
     "add_edges": {"execute"}, "remove_edge": {"execute"}, "list_edges": {"execute"}, "needs_of": {"execute"},
-    "prerequisite_closure": {"execute"},
+    "prerequisite_closure": {"execute"}, "_edges_plan": {"execute"},
+    # queue operations (issue 61, C4): reads, the in-transaction writers, and the operations that hold a transaction.
+    "queue_entries": {"execute"}, "_task_entries": {"execute"}, "_latest_queue_state": {"execute"},
+    "_queue_tip": {"execute"}, "_task_edges": {"execute"}, "_keyed": {"execute"}, "queue_entry_for_key": {"execute"},
+    "_check_population": {"execute"}, "_due_leases": {"execute"}, "_waiting": {"execute"},
+    "queue_snapshot": {"execute"}, "queue_apply_start": {"execute"}, "queue_add_edges": {"execute"},
+    "queue_remove_edge": {"execute"},
+    "_append_entry": {"execute"}, "_lifecycle_step": {"execute"}, "_insert_lease": {"execute"},
+    "_renew_lease_row": {"execute"}, "_drop_lease": {"execute"}, "_take_slot": {"execute"},
+    "_release_slots": {"execute"},
 }
+# Functions that write without opening a transaction. Each may run only inside `with write_transaction(...)` or inside
+# another of them (checked at every call site), and each refuses at run time when the connection is not in one. Being
+# on this list lets a function write outside a lexical `with`; it does not let it execute text or run unguarded.
+IN_TRANSACTION = {"_append_entry", "_lifecycle_step", "_insert_lease", "_renew_lease_row", "_drop_lease", "_take_slot",
+                  "_release_slots", "_expire", "_maintain", "_begin"}
 ALLOWED_REFLECTION = {("_open_once", "setconfig")}
 CONNECTORS = {"_open_once", "expected_fingerprint"}
 # The only functions that may assemble SQL text: schema DDL from this code's own vocabulary.
@@ -157,7 +171,7 @@ def identity_findings(source):
     """Privileged store functions must be unique, top-level definitions that nothing rebinds or shadows."""
     tree = _with_parents(ast.parse(source))
     privileged = (set(ALLOWED_METHODS) | CONNECTORS | TXN_OWNERS | SCHEMA_CONSUMERS | {n for _, n in BUILDERS}
-                  | {"write_transaction", "schema_statements"})
+                  | IN_TRANSACTION | {"write_transaction", "schema_statements"})
     found = []
     defs = {}
     for node in ast.walk(tree):
@@ -349,8 +363,31 @@ def access_findings(source, rel, allowed=None):
             if not _is_schema_loop_variable(arg, function):
                 found.append((node.lineno, "executor argument is not a literal"))
             continue
-        if not is_read_only(literal) and function not in TXN_OWNERS and not _in_write_transaction(node):
+        if (not is_read_only(literal) and function not in TXN_OWNERS and function not in IN_TRANSACTION
+                and not _in_write_transaction(node)):
             found.append((node.lineno, "statement that changes state outside write_transaction"))
+    found.extend(_in_transaction_findings(tree, inside))
+    return found
+
+
+def _in_transaction_findings(tree, inside):
+    """Every use of an in-transaction function: only as a direct call, and only inside a write transaction.
+
+    The call site must sit lexically in `with write_transaction(...)` (the real helper, not a look-alike) or inside
+    another in-transaction function. A reference without a call (an alias, a callback) is a finding."""
+    found = []
+    if not inside:
+        return found
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Name) and node.id in IN_TRANSACTION):
+            continue
+        if isinstance(getattr(node, "parent", None), (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not _is_call_func(node):
+            found.append((node.lineno, "in-transaction function referenced without a direct call"))
+            continue
+        if _enclosing_function(node) not in IN_TRANSACTION and not _in_write_transaction(node.parent):
+            found.append((node.lineno, "in-transaction function called outside a write transaction"))
     return found
 
 

@@ -12,13 +12,18 @@ with a fixed message (never a path or SQL text).
 import contextlib
 import functools
 import hashlib
+import hmac
+import json
 import os
 import re
+import secrets
 import sqlite3
 import stat
 import sys
+from datetime import UTC, datetime, timedelta
 
 from . import dependencies, lifecycle, queue_records, records
+from ._text import check_text
 from .errors import (
     BUSY,
     CONFINEMENT,
@@ -32,6 +37,7 @@ from .errors import (
     REJECTED,
     STABLE_EXIT_CODES,
     USAGE,
+    ContractError,
     ShitError,
 )
 from .log import GENESIS, chain_hash
@@ -1258,6 +1264,12 @@ def transition_task(conn, task_id, to, actor, reason, now, *, blocked_reason=Non
         if to == "approved" and actor != "human" and (frm, to) in lifecycle.LEGAL:
             raise ShitError(HUMAN_APPROVAL)
         lifecycle.check_transition(frm, to, actor)
+        queued = _latest_queue_state(conn, task_id)
+        if queued is not None and to not in queue_records.LIFECYCLE[queued]:
+            # A queued task changes lifecycle state only through its queue operation, in one transaction with the
+            # queue entry (a live lease needs `start`, `submit`, `fail`, `hold`, `reclaim`; `reopen` and `complete`
+            # move the rest). Anything else would leave the task row outside what its queue state allows.
+            raise ShitError(ILLEGAL_TRANSITION)
         if precheck is not None:
             precheck(current)
         if not isinstance(now, str) or now < current["updated_at"]:
@@ -1463,6 +1475,34 @@ def _graph_check_caps(conn, wanted):
         raise ShitError(INPUT_LIMIT)
 
 
+def _edges_plan(conn, additions):
+    """Read-only, inside the caller's transaction: the edges to add, after every check that precedes the writes.
+
+    The order is that of `dependencies.add_edges`: each edge's shape and then its tasks, in the order given; then
+    duplicates; then the caps; then a self edge. Raises on the first failure."""
+    wanted = []
+    for addition in additions:
+        edge = _graph_edge(addition)
+        if not (_graph_task_exists(conn, edge[0]) and _graph_task_exists(conn, edge[1])):
+            raise ShitError(PRECONDITION)
+        wanted.append(edge)
+    seen = set()
+    for edge in wanted:
+        if edge in seen or conn.execute(
+                "SELECT 1 FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge).fetchone():
+            raise ShitError(REJECTED)
+        seen.add(edge)
+    _graph_check_caps(conn, wanted)
+    if any(task_id == needs_id for task_id, needs_id, _ in wanted):
+        raise ShitError(REJECTED)
+    return wanted
+
+
+def _edges_cyclic(conn, wanted):
+    """With every new edge in, a cycle exists exactly when some new edge's prerequisite reaches its dependent."""
+    return any(_graph_has_path(conn, needs_id, task_id) for task_id, needs_id, _ in wanted)
+
+
 def add_edges(conn, additions):
     """Add every `(task_id, needs_id, type)` in one transaction, or none.
 
@@ -1473,25 +1513,10 @@ def add_edges(conn, additions):
     if not isinstance(additions, (list, tuple)):
         raise ShitError(REJECTED)
     with write_transaction(conn):
-        wanted = []
-        for addition in additions:
-            edge = _graph_edge(addition)
-            if not (_graph_task_exists(conn, edge[0]) and _graph_task_exists(conn, edge[1])):
-                raise ShitError(PRECONDITION)
-            wanted.append(edge)
-        seen = set()
-        for edge in wanted:
-            if edge in seen or conn.execute(
-                    "SELECT 1 FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge).fetchone():
-                raise ShitError(REJECTED)
-            seen.add(edge)
-        _graph_check_caps(conn, wanted)
-        if any(task_id == needs_id for task_id, needs_id, _ in wanted):
-            raise ShitError(REJECTED)
+        wanted = _edges_plan(conn, additions)
         for edge in wanted:
             conn.execute("INSERT INTO edges (task_id, needs_id, type) VALUES (?, ?, ?)", edge)
-        # With every edge in, a cycle exists exactly when some new edge's prerequisite reaches its dependent.
-        if any(_graph_has_path(conn, needs_id, task_id) for task_id, needs_id, _ in wanted):
+        if _edges_cyclic(conn, wanted):
             raise ShitError(REJECTED)
 
 
@@ -1543,3 +1568,813 @@ def prerequisite_closure(conn, task_id):
     except sqlite3.Error as exc:
         raise map_error(exc) from None
     return [row[0] for row in rows]
+
+
+# == C4: queue operations (issue 61, epic 57; docs/store.md, "Queue operations") ============================
+#
+# Each public `queue_*` function is ONE `write_transaction`. Inside it the order is: the operation's own checks (every
+# one after BEGIN IMMEDIATE, on rows read there), then the writes, in the order the invariants table of docs/store.md
+# requires: the queue entry first, the task row's lifecycle step in the same transaction, then the lease row (a claim
+# inserts it after its entry, a renewal updates it, a lease that ends deletes its apply slots and then the row). The
+# decisions are those of `shit/queue.py` (same order of checks, same exit codes), and every candidate entry is also
+# run through `queue_records.replay` before it is written, so the database never holds a log replay would refuse.
+#
+# Writes that several operations share live in the functions of `_IN_TRANSACTION` (tests/test_store_lint.py): they
+# write without opening a transaction, so each is called only inside `with write_transaction(...)` or inside another
+# of them, and each refuses to run when the connection is not in a transaction.
+
+_QUEUE_MESSAGE = "Queue entry recorded."
+_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_PRESENT_KEYS = {"task_id", "lease_id", "generation"}
+_CLAIM_KEYS = {"task_id", "step", "worker", "worker_kind"}
+MAX_TARGETS = 32
+_ENTRY_COLUMNS = ("id", "task_id", "timestamp", "actor", "kind", "state_after", "lease_id", "generation", "worker",
+                  "worker_kind", "step", "hold_kind", "not_before", "attempt", "expires_at", "orphan_sha256",
+                  "message")
+_LEASE_ORDER = ("step", "worker", "worker_kind", "lease_id", "generation", "claimed_at", "expires_at", "renewals")
+
+
+def _new_lease_id():
+    """Tests replace this to make lease ids repeatable; the wrapper always generates them (Q-CLAIM-05)."""
+    return secrets.token_hex(16)
+
+
+def _plus(stamp, seconds):
+    return (datetime.strptime(stamp, _STAMP_FORMAT).replace(tzinfo=UTC) + timedelta(seconds=seconds)).strftime(
+        _STAMP_FORMAT)
+
+
+def _stamp_or_reject(now):
+    """A fixed-width UTC stamp that is also a real calendar time (the schema refuses the rest)."""
+    if not isinstance(now, str) or not records.TIMESTAMP.fullmatch(now):
+        raise ShitError(REJECTED)
+    try:
+        datetime.strptime(now, _STAMP_FORMAT)
+    except ValueError:
+        raise ShitError(REJECTED) from None
+    return now
+
+
+def _key_or_reject(key):
+    if key is None:
+        return None
+    if not isinstance(key, str) or not records.SLUG.fullmatch(key):
+        raise ShitError(USAGE)
+    return key
+
+
+def _message(key):
+    return _QUEUE_MESSAGE if key is None else _QUEUE_MESSAGE[:-1] + "; key " + key + "."
+
+
+def _options(now, config, key):
+    """Validate what every operation takes besides its subject: the clock, the configuration, the idempotency key."""
+    _stamp_or_reject(now)
+    if config is not None and not isinstance(config, dict):
+        raise ShitError(USAGE)
+    return queue_records.make_config(**(config or {})), _key_or_reject(key)
+
+
+def _shape(request, keys):
+    """A request carries exactly `keys`: an extra field (a time, a lease id, a state) is exit code 2 (Q-CLAIM-05)."""
+    if not isinstance(request, dict) or set(request) != keys:
+        raise ShitError(USAGE)
+
+
+def _closed(fn):
+    """Run `fn`; a rejected record while checking queue state is a fail-closed condition (exit code 8)."""
+    try:
+        return fn()
+    except ShitError as exc:
+        if exc.code == REJECTED:
+            raise ShitError(FAILED_CLOSED) from None
+        raise
+
+
+def _clean(value):
+    if not isinstance(value, str) or value == "":
+        raise ShitError(REJECTED)
+    try:
+        check_text(value)
+    except ContractError:
+        raise ShitError(REJECTED) from None
+    return value
+
+
+def _met_default(edge):
+    """With no record reader, only an edge that gates nothing but the apply step counts as met."""
+    return edge["type"] not in dependencies.BLOCKING
+
+
+def _require_transaction(conn):
+    if _in_transaction(conn) is not True:
+        raise ShitError(INTERNAL)
+
+
+# -- reads -----------------------------------------------------------------------------------------------------
+
+
+def _entry_from_row(names, row):
+    entry = {"schema": "queue-entry", "schema_version": 1}
+    for name, value in zip(names, row, strict=True):
+        if value is None or name in ("seq", "prev_hash", "hash"):
+            continue
+        if name == "shards":
+            try:
+                value = json.loads(value)
+            except ValueError:
+                raise ShitError(FAILED_CLOSED) from None
+        entry[name] = value
+    return entry
+
+
+def _validated(entry):
+    try:
+        return queue_records.validate_entry(entry)
+    except ShitError:
+        raise ShitError(FAILED_CLOSED) from None
+
+
+def queue_entries(conn):
+    """The whole queue log, oldest first, as the validated records `queue_records.replay` reads."""
+    names = ("seq", *_ENTRY_COLUMNS, "shards")
+    rows = conn.execute(
+        "SELECT seq, id, task_id, timestamp, actor, kind, state_after, lease_id, generation, worker, worker_kind, "
+        "step, hold_kind, not_before, attempt, expires_at, orphan_sha256, message, shards FROM queue_entries "
+        "ORDER BY seq").fetchall()
+    return [_validated(_entry_from_row(names, row)) for row in rows]
+
+
+def _task_entries(conn, task_id, up_to=None):
+    """The queue entries of one task, numbered 1, 2, 3 so `queue_records.replay` reads them alone.
+
+    Tasks are independent in the replay, so the state of one task is the replay of its own entries."""
+    rows = conn.execute(
+        "SELECT id, task_id, timestamp, actor, kind, state_after, lease_id, generation, worker, worker_kind, step, "
+        "hold_kind, not_before, attempt, expires_at, orphan_sha256, message FROM queue_entries WHERE task_id = ? "
+        "AND kind <> 'graph_changed' AND seq <= ? ORDER BY seq",
+        (task_id, (1 << 62) if up_to is None else up_to)).fetchall()
+    out = []
+    for number, row in enumerate(rows, start=1):
+        entry = _entry_from_row(_ENTRY_COLUMNS, row)
+        entry["id"] = "queue-" + format(number, "04d")
+        out.append(_validated(entry))
+    return out
+
+
+def _replayed(entries, task_id):
+    return _closed(lambda: queue_records.replay(entries)).get(task_id)
+
+
+def _queued(conn, task_id, up_to=None):
+    """The replayed queue state of `task_id` (state, generation, lease, attempts, ...), or None when never enqueued."""
+    return _replayed(_task_entries(conn, task_id, up_to), task_id)
+
+
+def queue_state(conn, task_id):
+    """The queue state of one task as `queue_records.replay` rebuilds it from the log, or None."""
+    _slug_or_reject(task_id)
+    return _queued(conn, task_id)
+
+
+def _latest_queue_state(conn, task_id):
+    row = conn.execute("SELECT state_after FROM queue_entries WHERE task_id = ? AND state_after IS NOT NULL "
+                       "ORDER BY seq DESC LIMIT 1", (task_id,)).fetchone()
+    return None if row is None else row[0]
+
+
+def _queue_tip(conn):
+    row = conn.execute("SELECT seq, hash, timestamp FROM queue_entries ORDER BY seq DESC LIMIT 1").fetchone()
+    return (0, GENESIS, "") if row is None else (row[0], row[1], row[2])
+
+
+def _check_clock(conn, now):
+    """No claim and no expiry while the clock reads earlier than a recorded time (Q-LEASE-08): exit code 8."""
+    if now < _queue_tip(conn)[2] or now < _tip(conn)[2]:
+        raise ShitError(FAILED_CLOSED)
+
+
+def _task_edges(conn, task_id):
+    return [{"task_id": a, "needs_id": b, "type": c} for a, b, c in conn.execute(
+        "SELECT task_id, needs_id, type FROM edges WHERE task_id = ? ORDER BY needs_id, type", (task_id,)).fetchall()]
+
+
+def _unmet(conn, task_id, met):
+    return dependencies.unmet_blocking(_task_edges(conn, task_id), task_id, met or _met_default)
+
+
+def _effective(conn, queued, task_id, met):
+    if queued["state"] in ("waiting", "ready") and queued["lease"] is None:
+        return "waiting" if _unmet(conn, task_id, met) else "ready"
+    return queued["state"]
+
+
+def _lease_record(task_id, lease):
+    record = {"schema": "lease", "schema_version": 1, "task_id": task_id}
+    record.update({key: lease[key] for key in _LEASE_ORDER})
+    return queue_records.validate_lease(record)
+
+
+_ANY_TASK = object()  # a graph change belongs to no one task: its key is looked up by kind alone
+
+
+def _keyed(conn, key, task_id, kinds):
+    """The sequence number of the entry an earlier call with this idempotency key wrote, or None.
+
+    A key names one entry: it is in the entry's message. Found for another task or another kind of entry, the key was
+    reused for something else and the call is refused (exit code 3)."""
+    if key is None:
+        return None
+    row = conn.execute("SELECT seq, task_id, kind FROM queue_entries WHERE message = ? ORDER BY seq DESC LIMIT 1",
+                       (_message(key),)).fetchone()
+    if row is None:
+        return None
+    if (task_id is not _ANY_TASK and row[1] != task_id) or row[2] not in kinds:
+        raise ShitError(REJECTED)
+    return row[0]
+
+
+def _lease_at(conn, task_id, seq):
+    """The lease record as the entry at `seq` left it (the answer a repeated keyed claim or renewal gets)."""
+    queued = _queued(conn, task_id, seq)
+    if queued is None or queued["lease"] is None:
+        raise ShitError(FAILED_CLOSED)
+    return _lease_record(task_id, queued["lease"])
+
+
+def queue_entry_for_key(conn, key):
+    """The reconciling read for an ambiguous commit: the entry written under `key`, or None when it never landed."""
+    _key_or_reject(key)
+    if key is None:
+        raise ShitError(USAGE)
+    row = conn.execute("SELECT seq FROM queue_entries WHERE message = ? ORDER BY seq DESC LIMIT 1",
+                       (_message(key),)).fetchone()
+    if row is None:
+        return None
+    return next(entry for entry in queue_entries(conn) if entry["id"] == "queue-" + format(row[0], "04d"))
+
+
+def _check_population(conn, owners=()):
+    """Queued task ids and dependency shard owners together never exceed the documented task cap (exit code 7)."""
+    count = conn.execute(
+        "SELECT count(*) FROM (SELECT task_id FROM queue_entries WHERE kind = 'enqueued' UNION SELECT task_id FROM "
+        "edges UNION SELECT value FROM json_each(?))", (json.dumps(sorted(owners)),)).fetchone()[0]
+    if count > dependencies.MAX_TASKS:
+        raise ShitError(INPUT_LIMIT)
+
+
+def _task_of(presented):
+    """The task a presented lease names, for the idempotency lookup that runs before its shape is checked."""
+    return presented.get("task_id") if isinstance(presented, dict) else None
+
+
+def _presented(conn, presented):
+    """Verify a presented lease against the lease the log proves (Q-LEASE-01, Q-LEASE-02): exit code 12 when it differs."""
+    _shape(presented, _PRESENT_KEYS)
+    task_id, lease_id, generation = presented["task_id"], presented["lease_id"], presented["generation"]
+    if (not isinstance(task_id, str) or not records.SLUG.fullmatch(task_id) or not isinstance(lease_id, str)
+            or type(generation) is not int):
+        raise ShitError(USAGE)
+    queued = _queued(conn, task_id)
+    if queued is None:
+        raise ShitError(PRECONDITION)
+    lease = queued["lease"]
+    if lease is None:
+        raise ShitError(LEASE_REFUSED)
+    same_id = hmac.compare_digest(lease_id.encode("utf-8", "surrogatepass"), lease["lease_id"].encode("ascii"))
+    if not (same_id and generation == lease["generation"] and generation >= queued["generation"]):
+        raise ShitError(LEASE_REFUSED)
+    return queued, lease
+
+
+def _apply_finished(conn, task_id):
+    queued = _queued(conn, task_id)
+    return queued is not None and bool(queued["apply_finished"])
+
+
+def _lease_fields(task_id, lease, kind, after, **more):
+    return {"task_id": task_id, "actor": "wrapper", "kind": kind, "state_after": after,
+            "lease_id": lease["lease_id"], "generation": lease["generation"], **more}
+
+
+def _due_leases(conn, now):
+    """Tasks in a live queue state whose lease is past its expiry, or has no row at all (Q-REC-03b), by task id."""
+    rows = conn.execute(
+        "SELECT q.task_id, l.expires_at FROM queue_entries q LEFT JOIN leases l ON l.task_id = q.task_id WHERE q.seq "
+        "= (SELECT max(m.seq) FROM queue_entries m WHERE m.task_id = q.task_id AND m.state_after IS NOT NULL) AND "
+        "q.state_after IN ('dispatched', 'running') ORDER BY q.task_id").fetchall()
+    return [task_id for task_id, expires in rows if expires is None or now >= expires]
+
+
+def _waiting(conn):
+    return [row[0] for row in conn.execute(
+        "SELECT q.task_id FROM queue_entries q WHERE q.seq = (SELECT max(m.seq) FROM queue_entries m WHERE m.task_id = "
+        "q.task_id AND m.state_after IS NOT NULL) AND q.state_after = 'waiting' ORDER BY q.task_id").fetchall()]
+
+
+def queue_snapshot(conn, met=None):
+    """Per queued task: the effective state, the stored state, attempts, generation, what it waits on, the lease.
+
+    Read only (no expiry, no promotion): `queue_maintain` is the operation that applies them."""
+    out = {}
+    for (task_id,) in conn.execute("SELECT DISTINCT task_id FROM queue_entries WHERE kind = 'enqueued' "
+                                   "ORDER BY task_id").fetchall():
+        queued = _queued(conn, task_id)
+        lease = queued["lease"]
+        out[task_id] = {
+            "state": _effective(conn, queued, task_id, met), "stored_state": queued["state"],
+            "attempts": queued["attempts"], "generation": queued["generation"],
+            "waiting_on": sorted({e["needs_id"] for e in _unmet(conn, task_id, met)}),
+            "not_before": queued["not_before"],
+            "lease": None if lease is None else {k: lease[k] for k in ("worker", "step", "generation", "expires_at")},
+        }
+    return out
+
+
+# -- writes shared by the operations (called only inside a write transaction) ---------------------------------
+
+
+def _append_entry(conn, fields, now, key=None):
+    """Validate one queue entry against the replay of its task, then write it, chained to the tip of the log."""
+    _require_transaction(conn)
+    seq, previous, _stamp = _queue_tip(conn)
+    entry = {"schema": "queue-entry", "schema_version": 1, "id": "queue-" + format(seq + 1, "04d"), "timestamp": now,
+             "message": _message(key), **fields}
+    line = queue_records.dump_entry(entry)
+    if entry["kind"] != "graph_changed":
+        prior = _task_entries(conn, entry["task_id"])
+        _closed(lambda: queue_records.replay([*prior, {**entry, "id": "queue-" + format(len(prior) + 1, "04d")}]))
+    digest = chain_hash(previous, line)
+    _fault("checked")
+    shards = json.dumps(entry["shards"], separators=(",", ":"), ensure_ascii=True) if "shards" in entry else None
+    conn.execute(
+        "INSERT INTO queue_entries (seq, id, task_id, timestamp, actor, kind, state_after, lease_id, generation, "
+        "worker, worker_kind, step, hold_kind, not_before, attempt, expires_at, orphan_sha256, message, shards, "
+        "prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (seq + 1, entry["id"], entry["task_id"], now, entry["actor"], entry["kind"], entry.get("state_after"),
+         entry.get("lease_id"), entry.get("generation"), entry.get("worker"), entry.get("worker_kind"),
+         entry.get("step"), entry.get("hold_kind"), entry.get("not_before"), entry.get("attempt"),
+         entry.get("expires_at"), entry.get("orphan_sha256"), entry["message"], shards, previous, digest))
+    _fault("entry")
+    return entry
+
+
+def _lifecycle_step(conn, task_id, frm, to, actor, reason, now, blocked_reason=None, blocking_item=None):
+    """The task row's lifecycle step that a queue entry implies: row, history row and event, as `transition_task`."""
+    _require_transaction(conn)
+    current = _task_row(conn, task_id)
+    if current is None:
+        raise ShitError(PRECONDITION)
+    lifecycle.check_transition(frm, to, actor)
+    if current["state"] != frm or now < current["updated_at"]:
+        raise ShitError(FAILED_CLOSED)  # the task and the queue disagree: no step is taken on a guess
+    if (to == "blocked") != (blocked_reason is not None and blocking_item is not None):
+        raise ShitError(REJECTED)
+    blocked = {"blocked_reason": blocked_reason, "blocking_item": blocking_item} if to == "blocked" else {}
+    step = {"from": frm, "to": to, "actor": actor, "at": now, "reason": reason}
+    after = {"id": task_id, "state": to, "owner": current["owner"], "created_at": current["created_at"],
+             "updated_at": now, **blocked}
+    records.validate_task(_image(after, [*_history_rows(conn, task_id), step]))
+    seq, previous, digest, event = _next_event(conn, task_id, actor, "state_transition", "State transition recorded.",
+                                               now, from_state=frm, to_state=to)
+    conn.execute("UPDATE tasks SET state = ?, updated_at = ?, blocked_reason = ?, blocking_item = ? WHERE id = ?",
+                 (to, now, blocked.get("blocked_reason"), blocked.get("blocking_item"), task_id))
+    _fault("task-updated")
+    conn.execute("INSERT INTO task_history (task_id, from_state, to_state, actor, at, reason) "
+                 "VALUES (?, ?, ?, ?, ?, ?)", (task_id, frm, to, actor, now, reason))
+    _fault("history-row")
+    conn.execute("INSERT INTO events (seq, id, task_id, timestamp, actor, event, message, record_id, from_state, "
+                 "to_state, exit_code, prev_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+                 (seq, event["id"], event["task_id"], event["timestamp"], event["actor"], event["event"],
+                  event["message"], event["record_id"], frm, to, previous, digest))
+    _fault("event-row")
+
+
+def _insert_lease(conn, lease):
+    _require_transaction(conn)
+    conn.execute("INSERT INTO leases (task_id, lease_id, generation, step, worker, worker_kind, claimed_at, "
+                 "expires_at, renewals) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 (lease["task_id"], lease["lease_id"], lease["generation"], lease["step"], lease["worker"],
+                  lease["worker_kind"], lease["claimed_at"], lease["expires_at"], lease["renewals"]))
+    _fault("lease-row")
+
+
+def _renew_lease_row(conn, task_id, expires_at, renewals):
+    _require_transaction(conn)
+    conn.execute("UPDATE leases SET expires_at = ?, renewals = ? WHERE task_id = ?", (expires_at, renewals, task_id))
+    _fault("lease-updated")
+
+
+def _drop_lease(conn, task_id):
+    """The lease ends: its apply slots go first, then the row (the trigger refuses the other order)."""
+    _require_transaction(conn)
+    conn.execute("DELETE FROM apply_slots WHERE task_id = ?", (task_id,))
+    _fault("slots-dropped")
+    conn.execute("DELETE FROM leases WHERE task_id = ?", (task_id,))
+    _fault("lease-dropped")
+
+
+def _take_slot(conn, target, lease, now):
+    _require_transaction(conn)
+    conn.execute("INSERT INTO apply_slots (target, task_id, lease_id, generation, acquired_at) VALUES (?, ?, ?, ?, ?)",
+                 (target, lease["task_id"], lease["lease_id"], lease["generation"], now))
+    _fault("slot")
+
+
+def _release_slots(conn, task_id):
+    _require_transaction(conn)
+    conn.execute("DELETE FROM apply_slots WHERE task_id = ?", (task_id,))
+    _fault("slots-released")
+
+
+def _expire(conn, task_id, now, key=None):
+    """End a lease by expiry: `expired` entry, the lifecycle step of a running task (it ends `failed`), the lease row."""
+    _require_transaction(conn)
+    queued = _queued(conn, task_id)
+    lease = queued["lease"]
+    running = queued["state"] == "running"
+    _append_entry(conn, {"task_id": task_id, "actor": "wrapper", "kind": "expired", "lease_id": lease["lease_id"],
+                         "generation": lease["generation"], "state_after": "failed" if running else "ready"},
+                  now, key)
+    if running:
+        _lifecycle_step(conn, task_id, "running", "failed", "wrapper", "lease expired", now)
+    _drop_lease(conn, task_id)
+
+
+def _maintain(conn, now, met):
+    """Expire every lease that is due and promote every waiting task whose edges are met, in the caller's transaction."""
+    _require_transaction(conn)
+    for task_id in _due_leases(conn, now):
+        _expire(conn, task_id, now)
+    for task_id in _waiting(conn):
+        if not _unmet(conn, task_id, met):
+            _append_entry(conn, {"task_id": task_id, "actor": "wrapper", "kind": "ready", "state_after": "ready"}, now)
+
+
+def _begin(conn, now, met):
+    _require_transaction(conn)
+    _check_clock(conn, now)
+    _maintain(conn, now, met)
+
+
+# -- the operations -------------------------------------------------------------------------------------------
+
+
+def queue_maintain(conn, now, *, config=None, met=None):
+    """Apply expiry and promotion now, in one transaction (`queue_*` operations do the same before their own step)."""
+    _options(now, config, None)
+    with write_transaction(conn):
+        _begin(conn, now, met)
+
+
+def queue_enqueue(conn, task_id, actor, now, *, config=None, met=None, key=None):
+    """Put an open task into the queue as `waiting` or `ready`. A task id is enqueued once, ever (Q-RES-01)."""
+    if actor not in ("human", "wrapper"):
+        raise ShitError(HUMAN_APPROVAL)
+    _slug_or_reject(task_id)
+    _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, task_id, ("enqueued",)) is not None:
+            return
+        _begin(conn, now, met)
+        if _queued(conn, task_id) is not None:
+            raise ShitError(REJECTED)
+        _check_population(conn, (task_id,))
+        current = _task_row(conn, task_id)
+        if current is None:
+            raise ShitError(PRECONDITION)
+        if current["state"] != "open":
+            raise ShitError(ILLEGAL_TRANSITION)
+        unmet = _unmet(conn, task_id, met)
+        _append_entry(conn, {"task_id": task_id, "actor": actor, "kind": "enqueued",
+                             "state_after": "waiting" if unmet else "ready"}, now, key)
+
+
+def queue_claim(conn, request, now, *, config=None, met=None, key=None):
+    """Claim one step of a ready task under a new lease; returns the lease record.
+
+    The request holds only the task id, the step, the worker label and its kind. The entry is written before the
+    lease row; the generation is the previous one plus one."""
+    _shape(request, _CLAIM_KEYS)
+    task_id, step, worker, kind = (request[k] for k in ("task_id", "step", "worker", "worker_kind"))
+    if (not isinstance(task_id, str) or not records.SLUG.fullmatch(task_id) or step not in queue_records.STEPS
+            or not isinstance(worker, str) or not records.SLUG.fullmatch(worker)
+            or kind not in queue_records.WORKER_KINDS):
+        raise ShitError(USAGE)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        seen = _keyed(conn, key, task_id, ("claimed",))
+        if seen is not None:
+            return _lease_at(conn, task_id, seen)
+        _begin(conn, now, met)
+        queued = _queued(conn, task_id)
+        if queued is None:
+            raise ShitError(PRECONDITION)
+        if _effective(conn, queued, task_id, met) != "ready":
+            raise ShitError(ILLEGAL_TRANSITION)
+        if queued["not_before"] is not None and now < queued["not_before"]:
+            raise ShitError(ILLEGAL_TRANSITION)
+        if step == "apply":
+            for pre in dependencies.apply_prerequisites(_task_edges(conn, task_id), task_id):
+                if not _apply_finished(conn, pre):
+                    raise ShitError(ILLEGAL_TRANSITION)
+        lease = {"schema": "lease", "schema_version": 1, "task_id": task_id, "step": step, "worker": worker,
+                 "worker_kind": kind, "lease_id": _new_lease_id(), "generation": queued["generation"] + 1,
+                 "claimed_at": now, "expires_at": _plus(now, config["lease_ttl_seconds"]), "renewals": 0}
+        queue_records.validate_lease(lease)
+        _append_entry(conn, {"task_id": task_id, "actor": "wrapper", "kind": "claimed", "state_after": "dispatched",
+                             "lease_id": lease["lease_id"], "generation": lease["generation"], "worker": worker,
+                             "worker_kind": kind, "step": step, "expires_at": lease["expires_at"]}, now, key)
+        _insert_lease(conn, lease)
+    return lease
+
+
+def queue_start(conn, presented, now, *, config=None, met=None, key=None):
+    """The worker starts the step: dispatched to running, open to running in the lifecycle."""
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("started",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        if queued["state"] != "dispatched":
+            raise ShitError(ILLEGAL_TRANSITION)
+        task_id = presented["task_id"]
+        _append_entry(conn, _lease_fields(task_id, lease, "started", "running", worker=lease["worker"],
+                                          step=lease["step"], attempt=queued["attempts"] + 1), now, key)
+        _lifecycle_step(conn, task_id, "open", "running", "wrapper", "worker started", now)
+
+
+def queue_renew(conn, presented, now, *, config=None, met=None, key=None):
+    """Extend the lease by one TTL, bounded by `lease_max_seconds` and `lease_max_renewals` (Q-LEASE-03).
+
+    The `renewed` entry and the lease row's new expiry are written in the same transaction."""
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        seen = _keyed(conn, key, _task_of(presented), ("renewed",))
+        if seen is not None:
+            return _lease_at(conn, presented["task_id"], seen)
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        task_id = presented["task_id"]
+        longest = _plus(lease["claimed_at"], config["lease_max_seconds"])
+        new_expiry = min(_plus(lease["expires_at"], config["lease_ttl_seconds"]), longest)
+        if lease["renewals"] + 1 > config["lease_max_renewals"] or new_expiry <= lease["expires_at"]:
+            raise ShitError(LEASE_REFUSED)
+        _append_entry(conn, _lease_fields(task_id, lease, "renewed", queued["state"], worker=lease["worker"],
+                                          step=lease["step"], expires_at=new_expiry), now, key)
+        _renew_lease_row(conn, task_id, new_expiry, lease["renewals"] + 1)
+    return _lease_record(task_id, {**lease, "expires_at": new_expiry, "renewals": lease["renewals"] + 1})
+
+
+def queue_release(conn, presented, now, *, config=None, met=None, key=None):
+    """Give back a lease before the worker started. A running task cannot return to ready (exit code 4)."""
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("released",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        if queued["state"] != "dispatched":
+            raise ShitError(ILLEGAL_TRANSITION)
+        task_id = presented["task_id"]
+        _append_entry(conn, _lease_fields(task_id, lease, "released", "ready"), now, key)
+        _drop_lease(conn, task_id)
+
+
+def queue_submit(conn, presented, now, *, config=None, met=None, key=None):
+    """Report finished work: running to review. Refused with exit code 9 while a blocking edge is unmet (Q-DEP-09)."""
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("submitted",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        if queued["state"] != "running":
+            raise ShitError(ILLEGAL_TRANSITION)
+        task_id = presented["task_id"]
+        if _unmet(conn, task_id, met):
+            raise ShitError(PRECONDITION)
+        _append_entry(conn, _lease_fields(task_id, lease, "submitted", "review"), now, key)
+        _lifecycle_step(conn, task_id, "running", "review", "wrapper", "work submitted", now)
+        _drop_lease(conn, task_id)
+
+
+def queue_fail(conn, presented, now, *, config=None, met=None, key=None):
+    """The worker reports a failed attempt. The task stays failed until a human reopens it (Q-RET-02)."""
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("failed",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        task_id = presented["task_id"]
+        frm = "running" if queued["state"] == "running" else "open"
+        _append_entry(conn, _lease_fields(task_id, lease, "failed", "failed"), now, key)
+        _lifecycle_step(conn, task_id, frm, "failed", "wrapper", "worker reported failure", now)
+        _drop_lease(conn, task_id)
+
+
+def queue_hold(conn, presented, hold_kind, blocked_reason, blocking_item, now, *, config=None, met=None, key=None):
+    """The worker identifies a blocker: the lease and any apply slot end and the task waits for a human or a check."""
+    if hold_kind not in queue_records.HOLD_KINDS:
+        raise ShitError(USAGE)
+    _clean(blocked_reason)
+    _clean(blocking_item)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("held",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        task_id = presented["task_id"]
+        frm = "running" if queued["state"] == "running" else "open"
+        _append_entry(conn, {**_lease_fields(task_id, lease, "held", "hold-" + hold_kind), "hold_kind": hold_kind},
+                      now, key)
+        _lifecycle_step(conn, task_id, frm, "blocked", "wrapper", "blocker identified", now, blocked_reason,
+                        blocking_item)
+        _drop_lease(conn, task_id)
+
+
+def queue_reopen(conn, task_id, actor, reason, now, *, config=None, met=None, key=None, decided=None):
+    """Human only: review, a hold or failed back to ready (or waiting when an edge is unmet).
+
+    A failed task at its attempt limit needs `decided(last_failure)` to say an accepted human decision was recorded
+    after the failure (Q-RET-03); the callback runs inside the transaction."""
+    _slug_or_reject(task_id)
+    _clean(reason)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, task_id, ("reopened",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued = _queued(conn, task_id)
+        if queued is None:
+            raise ShitError(PRECONDITION)
+        before = queued["state"]
+        if before not in ("review", "failed", *queue_records.HOLDS):
+            raise ShitError(ILLEGAL_TRANSITION)
+        frm = {"review": "review", "failed": "failed"}.get(before, "blocked")
+        lifecycle.check_transition(frm, "open", actor)
+        if before == "failed" and queued["attempts"] >= config["max_attempts"] and (
+                decided is None or not decided(queued["last_failure"])):
+            raise ShitError(HUMAN_APPROVAL)
+        after = "waiting" if _unmet(conn, task_id, met) else "ready"
+        _append_entry(conn, {"task_id": task_id, "actor": actor, "kind": "reopened", "state_after": after}, now, key)
+        _lifecycle_step(conn, task_id, frm, "open", actor, reason, now)
+
+
+def queue_complete(conn, task_id, actor, reason, now, *, config=None, met=None, key=None, check=None):
+    """Close an approved task and mark it done. Terminal (Q-ST-05).
+
+    `check(task_row)` runs inside the transaction and may raise: the adapter proves the `close` rules there."""
+    _slug_or_reject(task_id)
+    _clean(reason)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, task_id, ("done",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued = _queued(conn, task_id)
+        if queued is None:
+            raise ShitError(PRECONDITION)
+        if queued["state"] != "review":
+            raise ShitError(ILLEGAL_TRANSITION)
+        current = _task_row(conn, task_id)
+        if current is None or current["state"] != "approved":
+            raise ShitError(ILLEGAL_TRANSITION)
+        lifecycle.check_transition("approved", "closed", actor)
+        if check is not None:
+            check(current)
+        _append_entry(conn, {"task_id": task_id, "actor": actor, "kind": "done", "state_after": "done"}, now, key)
+        _lifecycle_step(conn, task_id, "approved", "closed", actor, reason, now)
+
+
+def queue_reclaim(conn, task_id, actor, now, *, config=None, met=None, key=None):
+    """A human forces a live lease to expire. The entries are exactly those of a natural expiry (Q-REC-05)."""
+    _slug_or_reject(task_id)
+    if actor != "human":
+        raise ShitError(HUMAN_APPROVAL)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, task_id, ("expired",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued = _queued(conn, task_id)
+        if queued is None or queued["lease"] is None:
+            raise ShitError(PRECONDITION)
+        _expire(conn, task_id, now, key)
+
+
+def _target_or_reject(target):
+    """A repository-relative path, no empty, `.` or `..` component, never under `.shit` (Q-SER-07)."""
+    if not isinstance(target, str) or not 1 <= len(target) <= MAX_TEXT:
+        raise ShitError(REJECTED)
+    try:
+        check_text(target)
+    except ContractError:
+        raise ShitError(REJECTED) from None
+    parts = target.split("/")
+    if target.startswith("/") or any(part in ("", ".", "..") for part in parts) or parts[0] == ".shit":
+        raise ShitError(CONFINEMENT)
+    return target
+
+
+def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, key=None):
+    """Mark the apply step started (once per attempt) and take a slot for every target, all or none (Q-SER-02).
+
+    The entry is written first and the slots after it; the lease row has existed since the claim."""
+    if not isinstance(targets, (list, tuple)) or not 1 <= len(targets) <= MAX_TARGETS:
+        raise ShitError(REJECTED)
+    wanted = sorted({_target_or_reject(target) for target in targets})
+    if len(wanted) != len(targets):
+        raise ShitError(REJECTED)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("apply_started",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        if queued["state"] != "running" or lease["step"] != "apply" or queued["apply_phase"] is not None:
+            raise ShitError(ILLEGAL_TRANSITION)
+        for target in wanted:
+            if conn.execute("SELECT 1 FROM apply_slots WHERE target = ?", (target,)).fetchone() is not None:
+                raise ShitError(ILLEGAL_TRANSITION)
+        task_id = presented["task_id"]
+        _append_entry(conn, _lease_fields(task_id, lease, "apply_started", "running"), now, key)
+        for target in wanted:
+            _take_slot(conn, target, {"task_id": task_id, **lease}, now)
+
+
+def queue_apply_finish(conn, presented, now, *, config=None, met=None, key=None):
+    """Mark the apply step finished (after its start, once) and release its slots."""
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _task_of(presented), ("apply_finished",)) is not None:
+            return
+        _begin(conn, now, met)
+        queued, lease = _presented(conn, presented)
+        if queued["state"] != "running" or lease["step"] != "apply" or queued["apply_phase"] != "started":
+            raise ShitError(ILLEGAL_TRANSITION)
+        task_id = presented["task_id"]
+        _append_entry(conn, _lease_fields(task_id, lease, "apply_finished", "running"), now, key)
+        _release_slots(conn, task_id)
+
+
+# -- graph changes: the edge rows and the `graph_changed` entry that proves them, in one transaction ----------
+
+
+def _shard_proof(conn, task_ids):
+    """`graph_changed` shard digests for the dependents `task_ids`: the SHA-256 of the shard bytes the file
+    protocol would hold for them now, or 64 zeros for a dependent with no edge left."""
+    proof = []
+    for task_id in sorted(task_ids):
+        needs = needs_of(conn, task_id)
+        digest = queue_records.ABSENT if not needs else hashlib.sha256(dependencies.dump_shard(task_id, needs)).hexdigest()
+        proof.append({"task_id": task_id, "sha256": digest})
+    return proof
+
+
+def queue_add_edges(conn, additions, actor, now, *, config=None, met=None, key=None):
+    """Add typed edges and write the `graph_changed` entry in one transaction, or change nothing (Q-DEP-07).
+
+    Only `human` or `wrapper` may change the graph (exit code 10 otherwise). The checks and codes are those of
+    `add_edges`; the population cap (queued tasks and shard owners together, 2,000) is exit code 7."""
+    if actor not in ("human", "wrapper"):
+        raise ShitError(HUMAN_APPROVAL)
+    if not isinstance(additions, (list, tuple)):
+        raise ShitError(REJECTED)
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _ANY_TASK, ("graph_changed",)) is not None:
+            return
+        _begin(conn, now, met)
+        wanted = _edges_plan(conn, additions)
+        for edge in wanted:
+            conn.execute("INSERT INTO edges (task_id, needs_id, type) VALUES (?, ?, ?)", edge)
+        if _edges_cyclic(conn, wanted):
+            raise ShitError(REJECTED)
+        owners = {task_id for task_id, _, _ in wanted}
+        _check_population(conn, owners)
+        proof = _shard_proof(conn, owners)
+        _append_entry(conn, {"task_id": proof[0]["task_id"], "actor": actor, "kind": "graph_changed",
+                             "shards": proof}, now, key)
+
+
+def queue_remove_edge(conn, task_id, needs_id, kind, actor, now, *, config=None, met=None, key=None):
+    """Remove one edge and write the `graph_changed` entry in one transaction (see `remove_edge` for the codes)."""
+    if actor not in ("human", "wrapper"):
+        raise ShitError(HUMAN_APPROVAL)
+    edge = _graph_edge((task_id, needs_id, kind))
+    config, key = _options(now, config, key)
+    with write_transaction(conn):
+        if _keyed(conn, key, _ANY_TASK, ("graph_changed",)) is not None:
+            return
+        _begin(conn, now, met)
+        if conn.execute("SELECT 1 FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge).fetchone() is None:
+            raise ShitError(PRECONDITION)
+        if conn.execute("SELECT 1 FROM leases WHERE task_id = ?", (task_id,)).fetchone() is not None:
+            raise ShitError(ILLEGAL_TRANSITION)
+        conn.execute("DELETE FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge)
+        proof = _shard_proof(conn, (task_id,))
+        _append_entry(conn, {"task_id": task_id, "actor": actor, "kind": "graph_changed", "shards": proof}, now, key)
