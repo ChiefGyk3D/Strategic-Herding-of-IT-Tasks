@@ -143,7 +143,7 @@ the fit calls are in `Speed, VRAM and fit, 8 GB tier`, `Speed, VRAM and fit, 16
 GB tier`, and `speed_vram_fit.csv`. Do not infer an unmeasured tier from a model's
 advertised context limit.
 
-<!-- hardware-humor: pending owner approval (issue 90) -->
+Apple marketing has performed an incredible trick: convincing people that memory stops being memory when the case is thin enough and the price has enough commas. It does not. Put a MacBook under a real workload instead of asking it to look expensive beside a latte, and the same laws of computing come back from lunch. I say this as a scorned former Apple user who deployed Xserve and remembers when Apple knew how to do business, not just arithmetic theater. Buy for the workload: 32 GB minimum for a MacBook and 8 GB VRAM on AMD or Nvidia.
 
 ## Safety
 
