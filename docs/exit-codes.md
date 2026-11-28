@@ -111,6 +111,14 @@ For privacy scan findings, output contains only the file path and line number. I
 | `privacy-scan` | 7 | Scan input exceeded an applicable size or depth limit. |
 | `privacy-scan` | 9 | A requested scan target was not found. |
 | `privacy-scan` | 11 | A required allowlisted scanning tool was unavailable. |
+| `threads` | 0 | The plan was printed, or the launcher (`scripts/threads_run.py`) listed the threads or applied the plan. |
+| `threads` | 2 | Threads arguments are invalid. |
+| `threads` | 3 | The dispositions file, the configuration or a plan was rejected; nothing was written. |
+| `threads` | 5 | The dispositions, configuration or plan path violated confinement. |
+| `threads` | 7 | The dispositions file or an answer from the GitHub CLI exceeded a size or depth limit. |
+| `threads` | 8 | GitHub did not answer as required: a failed read (nothing written) or a failed write (see docs/threads.md). |
+| `threads` | 9 | The dispositions file or configuration was not found, or a comment id is not an unresolved thread. |
+| `threads` | 11 | The GitHub CLI is missing, cannot start, or timed out. |
 | `hooks` | 0 | Hook state was verified or the requested local hook operation succeeded. |
 | `hooks` | 1 | An unexpected internal failure occurred. |
 | `hooks` | 2 | Hook arguments are invalid. |
