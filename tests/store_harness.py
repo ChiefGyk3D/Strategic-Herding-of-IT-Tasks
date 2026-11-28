@@ -38,7 +38,7 @@ from _bootstrap import ROOT, make_git_dir
 
 from shit import queue_records, records, store
 from shit.errors import ShitError
-from shit.log import GENESIS
+from shit.log import GENESIS, chain_hash
 from shit.project import Project
 
 WORKER = str(Path(__file__).resolve().parent / "store_worker.py")
@@ -256,8 +256,7 @@ def check_invariants(conn, claims=()):
     - `store.verify` (deep, so `PRAGMA integrity_check` too) and `store.verify_tasks` report nothing;
     - `queue_records.replay` accepts the whole log;
     - the hash chain of the queue log is contiguous (numbers 1, 2, 3 ..., each entry's previous hash is the hash of the
-      one before; the digests themselves are recomputed for the events table by `verify_tasks`, not for the queue log,
-      whose line the harness cannot rebuild byte for byte);
+      one before) and every digest matches the canonical queue-entry line;
     - every claim has one winner: per task the claim generations are 1, 2, 3 ... with no repeat, no lease id repeats,
       and each claim a worker was told succeeded (`claims`, from the journals) is in the log exactly once and no two
       workers were told the same generation of one task;
@@ -275,10 +274,12 @@ def check_invariants(conn, claims=()):
     except ShitError as exc:
         return found + [f"replay refused the log (exit {exc.code})"]
     previous = GENESIS
-    for number, (seq, prev_hash, digest) in enumerate(rows, start=1):
+    for number, ((seq, prev_hash, digest), entry) in enumerate(zip(rows, entries, strict=True), start=1):
         if seq != number or prev_hash != previous:
             found.append(f"queue hash chain broken at entry {number}")
             break
+        if chain_hash(previous, store._queue_line(entry)) != digest:
+            found.append(f"queue hash wrong at entry {number}")
         previous = digest
     generations, lease_ids = {}, set()
     for entry in entries:

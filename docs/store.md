@@ -250,7 +250,7 @@ Test infrastructure for the queue operations above. It lives in `tests/` and cha
 | the lease row deleted before its apply slots (the order the trigger forbids) | the model: an accepted submit or hold is refused |
 | a COMMIT between the claim's entry and its lease row | the sweep: a kill after the entry leaves `claim_without_lease` |
 
-**Invariants checked** (`check_invariants`): `verify` (deep) and `verify_tasks` are empty; `queue_records.replay` accepts the whole log; the queue hash chain is contiguous (numbers, previous hashes); one winner per claim (the generations of a task are 1, 2, 3 ..., no lease id repeats, every claim a worker was told it won is in the log exactly once, no two workers were told the same generation); a lease row exists exactly when the replayed log says a lease is live, with the same lease id.
+**Invariants checked** (`check_invariants`): `verify` (deep) and `verify_tasks` are empty; `queue_records.replay` accepts the whole log; the queue hash chain is contiguous (numbers, previous hashes) and every queue-entry hash is recomputed from its canonical line; one winner per claim (the generations of a task are 1, 2, 3 ..., no lease id repeats, every claim a worker was told it won is in the log exactly once, no two workers were told the same generation); a lease row exists exactly when the replayed log says a lease is live, with the same lease id.
 
 **What it proves, and its limits.**
 
@@ -259,7 +259,7 @@ Test infrastructure for the queue operations above. It lives in `tests/` and cha
 - A SIGKILL ends a process; the operating system, and the file system, stay up. Power loss, a torn sector, a lost fsync or a full disk are not simulated, so what `synchronous=FULL` buys is trusted here, not tested.
 - A kill by a timer lands near COMMIT often but not exactly there; the deterministic sweep covers the fault points between statements, and SQLite's own atomic commit covers the rest.
 - Workers and the checks use one database file on one local file system. Network and shared file systems are not covered.
-- The queue hash chain's digests are not recomputed (the harness cannot rebuild the stored line byte for byte); the events chain's digests are, by `verify_tasks`.
+- The queue hash chain's digests are recomputed from the canonical stored-entry representation; the events chain's digests are recomputed by `verify_tasks`.
 - The model covers operations with no dependency edges and no decisions or records. Edge and record-dependent behavior is covered by `tests/test_store_queue.py`, `tests/test_store_queue_adapter.py`, and the concurrency harness; there is no claim of differential parity with the removed file queue.
 - A worker that sees exit code 8 (a stale clock reading against a newer entry, or an ambiguous commit) opens a new connection and goes on: with a shared logical clock a few operations are refused this way in every run, which is the designed fail-closed answer, not a finding.
 

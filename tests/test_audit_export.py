@@ -315,6 +315,53 @@ class VerifierTests(Flow):
 
         self.assert_refused(rechain(self.good, remove_creation))
 
+    def test_a_task_queue_cannot_start_after_its_lifecycle_has_already_advanced(self):
+        def advance_then_enqueue(target):
+            def edit(events, entries):
+                task_id = "later-" + target
+                stamp = "2026-11-27T22:00:00Z"
+                events.append({"schema": "event-log", "schema_version": 1, "id": "renumbered", "task_id": task_id,
+                               "timestamp": stamp, "actor": "human", "event": "task_created",
+                               "message": "Task record created.", "record_id": task_id})
+                transitions = [("open", "running", "wrapper")]
+                if target == "closed":
+                    transitions += [("running", "review", "wrapper"), ("review", "approved", "human"),
+                                    ("approved", "closed", "human")]
+                for number, (before, after, actor) in enumerate(transitions, start=1):
+                    events.append({"schema": "event-log", "schema_version": 1, "id": "renumbered",
+                                   "task_id": task_id, "timestamp": f"2026-11-27T22:00:0{number}Z",
+                                   "actor": actor, "event": "state_transition", "message": "State changed.",
+                                   "from_state": before, "to_state": after})
+                entries.append({"schema": "queue-entry", "schema_version": 1, "id": "renumbered",
+                                "timestamp": "2026-11-27T22:00:09Z", "task_id": task_id, "actor": "human",
+                                "kind": "enqueued", "state_after": "ready"})
+            return edit
+
+        for state in ("running", "closed"):
+            with self.subTest(first_lifecycle_state=state):
+                self.assert_refused(rechain(self.good, advance_then_enqueue(state)))
+
+    def test_a_queue_caused_lifecycle_transition_may_share_the_first_queue_timestamp(self):
+        self.task("same-second", enqueue=False)
+        stamp = self.tick()
+        store_queue.enqueue(self.proj, "same-second", "human", now=stamp)
+        lease = store_queue.claim(
+            self.proj,
+            {"task_id": "same-second", "step": "draft", "worker": "w1", "worker_kind": "human"},
+            now=stamp,
+        )
+        store_queue.start(self.proj, self.present(lease), now=stamp)
+
+        audit_export.verify_bytes(self.export_bytes())
+
+    def test_graph_proofs_cannot_name_a_task_without_a_creation_event(self):
+        def add_unknown_shard(events, entries):
+            proof = next(entry for entry in entries if entry["kind"] == "graph_changed")
+            proof["shards"].append({"task_id": "never-created", "sha256": "1" * 64})
+            proof["shards"].sort(key=lambda item: item["task_id"])
+
+        self.assert_refused(rechain(self.good, add_unknown_shard))
+
     def test_queue_completion_requires_its_matching_lifecycle_event(self):
         def remove_submission(events, entries):
             submitted = next(entry for entry in entries if entry["kind"] == "submitted")

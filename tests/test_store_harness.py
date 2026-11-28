@@ -186,6 +186,21 @@ class InvariantCheckTests(Quiet):
             self.assertIn("queue hash chain broken at entry 2", found)
             self.assertIn("verify: queue_chain_broken", found)
 
+    def test_a_corrupted_queue_entry_hash_is_reported_at_the_fixed_default_seed(self):
+        with mock.patch.dict("os.environ", {}, clear=True):
+            settings = harness.Settings.from_env()
+        self.assertEqual(settings.seed, 1729)
+        with harness.Arena(settings) as arena:
+            self.claimed(arena)
+            raw = self.raw(arena)
+            names = [row[0] for row in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'queue_entries'")]
+            for name in names:
+                raw.execute('DROP TRIGGER "' + name + '"')
+            last = raw.execute("SELECT max(seq) FROM queue_entries").fetchone()[0]
+            raw.execute("UPDATE queue_entries SET hash = ? WHERE seq = ?", ("f" * 64, last))
+            self.assertIn(f"queue hash wrong at entry {last}", harness.check_invariants(arena.conn))
+
     def test_a_worker_that_cannot_start_is_reported(self):
         with harness.Arena(self.settings) as arena:
             report = harness.run_workers(arena, seed=1, workers=1, ops=5, seconds=10.0, root=arena.dir / "nowhere")
