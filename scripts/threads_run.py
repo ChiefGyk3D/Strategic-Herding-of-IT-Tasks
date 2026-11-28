@@ -17,8 +17,8 @@ whose outcome is unknown could double-post); a resolve runs only after every rep
 when the answer says `isResolved` is true; the first failure stops the run and prints what was done; the output
 of `gh` (stdout and stderr) is never shown, only checked.
 
-Host and credential: the host comes only from this machine's configuration (`--config`, else `config.toml` in the
-working directory, `[tracker] host`), else github.com; the plan never chooses it. A plan whose host is not null and
+Host and credential: the host comes only from this machine's configuration (an explicit `--config PATH`,
+`[tracker] host`), else github.com, and no file is read by default; the plan never chooses it. A plan whose host is not null and
 differs is refused before any call (exit 3). Every call carries `--hostname HOST`. Only the token variables that
 apply to that host are passed: GH_TOKEN and GITHUB_TOKEN for github.com, GH_ENTERPRISE_TOKEN and
 GITHUB_ENTERPRISE_TOKEN for any other host. This script never reads, prints or logs their values.
@@ -45,7 +45,6 @@ from shit._text import read_bounded
 from shit.errors import REJECTED, ShitError
 
 CALL_TIMEOUT = 60
-DEFAULT_CONFIG = "config.toml"
 
 # The variables `gh` may receive. Nothing else from the caller's environment is passed on.
 ENV_ALLOW = (
@@ -143,11 +142,9 @@ def execute(plan, gh):
 
 
 def configured_host(config_arg, base):
-    """`[tracker] host` of --config, or of config.toml below the working directory if there is one, else None."""
+    """`[tracker] host` of the explicit --config file, else None. No file is ever picked up by default."""
     if config_arg is None:
-        if not os.path.lexists(base / DEFAULT_CONFIG):
-            return None
-        config_arg = DEFAULT_CONFIG
+        return None
     return config.read(base / config_arg, base).get("tracker", {}).get("host")
 
 
@@ -172,7 +169,7 @@ def make_handler(runner, which, environ, cwd):
 def build(runner, which, environ, cwd):
     parser = _cli.SafeParser(prog="threads_run")
     parser.add_argument("--config", default=None, help="configuration file whose [tracker] host is trusted "
-                        "(default: config.toml in the working directory, if present)")
+                        "(default: none, so github.com)")
     parser.add_argument("plan", help="plan file from `shit threads`, below the working directory")
     parser.set_defaults(func=make_handler(runner, which, environ, cwd))
     return parser

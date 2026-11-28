@@ -16,12 +16,12 @@ The launcher is outside the `shit` package because SHIT forbids any module of th
 ```
 shit threads [--config PATH] list  OWNER/NAME PR                      > plan.json
 shit threads [--config PATH] apply OWNER/NAME PR DISPOSITIONS.json    > plan.json
-python3 scripts/threads_run.py plan.json
+python3 scripts/threads_run.py [--config PATH] plan.json
 ```
 
 Run the launcher from the directory that holds `plan.json`; the plan file, the dispositions file and the configuration file must be regular files below the working directory (a path outside it, a symlink, a FIFO and a hard-linked file are refused).
 
-`--config` names a project configuration file (`templates/config.toml`). Its optional `[tracker] host` is the host name of the code host, for a self-hosted server; it is carried in the plan and passed to every call as `gh api --hostname HOST`. Without `--config`, or without a `host` key, `gh` uses its own default host.
+`--config` names a project configuration file (`templates/config.toml`). Its optional `[tracker] host` is the host name of the code host, for a self-hosted server; it is carried in the plan for reading, and it is the only host the launcher will talk to (see below). Without `--config`, or without a `host` key, the host is `github.com`. Pass the same `--config` to `shit threads` and to the launcher.
 
 ### The plan
 
@@ -55,7 +55,9 @@ The dispositions file is a JSON list; each row is exactly `comment_id` (the id `
 
 ### What the launcher passes to `gh`
 
-No shell (an argument list), stdin closed, a 60 second timeout per call, standard output and standard error captured and never shown. The environment is an explicit allowlist (`ENV_ALLOW` in the script): `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`, `USER`, `TMPDIR`; the sign-in variables `GH_TOKEN`, `GITHUB_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR`; the `XDG_*` directories; the proxy and certificate variables `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and lowercase forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`. It adds `GH_PROMPT_DISABLED=1` and `NO_COLOR=1`. Every other variable is dropped, and a value with a control character is dropped. The sign-in variables are the user's own credential, passed through untouched so `gh` can authenticate; the launcher never reads, prints or logs their values. Trim `ENV_ALLOW` if you sign in another way (for example with `gh auth login`, which needs none of the token names).
+**Host and credential.** A plan file is data anyone may have edited, and the credential goes to whatever host a call names, so the plan never chooses the host. The launcher takes the trusted host only from an explicit `--config PATH` (its `[tracker] host`), otherwise `github.com`. It never reads a configuration file by default, so a file left in the working directory cannot choose the host that receives your token. **A GitHub Enterprise or other self-hosted host needs `--config`**; without it only `github.com` is used. A plan whose `host` is null uses the trusted host; a plan naming a different host is refused before any call with exit code 3 (the message names no host). A `--config` file that is unreadable is refused too (3, 5 or 9). Every call carries `--hostname HOST` for the trusted host.
+
+**Call rules.** No shell (an argument list), stdin closed, a 60 second timeout per call, standard output and standard error captured and never shown. The environment is an explicit allowlist (`ENV_ALLOW` in the script): `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TZ`, `USER`, `TMPDIR`, `GH_CONFIG_DIR`, the `XDG_*` directories, and the proxy and certificate variables `HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY` (and lowercase forms), `SSL_CERT_FILE`, `SSL_CERT_DIR`. It adds `GH_PROMPT_DISABLED=1` and `NO_COLOR=1`. Only the token variables that apply to the trusted host are passed, never both pairs: `GH_TOKEN` and `GITHUB_TOKEN` for `github.com`; `GH_ENTERPRISE_TOKEN` and `GITHUB_ENTERPRISE_TOKEN` for any other host. `GH_HOST` is not passed. Every other variable is dropped, and a value with a control character is dropped. The tokens are the user's own credential, passed untouched so `gh` can authenticate; the launcher never reads, prints or logs their values. If you sign in with `gh auth login`, no token variable is needed.
 
 ## Exit codes
 
@@ -65,11 +67,11 @@ The codes are the shared table in [exit-codes.md](exit-codes.md); no new code is
 |---:|---|
 | 0 | Done. |
 | 2 | Arguments are invalid: bad repository name or number, or an unknown option. |
-| 3 | The dispositions file, the configuration or the plan was rejected. |
+| 3 | The dispositions file, the configuration or the plan was rejected, including a plan naming a host other than the configured one. |
 | 5 | A dispositions, configuration or plan path violated confinement. |
 | 7 | An input or an answer from `gh` exceeded a size or depth limit. |
 | 8 | GitHub did not answer as required. Before any write this is a failed read (nothing was written). After the first write the printed lines show what was done and where it stopped. |
-| 9 | A file or the configuration was not found, or a replied `comment_id` is not an unresolved thread. Nothing was written. |
+| 9 | A file or the configuration was not found, or a replied or resolved `comment_id` is not an unresolved thread. Nothing was written. |
 | 11 | `gh` is missing, cannot start, or a call timed out (60 seconds each). |
 
 Tests: `tests/test_threads.py` (plan builder, validation, helpers) and `tests/test_threads_run.py` (the launcher, against a fake `gh` executable on a temporary `PATH`). No test touches the network or a real credential.

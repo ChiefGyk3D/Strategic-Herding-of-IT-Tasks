@@ -207,12 +207,14 @@ class HostTrustTests(Case):
                 self.assertNotIn(plan_host, err)
         self.assertEqual(self.calls(), [])
 
-    def test_default_config_in_the_working_directory_is_read(self):
+    def test_a_config_in_the_working_directory_is_never_picked_up(self):
         self.fake()
-        self.conf("git.example.org")
-        self.assertEqual(self.run_with(self.plan_file(kind="list", host="github.com"))[0], 3)
-        self.assertEqual(self.run_with(self.plan_file(kind="list", host="git.example.org"))[0], 0)
-        self.assertEqual(self.hostname(), "git.example.org")
+        self.conf("git.example.org")  # planted config.toml: without --config it must have no effect
+        self.assertEqual(self.run_with(self.plan_file(kind="list", host="git.example.org"))[0], 3)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.run_with(self.plan_file(kind="list"))[0], 0)
+        self.assertEqual(self.hostname(), "github.com")
+        self.assertEqual(set(self.calls()[0]["env"]) & {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"}, set())
 
     def test_a_bad_or_missing_config_is_refused_before_any_call(self):
         self.fake()
