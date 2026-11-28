@@ -61,7 +61,7 @@ The spec text now matches the code.
 - The task cap (2,000) counts queued ids and shard owners together. An empty persisted shard is refused.
 - Maintenance removes every temporary leftover in one pass, and readiness reads an index of edges by task.
 - Entry points refuse on sight: any locked entry point (queue operation, task, evidence, report, review, decision, yardstick) that finds `queue-pending.json` returns exit code 8 and writes nothing, whether the record is genuine or planted. Only `queue.recover(project)` plans and applies it, after proving it read-only (Q-REC-02). Task and artifact writers prove the whole queue state before they commit, even with nothing pending; readers do so only when a pending task record forces a write. `shit check` reports the queue state and any pending record read-only (exit code 8).
-- Not done (follow-up): privacy-scan directory width and cumulative byte budgets, an operation deadline while holding the lock, and `scandir`-based bounded listings (M4).
+- Bounded work (M4, issue 54): privacy-scan directory width and cumulative byte budgets, a scan deadline, `scandir`-based bounded listings and an operation deadline while holding the lock are done. See [bounded-work.md](bounded-work.md).
 
 ## Still open
 

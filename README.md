@@ -16,6 +16,8 @@ The dependency graph, durable queue and per-task leases are implemented in `shit
 
 The SQLite store that will replace the file queue is being built in steps; its foundation (confined connection, schema, fingerprint, error mapping) is `shit/store.py`, described in [docs/store.md](docs/store.md).
 
+Bounded work (directory width, byte budget, scan and lock-hold deadlines) is described in [docs/bounded-work.md](docs/bounded-work.md).
+
 ## Contributing
 
 Open an issue describing the change before sending a pull request, and link that issue from the pull request. Every change goes through a pull request; the `CI green` check must pass. Report security problems privately as described in [SECURITY.md](SECURITY.md).

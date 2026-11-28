@@ -32,7 +32,7 @@ from .errors import (
 )
 from .log import EventLog
 from .privacy import repo_root
-from .project import Project
+from .project import Project, bounded_names
 
 MAX_TEXT_BYTES = 16384
 MAX_TASKS = 5000
@@ -244,7 +244,7 @@ def _task_ids(project):
     """Task ids from tasks/*.json. A name that is not a valid id is reported without being printed."""
     fd = project._walk(("tasks",))
     try:
-        names = sorted(os.listdir(fd))
+        names = sorted(bounded_names(fd))
     finally:
         os.close(fd)
     ids, bad = [], False
