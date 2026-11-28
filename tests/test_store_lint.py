@@ -52,6 +52,16 @@ ALLOWED_METHODS = {
     "_check_settings": {"execute"}, "fingerprint": {"execute"}, "expected_fingerprint": {"execute"},
     "write_transaction": {"execute"}, "_fail_transaction": {"execute"}, "_verify_unmapped": {"execute"},
     "_check_json": {"execute"},
+    # C3 (issue 61): reads, the snapshot owner and the three write helpers. Every statement in a write helper is a
+    # literal; the writes sit lexically inside `with write_transaction(conn)`.
+    "read_snapshot": {"execute"}, "_task_row": {"execute"}, "_history_rows": {"execute"}, "get_record": {"execute"},
+    "record_event": {"execute"}, "list_records": {"execute"}, "record_ids": {"execute"}, "list_events": {"execute"}, "_tip": {"execute"},
+    "create_task": {"execute"}, "transition_task": {"execute"}, "add_record": {"execute"},
+    "_verify_tasks_unmapped": {"execute"},
+    # dependency graph (issue 62)
+    "_graph_task_exists": {"execute"}, "_graph_has_path": {"execute"}, "_graph_check_caps": {"execute"},
+    "add_edges": {"execute"}, "remove_edge": {"execute"}, "list_edges": {"execute"}, "needs_of": {"execute"},
+    "prerequisite_closure": {"execute"},
 }
 ALLOWED_REFLECTION = {("_open_once", "setconfig")}
 CONNECTORS = {"_open_once", "expected_fingerprint"}
@@ -60,7 +70,8 @@ BUILDERS = {(STORE, name) for name in (
     "schema_statements", "_guard", "_no_pair", "_queue_guards", "_lease_guards", "_chain_guard", "_stamp_check",
     "_slug_check", "_hex_check", "_text_check", "_seconds", "_pair_rows", "_kind_rules")}
 # Functions of the store that run their own BEGIN IMMEDIATE / pragmas / scratch in-memory database.
-TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "_fail_transaction", "expected_fingerprint"}
+TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "_fail_transaction", "expected_fingerprint",
+              "read_snapshot"}
 # A variable may be passed to execute only as the loop variable over `schema_statements()` in these two functions.
 SCHEMA_CONSUMERS = {"_install_schema", "expected_fingerprint"}
 
@@ -587,6 +598,154 @@ class BiteTests(unittest.TestCase):
         for source in good:
             with self.subTest(source=source):
                 self.assertEqual(access_findings(source, STORE, FUTURE), [], source)
+
+
+C3_WRITERS = ("create_task", "transition_task", "add_record")
+
+
+class TaskHelperLintTests(unittest.TestCase):
+    """Issue 61: the task, event and index helpers are on the list on purpose, and the list does not make them free."""
+
+    def test_each_write_helper_is_exactly_one_write_transaction(self):
+        tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
+        top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for name in C3_WRITERS:
+            _with_parents(top[name])
+            with self.subTest(name=name):
+                withs = [n for n in ast.walk(top[name]) if isinstance(n, ast.With)]
+                guarded = [w for w in withs if any(
+                    isinstance(i.context_expr, ast.Call) and getattr(i.context_expr.func, "id", "") == "write_transaction"
+                    for i in w.items)]
+                self.assertEqual(len(guarded), 1, name)
+                # Every statement that is not a read sits inside that one block.
+                writes = [n for n in ast.walk(top[name]) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "execute"
+                          and not is_read_only(_text(n.args[0]) or "")]
+                self.assertGreaterEqual(len(writes), 2, name)
+                for call in writes:
+                    self.assertTrue(_in_write_transaction(call), name)
+
+    def test_the_read_helpers_never_write(self):
+        tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
+        top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for name in ("_task_row", "_history_rows", "get_task", "get_record", "record_event", "record_ids", "list_events",
+                     "_tip", "list_records", "_verify_tasks_unmapped"):
+            for call in ast.walk(top[name]):
+                if isinstance(call, ast.Call) and getattr(call.func, "attr", "") in EXECUTORS:
+                    with self.subTest(name=name):
+                        self.assertTrue(is_read_only(_text(call.args[0]) or ""), name)
+
+    def test_a_listed_helper_still_may_not_write_outside_its_transaction(self):
+        for name in C3_WRITERS:
+            source = 'def ' + name + '(conn):\n    conn.execute("INSERT INTO tasks VALUES (?)", row)'
+            with self.subTest(name=name):
+                self.assertTrue(access_findings(source, STORE), name)
+
+    def test_a_helper_that_is_not_on_the_list_may_not_execute_at_all(self):
+        source = 'def _insert_event(conn):\n    with write_transaction(conn):\n        conn.execute("INSERT INTO events VALUES (?)", row)'
+        found = access_findings(source, STORE)
+        self.assertIn("database method in a function not on the list", {kind for _, kind in found})
+
+    def test_text_built_sql_is_still_caught_inside_a_listed_helper(self):
+        sources = (
+            ("def create_task(conn, name):\n    with write_transaction(conn):\n"
+             '        conn.execute("INSERT INTO " + name + " VALUES (?)", row)'),
+            ("def add_record(conn, kind):\n    with write_transaction(conn):\n"
+             '        conn.execute(f"INSERT INTO records VALUES ({kind})", row)'),
+            ("def transition_task(conn, to):\n    sql = \"UPDATE tasks SET state = '%s'\" % to\n"
+             "    with write_transaction(conn):\n        conn.execute(sql)"),
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                found = access_findings(source, STORE) + sql_findings(source, STORE, BUILDERS)
+                self.assertTrue(found, source)
+
+    def test_the_read_snapshot_name_cannot_be_borrowed(self):
+        bad = (
+            'def f(conn):\n    conn.execute("BEGIN")',
+            'def innocent():\n    def read_snapshot(conn):\n        conn.execute("BEGIN")\n    return read_snapshot',
+            "def read_snapshot(conn):\n    pass\n\ndef read_snapshot(conn):\n    pass",
+            "read_snapshot = something",
+            "class Holder:\n    def read_snapshot(self):\n        pass",
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE), source)
+        self.assertEqual(access_findings('def read_snapshot(conn):\n    conn.execute("BEGIN")', STORE), [])
+        self.assertIn("read_snapshot", TXN_OWNERS)
+
+
+GRAPH_FUNCTIONS = ("_graph_task_exists", "_graph_has_path", "_graph_check_caps", "add_edges", "remove_edge",
+                   "list_edges", "needs_of", "prerequisite_closure")
+
+
+class GraphLintTests(unittest.TestCase):
+    """The dependency graph helpers (issue 62) are on the allowlist one by one, and the rules still bite there."""
+
+    def test_the_real_graph_functions_are_listed_defined_and_clean(self):
+        source = (ROOT / STORE).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for name in GRAPH_FUNCTIONS:
+            self.assertIn(name, defined)
+            self.assertEqual(ALLOWED_METHODS[name], {"execute"})
+        self.assertEqual(access_findings(source, STORE), [])
+        # Nothing else in the graph section reaches the database: the allowlist is exact, not a prefix.
+        graph = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and n.name.startswith("_graph_")}
+        self.assertEqual({n for n in graph if n in ALLOWED_METHODS}, {"_graph_task_exists", "_graph_has_path",
+                                                                      "_graph_check_caps"})
+
+    def test_a_new_function_that_touches_the_database_is_a_finding_until_listed(self):
+        source = 'def add_edges_fast(conn):\n    return conn.execute("SELECT 1")'
+        self.assertTrue(access_findings(source, STORE, ALLOWED_METHODS))
+        self.assertEqual(access_findings(source, STORE, {**ALLOWED_METHODS, "add_edges_fast": {"execute"}}), [])
+
+    def test_an_edge_write_outside_the_transaction_is_a_finding(self):
+        for statement in ("INSERT INTO edges (task_id, needs_id, type) VALUES (?, ?, ?)",
+                          "DELETE FROM edges WHERE task_id = ?",
+                          "UPDATE edges SET type = 'apply'",
+                          "INSERT OR REPLACE INTO edges (task_id, needs_id, type) VALUES (?, ?, ?)"):
+            with self.subTest(statement=statement):
+                bare = f'def add_edges(conn, edge):\n    conn.execute("{statement}", edge)'
+                self.assertTrue(access_findings(bare, STORE, ALLOWED_METHODS))
+                guarded = ('def add_edges(conn, edge):\n    with write_transaction(conn):\n'
+                           f'        conn.execute("{statement}", edge)')
+                self.assertEqual(access_findings(guarded, STORE, ALLOWED_METHODS), [])
+
+    def test_a_write_hidden_behind_a_with_clause_is_a_finding_outside_the_transaction(self):
+        # A statement that starts with WITH is not a plain read, so the closure reads are written as a SELECT.
+        source = 'def needs_of(conn, t):\n    return conn.execute("WITH r AS (SELECT 1) DELETE FROM edges", (t,))'
+        self.assertTrue(access_findings(source, STORE, ALLOWED_METHODS))
+
+    def test_dynamic_sql_in_a_graph_function_is_a_finding(self):
+        bad = (
+            'def needs_of(conn, t):\n    return conn.execute(f"SELECT * FROM edges WHERE task_id = \'{t}\'")',
+            'def needs_of(conn, t):\n    return conn.execute("SELECT * FROM edges WHERE task_id = " + t)',
+            'def needs_of(conn, t):\n    sql = "SELECT * FROM edges WHERE task_id = ?"\n    return conn.execute(sql, (t,))',
+            'def needs_of(conn, t):\n    return conn.execute("SELECT * FROM edges WHERE task_id = %s" % t)',
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE, ALLOWED_METHODS) or sql_findings(source, STORE),
+                                source)
+
+    def test_the_real_reads_are_literal_selects_and_the_real_writes_sit_in_write_transaction(self):
+        tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
+        seen = {}
+        for function in tree.body:
+            if isinstance(function, ast.FunctionDef) and function.name in GRAPH_FUNCTIONS:
+                for node in ast.walk(function):
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "execute"):
+                        seen.setdefault(function.name, []).append(_text(node.args[0]))
+        self.assertEqual(set(seen), set(GRAPH_FUNCTIONS))
+        for name, statements in seen.items():
+            for statement in statements:
+                self.assertIsNotNone(statement, name)
+                if name in ("add_edges", "remove_edge"):
+                    continue  # their writes are proven by access_findings above
+                self.assertTrue(is_read_only(statement), (name, statement))
+        writes = [s for s in seen["add_edges"] + seen["remove_edge"] if not is_read_only(s)]
+        self.assertEqual(len(writes), 2)  # exactly one INSERT and one DELETE
 
 
 if __name__ == "__main__":

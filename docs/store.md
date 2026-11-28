@@ -60,7 +60,7 @@ The wait for another writer is `[store] busy_timeout_ms` in `config.toml` (0 to 
 | `records` | Index of record files by kind, id, task, SHA-256 and size. Bodies stay files. |
 | `queue_entries` | The queue log with its hash chain columns. Append-only. |
 | `leases` | At most one live lease per task. |
-| `edges` | Dependency edges, no self edge. |
+| `edges` | Dependency edges, no self edge, one row per dependent, prerequisite and type. |
 | `apply_slots` | One slot per apply target. |
 
 The rules are generated from `shit/lifecycle.py`, `shit/queue_records.py`, `shit/dependencies.py` and `shit/records.py`, so the database cannot drift from the code:
@@ -122,6 +122,40 @@ Messages are the fixed text of `docs/exit-codes.md`. They never carry a path or 
 - `PRAGMA journal_mode=WAL` writes the database header outside an explicit transaction, because SQLite does not allow the switch inside one. It runs only after the header checks pass.
 - Rows are checked for what the database can express. Control and bidirectional characters in messages are still the job of the record validators (`shit/_text.py`) before a write.
 
+## Tasks, events and the records index (issue 61)
+
+`store.py` holds, in a delimited section, the write helpers that replace the file protocol's multi-file commit for tasks and records. `shit/store_tasks.py` is the adapter: it has the names and arguments of `task.py` and `commands.py` (`create_task`, `new_task`, `get_task`, `transition`, `add_evidence`, `add_report`, `add_review`, `add_decision`, `show`, `close_task`) and returns the same values and exit codes. The file protocol is left in place until the CLI and the queue move over; nothing here reads or writes `events.jsonl`, `events.chain` or `pending.json`.
+
+| Helper | One `write_transaction` writes, in this order |
+|---|---|
+| `create_task` | the task row, the `task` index row (digest of the body file), the `task_created` event |
+| `transition_task` | the task row (state, time, blocked fields), the `task_history` row, the `state_transition` event |
+| `add_record` | the index row, then the event (`handoff` has no event kind, so only the row) |
+
+Every check and every read happens after `BEGIN IMMEDIATE`: the task exists, a closed task takes no record, a duplicate is refused (exit code 2), the transition is legal for the actor, a model or wrapper cannot approve (10), time never goes back against the task or the event log tip (3). A `precheck` or `check` callback runs inside the transaction and may raise, so `close_task` decides on the same data it commits. Each event is the file protocol's: same fields in the same order, id `event-NNNN` from the sequence number, hash `sha256(previous hash, newline, line)`, so the two logs of the same script are equal byte for byte (a test runs both).
+
+**Bodies.** A record body (task, evidence, report, review, decision) stays a file at its old path under `.shit/`. It is written to its final name before the transaction, by temp file and hard link, so it appears whole or not at all and nothing on disk is overwritten. No file lock is taken (the store's own transaction is the isolation, and the file protocol's lock discipline belongs to the file protocol). The one thing a lock would have done is clean up a `.tmp-` name that a crash left beside a finished body in the microseconds between the link and the removal: every read of that body then refuses (exit code 5, `body_unreadable` in `verify_bodies`) and that record id is unusable until the extra name is removed by hand; another id works. After the commit the adapter reads the file again and compares its SHA-256 and size with the index row; a difference is exit code 3 and the row stays (the index is the record of what was committed). Every read of a body checks the digest first. A task body is the task as created (title, summary); the state, owner, times and history come from the database, and `get_task` joins them and validates the result with the old validator.
+
+**Crashes.** A crash before the transaction leaves a body file with no index row. That is not an inconsistency: repeating the call adopts the bytes on disk (a record body only if it names the same task and actor; a task body only if it is the same open task), as the file protocol did. A crash inside the transaction leaves nothing (SQLite rolls it back). A crash after the commit and before the check leaves a complete record. An orphan body is never used by a reader, because every read goes through the index.
+
+**Reads.** One statement can be read alone. An operation that reads several rows (`get_task` reads the row and the history) runs in `store.read_snapshot`, a deferred `BEGIN` that ends in `ROLLBACK`, so every read sees one commit. It is one of the functions that own their transaction in the lint.
+
+**Checks.** The tests call `store.verify(conn)` and `store.verify_tasks(conn)` after every operation. `verify_tasks` adds what `verify` leaves to the writers: `event_hash_wrong`, `event_invalid`, `task_differs_from_history` (state and time against the last history row, and the history chain from `open`), `history_differs_from_events`, `task_without_created_event`, `task_without_body_record`, `record_without_event`, `event_without_record`, `record_digest_differs_from_event`. `store_tasks.verify_bodies(project, conn)` reads the files: `body_missing`, `body_differs_from_index`.
+
+**Lint.** The new functions are on the allowlist of `tests/test_store_lint.py` on purpose, each with `execute` only: the reads, `read_snapshot` (a transaction owner) and the three write helpers. A test proves each write helper holds exactly one `write_transaction` with all its writes inside, that the read helpers hold no write, and that being on the list does not allow a write outside a transaction, text-built SQL or a look-alike `read_snapshot`.
+
+**Not done here.** The queue is still files (a task in a live queue state is not refused by `transition_task`; the queue port does that in one transaction with the queue entry), the dependency graph, the hash-chained export, the CLI switch, and removal of the file protocol. A body file that no index row names is left in place; there is no sweep. `precheck` receives the task row, not the body (no title or summary).
+
+## Dependency graph (issue 62)
+
+`store.add_edge`, `store.add_edges`, `store.remove_edge` and the reads `store.list_edges`, `store.needs_of` and `store.prerequisite_closure` are the database version of `shit/dependencies.py` (which stays until the file queue is removed). An edge `(task_id, needs_id, type)` means `task_id` needs `needs_id`. Each add (one edge or a batch) and each removal is one `write_transaction`, so a refusal leaves nothing behind. The reads are single `SELECT` statements.
+
+The order of the checks, and the exit codes, are those of `dependencies.add_edges`: each edge's shape (two slugs and one of the four types, else 3) and then its tasks (an unknown task is 9), in the order given; then duplicates (3); then the caps (7): 200 edges per dependent task and 2,000 dependent tasks with edges in all (`dependencies.MAX_NEEDS_PER_TASK`, `MAX_TASKS`), counting a self edge as the file version does; then a self edge or a cycle (3). The cycle check runs inside the transaction: with the new edges inserted, a recursive query (`UNION`, so a diamond or a long chain terminates and is walked once) asks whether any new edge's prerequisite reaches its dependent; if so the transaction is rolled back. `remove_edge` refuses a bad shape (3) and an edge that is not there, matched on all three columns (9), and then, as `queue.remove_edge` does, a dependent that holds a live lease row (4). No SQL text is built from an argument: every statement is a literal with `?` parameters, and each function that runs one is on the exact allowlist of `tests/test_store_lint.py`.
+
+`edges` now has the primary key `(task_id, needs_id, type)`, as the file graph allows the same pair with more than one type (a `draft` and an `apply` edge between the same two tasks). The pinned schema fingerprint changed with it.
+
+What the database does not do: the caps are enforced by the helpers only (a hand written `INSERT` can exceed them; the schema keeps the foreign keys, the type list and the no-self-edge check), and a cycle can likewise be written by hand. `store.verify` does not look for cycles. The queue population cap (queued tasks and shard owners together stay within 2,000, `queue._check_population`) belongs to the enqueue operation, not to the graph helpers. The `graph_changed` queue entry that the file queue writes for each change is the job of the queue operations (C3, C4): this module changes the table only. `tests/test_store_graph.py` replays random operation sequences, including hostile and oversized ids, through both implementations and requires the same exit code, the same edges and the same closure after every operation.
+
 ## Not built yet
 
-Queue operations, the event-log and task ports, the hash-chained export, apply-slot logic, and removal of the file queue.
+Queue operations, the dependency graph, the hash-chained export, apply-slot logic, the CLI switch, and removal of the file queue.
