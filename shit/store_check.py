@@ -8,7 +8,7 @@ nothing to report. Output is fixed text and names of invariants (fixed identifie
 
 from datetime import UTC, datetime
 
-from . import audit_export, file_backend_state, store, store_tasks
+from . import audit_export, store, store_tasks
 from .errors import FAILED_CLOSED, ShitError
 
 _LIVE = ("dispatched", "running")
@@ -18,6 +18,9 @@ _FAILURES = {
     audit_export.OLDER: "database is older than its audit export (restored or truncated)",
     audit_export.DIVERGED: "database differs from its audit export (restored or edited)",
 }
+
+# Deterministic test seam for a cooperating writer between the status read and the remaining check reads.
+_check_hook = lambda: None
 
 
 def _count(items):
@@ -40,52 +43,62 @@ def _queue_lines(conn, now):
     return lines
 
 
-def task_statuses(project):
+def task_statuses(project, conn=None):
     """Current task states and human dispositions from one read-only snapshot; no store means no tasks."""
     if not project.exists(store.DB_NAME):
         return {}
+    if conn is not None:
+        return _task_statuses(project, conn)
     try:
-        conn = store.connect(project)
+        conn = store.connect(project, allow_file_protocol_state=True)
     except ShitError:
         return {}
     try:
         with store.read_snapshot(conn):
-            statuses = {}
-            for row in store.list_records(conn):
-                if row["kind"] != "task":
-                    continue
-                body = store_tasks._read_body(project, "task", row["record_id"], row)
-                if store_tasks.records.load_task(body)["id"] != row["record_id"]:
-                    raise ShitError(FAILED_CLOSED)
-                task_id = row["record_id"]
-                decisions = [store_tasks._load(project, conn, "decision", record_id, task_id)
-                             for record_id in store.record_ids(conn, "decision", task_id)]
-                statuses[task_id] = {
-                    "state": store.get_task(conn, task_id)["state"],
-                    "human_disposition": any(item["actor"] == "human" and item["status"] in ("accepted", "rejected")
-                                             for item in decisions),
-                }
-            return statuses
+            return _task_statuses(project, conn)
     finally:
         conn.close()
 
 
-def diagnose(project, now=None):
+def _task_statuses(project, conn):
+    statuses = {}
+    for row in store.list_records(conn):
+        if row["kind"] != "task":
+            continue
+        body = store_tasks._read_body(project, "task", row["record_id"], row)
+        if store_tasks.records.load_task(body)["id"] != row["record_id"]:
+            raise ShitError(FAILED_CLOSED)
+        task_id = row["record_id"]
+        decisions = [store_tasks._load(project, conn, "decision", record_id, task_id)
+                     for record_id in store.record_ids(conn, "decision", task_id)]
+        statuses[task_id] = {
+            "state": store.get_task(conn, task_id)["state"],
+            "human_disposition": any(item["actor"] == "human" and item["status"] in ("accepted", "rejected")
+                                     for item in decisions),
+        }
+    return statuses
+
+
+def _audit_files(project):
+    footer = audit_export.read_footer(project)
+    return footer, audit_export.read_export(project) if footer is not None else None
+
+
+def diagnose(project, now=None, *, conn=None, audit_files=None):
     """([(exit code, text)], [summary lines], [warning lines]); all empty when the project has no store file."""
     findings, lines, warnings = [], [], []
     if not project.exists(store.DB_NAME):
         return findings, lines, warnings
     now = now or datetime.now(UTC).strftime(_NOW)
+    owned = conn is None
     try:
-        footer = audit_export.read_footer(project)  # before the snapshot: an export never gets ahead of its database
-        exported = audit_export.read_export(project) if footer is not None else None
-        conn = store.connect(project)
+        footer, exported = audit_files if audit_files is not None else _audit_files(project)
+        if owned:
+            conn = store.connect(project, allow_file_protocol_state=True)
     except ShitError as exc:
         return [(exc.code, "cannot be opened or its audit export cannot be read")], lines, warnings
     try:
-        with store.read_snapshot(conn):
-            if file_backend_state.present(project):
-                findings.append((FAILED_CLOSED, "file backend is gone; start a new store"))
+        def read_all():
             for name in store.verify(conn, deep=True) + store.verify_tasks(conn):
                 findings.append((FAILED_CLOSED, f"invariant {name} does not hold"))
             for name in store_tasks.verify_bodies(project, conn, include_orphans=True):
@@ -95,11 +108,20 @@ def diagnose(project, now=None):
             except ShitError:
                 findings.append((FAILED_CLOSED, "queue state does not verify"))
             found = audit_export.compare(footer, conn)
+            tips = store.audit_tips(conn)
+            lines.append(f"store: snapshot events {tips['events'][0]}, queue {tips['queue'][0]}")
+            return found
+        if owned:
+            with store.read_snapshot(conn):
+                found = read_all()
+        else:
+            found = read_all()
     except ShitError as exc:
         findings.append((exc.code, "cannot be read"))
         return findings, lines, warnings
     finally:
-        conn.close()
+        if owned and conn is not None:
+            conn.close()
     if found.state in _FAILURES:
         findings.append((FAILED_CLOSED, _FAILURES[found.state]))
     elif found.state == audit_export.BEHIND:

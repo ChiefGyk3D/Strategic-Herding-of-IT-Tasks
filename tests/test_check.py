@@ -40,6 +40,33 @@ class Check(RepoCase):
         self.new_task(state="open")
         self.assertEqual(self.check()[0], 0)
 
+    def test_one_snapshot_hides_a_commit_between_check_reads(self):
+        self.new_task(state="open")
+        real_hook = store_check._check_hook
+
+        def commit_after_statuses():
+            from shit import task as task_mod
+            store_check._check_hook = lambda: None
+            task_mod.transition(
+                self.proj, "t1", "running", "wrapper", "start",
+                now="2026-11-26T16:00:00Z",
+            )
+
+        store_check._check_hook = commit_after_statuses
+        try:
+            code, out, err = self.check()
+        finally:
+            store_check._check_hook = real_hook
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("store: snapshot events 1, queue 0", out)
+        self.assertNotIn("brief missing", out)
+
+        conn = store.connect(self.proj)
+        try:
+            self.assertEqual(store.get_task(conn, "t1")["state"], "running")
+        finally:
+            conn.close()
+
     def test_each_missing_element_fails(self):
         cases = [
             ("brief", "briefs/t1.md", "running", 9),

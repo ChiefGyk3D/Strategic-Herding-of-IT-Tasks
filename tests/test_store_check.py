@@ -68,7 +68,10 @@ class ReportTests(StoreCheckCase):
         (self.repo / ".shit" / "queue.jsonl").write_text("state")
         code, lines = check.run_check(self.repo)
         self.assertEqual(code, errors.PRECONDITION)
-        self.assertIn("store: file backend is gone; start a new store", lines)
+        self.assertIn(
+            "store: found file-protocol state (queue.jsonl); file protocol was removed; start a new store",
+            lines,
+        )
 
     def test_a_consistent_store_reports_its_queue_and_its_export(self):
         self.flow()

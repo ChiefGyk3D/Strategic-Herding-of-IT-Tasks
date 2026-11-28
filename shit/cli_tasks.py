@@ -163,9 +163,13 @@ def _init(ns):
         configured = backend.resolve(proj.repo)
         if ns.backend is not None and ns.backend != configured.name:
             raise ShitError(USAGE)
-        if not proj.exists(store.DB_NAME) and file_backend_state.present(proj):
+        found = file_backend_state.present(proj)
+        if found:
             error = ShitError(PRECONDITION)
-            error.message = "file backend is gone; start a new store"
+            error.message = (
+                f"found file-protocol state ({', '.join(found)}); "
+                "file protocol was removed; start a new store"
+            )
             raise error
         store.init_store(proj, configured.busy_timeout_ms)
     finally:

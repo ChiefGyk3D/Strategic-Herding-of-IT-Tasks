@@ -317,7 +317,10 @@ context_tokens = 32768
 backend = "sqlite"
 """)
         code, _out, err = self.run_cli("init", "--backend", "sqlite")
-        self.assertEqual((code, err), (9, "shit: file backend is gone; start a new store\n"))
+        self.assertEqual(
+            (code, err),
+            (9, "shit: found file-protocol state (events.jsonl); file protocol was removed; start a new store\n"),
+        )
         self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
 
     def test_file_backend_artifact_catalog_is_derived_from_its_definitions(self):
@@ -382,7 +385,9 @@ backend = "sqlite"
                 else:
                     path.write_text("state")
                 code, _out, err = self.run_cli("init", "--backend", "sqlite")
-                self.assertEqual((code, err), (9, "shit: file backend is gone; start a new store\n"))
+                self.assertEqual(code, 9)
+                self.assertIn(f"found file-protocol state ({name})", err)
+                self.assertIn("file protocol was removed; start a new store", err)
                 self.assertFalse((state / "store.sqlite3").exists())
                 if path.is_dir():
                     (path / "state.json").unlink()
@@ -390,6 +395,46 @@ backend = "sqlite"
                         path.rmdir()
                 else:
                     path.unlink()
+
+    def test_every_store_command_class_refuses_mixed_backend_state(self):
+        self.new_task()
+        cases = (
+            ("init",),
+            ("task", "show", "t1"),
+            ("evidence", "show", "missing"),
+            ("report", "show", "missing"),
+            ("review", "show", "missing"),
+            ("decision", "show", "missing"),
+            ("close", "t1", "--actor", "human", "--reason", "x"),
+            ("audit", "export"),
+            ("audit", "verify", "--database"),
+        )
+        for name in file_backend_state.FILE_ONLY_ARTIFACTS:
+            artifact = self.repo / ".shit" / name
+            if name in {queue.DEPS, queue.LEASES}:
+                artifact.mkdir(exist_ok=True)
+                state = artifact / "state.json"
+                state.write_text("{}")
+            else:
+                artifact.write_text("state")
+                state = artifact
+            message = (
+                f"shit: found file-protocol state ({name}); "
+                "file protocol was removed; start a new store\n"
+            )
+            for argv in cases:
+                with self.subTest(name=name, argv=argv):
+                    code, out, err = self.run_cli(*argv)
+                    self.assertEqual((code, out, err), (9, "", message))
+            state.unlink()
+            if artifact.is_dir() and name not in project.SUBDIRS:
+                artifact.rmdir()
+
+    def test_pure_sqlite_project_is_unaffected_by_mixed_state_guard(self):
+        self.new_task()
+        code, out, err = self.run_cli("task", "show", "t1")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(json.loads(out)["id"], "t1")
 
     def test_model_cannot_approve_or_accept(self):
         self.new_task()

@@ -875,8 +875,26 @@ def _remove_created(project, identity):
             continue
 
 
-def connect(project, busy_timeout_ms=None):
-    """Open the project's store. The one and only way to get a connection."""
+def _refuse_file_protocol_state(project):
+    """Refuse removed file-protocol artifacts before an ordinary store open."""
+    from . import (
+        file_backend_state,  # delayed: the artifact catalog names this module's database file
+    )
+
+    found = file_backend_state.present(project)
+    if found:
+        error = ShitError(PRECONDITION)
+        error.message = (
+            f"found file-protocol state ({', '.join(found)}); "
+            "file protocol was removed; start a new store"
+        )
+        raise error
+
+
+def connect(project, busy_timeout_ms=None, *, allow_file_protocol_state=False):
+    """Open the project's store. Ordinary opens refuse removed file-protocol state."""
+    if not allow_file_protocol_state:
+        _refuse_file_protocol_state(project)
     return _open(project, busy_timeout_ms, initialize=False)
 
 

@@ -25,6 +25,7 @@ from . import (
     evidence,
     file_backend_state,
     records,
+    store,
     store_check,
 )
 from ._text import check_text, decode
@@ -275,24 +276,61 @@ def run_check(repo, task=None):
             raise ShitError(CONFINEMENT)
         failures = _Failures()
         store_lines = []  # set below, once the project is read
+        found_file_state = file_backend_state.present(project)
+        if found_file_state:
+            failures.add(
+                PRECONDITION,
+                "store",
+                f"found file-protocol state ({', '.join(found_file_state)}); "
+                "file protocol was removed; start a new store",
+            )
+        conn = None
+        statuses = {}
+        store_findings, store_warnings = [], []
         try:
-            statuses = store_check.task_statuses(project)
+            audit_files = store_check._audit_files(project) if project.exists(store.DB_NAME) else None
+            if project.exists(store.DB_NAME):
+                conn = store.connect(project, allow_file_protocol_state=True)
+            if conn is None:
+                if project.exists(store.DB_NAME):
+                    store_findings.append((FAILED_CLOSED, "cannot be opened or its audit export cannot be read"))
+                else:
+                    statuses = store_check.task_statuses(project)
+            else:
+                with store.read_snapshot(conn):
+                    try:
+                        statuses = store_check.task_statuses(project, conn)
+                    except _cli.EXPECTED as exc:
+                        failures.add(_code(exc), "store", "task records cannot be read")
+                    store_check._check_hook()
+                    ids = sorted(statuses)
+                    if task is not None:
+                        if task not in ids:
+                            raise ShitError(PRECONDITION)
+                        ids = [task]
+                    for task_id in ids:
+                        _check_task(project, task_id, statuses[task_id], failures)
+                    if _root_unchanged(repo, repo_fd, project, failures):
+                        _check_limits(repo_fd, failures)
+                        _root_unchanged(repo, repo_fd, project, failures)
+                    store_findings, store_lines, store_warnings = store_check.diagnose(
+                        project, conn=conn, audit_files=audit_files)
         except _cli.EXPECTED as exc:
-            statuses = {}
-            failures.add(_code(exc), "store", "task records cannot be read")
+            store_findings = [(_code(exc), "cannot be opened or its audit export cannot be read")]
+        finally:
+            if conn is not None:
+                conn.close()
         ids = sorted(statuses)
-        if not statuses and file_backend_state.present(project):
-            failures.add(PRECONDITION, "store", "file backend is gone; start a new store")
         if task is not None:
             if task not in ids:
                 raise ShitError(PRECONDITION)
             ids = [task]
-        for task_id in ids:
-            _check_task(project, task_id, statuses[task_id], failures)
-        if _root_unchanged(repo, repo_fd, project, failures):
-            _check_limits(repo_fd, failures)
-            _root_unchanged(repo, repo_fd, project, failures)
-        store_findings, store_lines, store_warnings = store_check.diagnose(project)  # read-only, from the SQLite store
+        if conn is None:
+            for task_id in ids:
+                _check_task(project, task_id, statuses[task_id], failures)
+            if _root_unchanged(repo, repo_fd, project, failures):
+                _check_limits(repo_fd, failures)
+                _root_unchanged(repo, repo_fd, project, failures)
         for code, text in store_findings:
             failures.add(code, "store", text)
         failures.warnings.extend(store_warnings)
