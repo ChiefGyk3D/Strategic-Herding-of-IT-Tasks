@@ -277,8 +277,15 @@ def _open_private(project):
         return None
     except OSError:
         raise ShitError(CONFINEMENT) from None
-    st = os.fstat(fd)
-    if (not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.geteuid()
+    try:
+        _fault("opened")
+        st = os.fstat(fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    # Atomic replacement unlinks the old name after a reader has opened it, leaving that complete old inode with
+    # zero links. Two or more links still means a hard link and is refused.
+    if (not stat.S_ISREG(st.st_mode) or st.st_nlink not in (0, 1) or st.st_uid != os.geteuid()
             or stat.S_IMODE(st.st_mode) & ~_PRIVATE):
         os.close(fd)
         raise ShitError(CONFINEMENT)
@@ -286,6 +293,17 @@ def _open_private(project):
         os.close(fd)
         raise ShitError(INPUT_LIMIT)
     return fd, st
+
+
+def _footer_from_tail(tail):
+    if not tail.endswith(b"\n"):
+        raise _fail()
+    return _parse_footer(tail[:-1].rsplit(b"\n", 1)[-1])
+
+
+def footer_from_bytes(data):
+    """Parse the footer from export bytes already read and bounded by `read_export`."""
+    return _footer_from_tail(data[-FOOTER_WINDOW:])
 
 
 def read_footer(project):
@@ -300,9 +318,7 @@ def read_footer(project):
             tail = handle.read(FOOTER_WINDOW)
     except OSError:
         raise _fail() from None
-    if not tail.endswith(b"\n"):
-        raise _fail()
-    return _parse_footer(tail[:-1].rsplit(b"\n", 1)[-1])
+    return _footer_from_tail(tail)
 
 
 def read_export(project):

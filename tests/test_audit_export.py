@@ -748,6 +748,19 @@ class FileTests(Flow):
         self.assertEqual(self.export_path.stat().st_nlink, 1)
         self.assertEqual([p.name for p in (self.repo / ".shit").iterdir() if p.name.startswith(".tmp-")], [])
 
+    def test_a_reader_keeps_the_complete_old_export_when_replacement_follows_open(self):
+        expected = self.export_bytes()
+        replaced = []
+
+        def replace_after_open(stage):
+            if stage == "opened" and not replaced:
+                self.proj.write_atomic(audit_export.EXPORT_PATH, expected, limit=audit_export.MAX_EXPORT_BYTES)
+                replaced.append(True)
+
+        with mock.patch.object(audit_export, "_fault", replace_after_open):
+            self.assertEqual(audit_export.read_export(self.proj), expected)
+        self.assertEqual(replaced, [True])
+
     def test_the_mode_holds_under_a_loose_umask(self):
         old = os.umask(0)
         try:
