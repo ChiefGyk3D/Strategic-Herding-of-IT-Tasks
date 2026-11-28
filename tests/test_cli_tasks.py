@@ -396,6 +396,34 @@ backend = "sqlite"
                 else:
                     path.unlink()
 
+    def test_creation_and_record_writer_paths_refuse_every_file_backend_artifact(self):
+        state = self.repo / ".shit"
+        state.mkdir()
+        cases = (
+            ("init",),
+            ("task", "create", "t1", "--title", "T", "--summary", "S", "--owner", "human", "--actor", "human"),
+            ("decision", "add", "t1", "d1", "--actor", "human", "--status", "accepted",
+             "--question", "Q", "--choice", "C", "--rationale", "R"),
+        )
+        for name in file_backend_state.FILE_ONLY_ARTIFACTS:
+            artifact = state / name
+            if name in {queue.DEPS, queue.LEASES}:
+                artifact.mkdir(exist_ok=True)
+                marker = artifact / "state.json"
+                marker.write_text("{}")
+            else:
+                artifact.write_text("state")
+                marker = artifact
+            for argv in cases:
+                with self.subTest(name=name, argv=argv):
+                    code, _out, err = self.run_cli(*argv)
+                    self.assertEqual(code, 9)
+                    self.assertIn(f"found file-protocol state ({name})", err)
+                    self.assertFalse((state / store.DB_NAME).exists())
+            marker.unlink()
+            if artifact.is_dir() and name not in project.SUBDIRS:
+                artifact.rmdir()
+
     def test_every_store_command_class_refuses_mixed_backend_state(self):
         self.new_task()
         cases = (

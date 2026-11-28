@@ -12,7 +12,7 @@ from unittest import mock
 
 from _bootstrap import make_git_dir
 
-from shit import errors, store, store_queue, store_tasks
+from shit import errors, file_backend_state, queue, store, store_queue, store_tasks
 from shit.errors import ShitError
 from shit.project import Project
 
@@ -74,6 +74,24 @@ class AdapterCase(unittest.TestCase):
 
 
 class FlowTests(AdapterCase):
+    def test_queue_store_creation_refuses_every_file_protocol_artifact(self):
+        state = self.repo / ".shit"
+        for name in file_backend_state.FILE_ONLY_ARTIFACTS:
+            with self.subTest(name=name):
+                artifact = state / name
+                if name in {queue.DEPS, queue.LEASES}:
+                    artifact.mkdir(exist_ok=True)
+                    marker = artifact / "state.json"
+                    marker.write_text("{}")
+                else:
+                    artifact.write_text("state")
+                    marker = artifact
+                self.assertEqual(code_of(store_queue.status, self.proj, now=self.tick()), errors.PRECONDITION)
+                self.assertFalse((state / store.DB_NAME).exists())
+                marker.unlink()
+                if artifact.is_dir():
+                    artifact.rmdir()
+
     def test_a_human_worker_path_through_the_names_of_queue_py(self):
         self.task("t1")
         lease = self.claim("t1")

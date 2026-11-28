@@ -13,6 +13,8 @@ state, owner, history and times come from the database, and `get_task` joins the
 """
 
 import hashlib
+import os
+import stat
 
 from . import artifacts, audit_export, commands, records, store
 from . import task as task_mod
@@ -25,6 +27,7 @@ from .errors import (
     USAGE,
     ShitError,
 )
+from .project import bounded_names
 
 _TASK_DIR = "tasks"
 _MAX_BODY = records.MAX_RECORD_BYTES
@@ -103,23 +106,38 @@ def verify_bodies(project, conn, *, include_orphans=False):
     """Read-only: names of the problems between the records index and the body files.
 
     `body_missing` (no file under a recorded name), `body_unreadable` (a symlink, a second link or a special file there)
-    and `body_differs_from_index` (bytes that do not match the digest).
-    A file with no index row is not a problem: it is what a crash between the body and the transaction leaves."""
+    and `body_differs_from_index` (bytes that do not match the digest). With `include_orphans`, the bounded directory
+    scan also reports `body_orphan` and `body_unexpected_name`; it uses lstat before any body is opened."""
     found = set()
-    rows = store.list_records(conn)
+    rows = store.list_records(conn) if conn is not None else []
     if include_orphans:
         indexed = {(row["kind"], row["record_id"]) for row in rows}
         for kind in ("task", *commands.DIRS):
             try:
-                names = project.list_dir(_directory(kind))
+                fd = project._walk((_directory(kind),))
             except ShitError as exc:
                 if exc.code == PRECONDITION:
                     continue
                 raise
-            for name in names:
-                record_id = name[:-5] if name.endswith(".json") else ""
-                if records.SLUG.fullmatch(record_id) and (kind, record_id) not in indexed:
-                    found.add("body_orphan")
+            try:
+                for name in bounded_names(fd):
+                    try:
+                        entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    except OSError:
+                        found.add("body_unreadable")
+                        continue
+                    if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                        found.add("body_unreadable")
+                        continue
+                    if not name.endswith(".json"):
+                        continue  # workflow files (for example reports/<id>.md) can share these directories
+                    record_id = name[:-5]
+                    if not records.SLUG.fullmatch(record_id):
+                        found.add("body_unexpected_name")
+                    elif (kind, record_id) not in indexed:
+                        found.add("body_orphan")
+            finally:
+                os.close(fd)
     for row in rows:
         try:
             data = project.read(_body_path(row["kind"], row["record_id"]), limit=_MAX_BODY)

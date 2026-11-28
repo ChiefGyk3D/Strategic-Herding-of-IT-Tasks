@@ -114,6 +114,33 @@ class Yardstick(unittest.TestCase):
             yardstick.compute(self.p)
         self.assertEqual(ctx.exception.code, 8)
 
+    def test_tampered_task_body_is_refused(self):
+        self.seed()
+        (self.repo / ".shit" / "tasks" / "t1.json").write_bytes(b"{}")
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_tampered_evidence_body_is_refused(self):
+        commands.new_task(self.p, task_id="t1", title="T", summary="S", owner="human", actor="human", now=T[0])
+        evidence = self.repo / "proof.txt"
+        evidence.write_text("proof")
+        commands.add_evidence(self.p, task_id="t1", evidence_id="e1", path="proof.txt", description="d",
+                              actor="human", now=T[1])
+        (self.repo / ".shit" / "evidence" / "e1.json").write_bytes(b"{}")
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_tampered_decision_body_is_refused(self):
+        commands.new_task(self.p, task_id="t1", title="T", summary="S", owner="human", actor="human", now=T[0])
+        commands.add_decision(self.p, task_id="t1", decision_id="d1", status="accepted", question="Q",
+                              choice="C", rationale="R", actor="human", now=T[1])
+        (self.repo / ".shit" / "decisions" / "d1.json").write_bytes(b"{}")
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 8)
+
     def test_cli_prints_json(self):
         self.seed()
         self.p.close()

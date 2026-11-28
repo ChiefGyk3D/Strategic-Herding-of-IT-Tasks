@@ -27,6 +27,7 @@ from . import (
     records,
     store,
     store_check,
+    store_tasks,
 )
 from ._text import check_text, decode
 from .errors import (
@@ -296,6 +297,8 @@ def run_check(repo, task=None):
                     store_findings.append((FAILED_CLOSED, "cannot be opened or its audit export cannot be read"))
                 else:
                     statuses = store_check.task_statuses(project)
+                    for name in store_tasks.verify_bodies(project, None, include_orphans=True):
+                        store_findings.append((FAILED_CLOSED, f"record {name} does not verify"))
             else:
                 with store.read_snapshot(conn):
                     try:

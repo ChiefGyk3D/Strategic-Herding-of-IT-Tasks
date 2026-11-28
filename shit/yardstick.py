@@ -41,7 +41,8 @@ def compute(project, weights=None):
     conn = store_tasks._connect(project, False, None)
     try:
         with store.read_snapshot(conn):
-            if store.verify(conn, deep=True) or store.verify_tasks(conn):
+            if (store.verify(conn, deep=True) or store.verify_tasks(conn)
+                    or store_tasks.verify_bodies(project, conn)):
                 raise ShitError(FAILED_CLOSED)
             outcomes, verdicts = Counter(), Counter()
             events = store.list_events(conn)

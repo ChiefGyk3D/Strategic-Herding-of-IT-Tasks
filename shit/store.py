@@ -834,6 +834,7 @@ def init_store(project, busy_timeout_ms=None, adopt_empty=False):
     _check_floor()
     _timeout(busy_timeout_ms)  # an invalid argument must fail before any file exists
     _check_directory(project)
+    _refuse_file_protocol_state(project)
     old = os.umask(stat.S_IRWXG | stat.S_IRWXO)
     created = None
     try:
