@@ -28,6 +28,11 @@ DEFAULT_LIMIT = 65536
 DIR_MODE = 0o700
 FILE_MODE = 0o600
 LOCK_NAME = "lock"
+# Bounded work (issue 54). A directory listing wider than this is refused with exit code 7 instead of being read in full.
+MAX_DIR_ENTRIES = 10000
+# While the store lock is held, every confined store operation checks this deadline; past it the operation stops
+# with exit code 7. A stopped commit is the same state as a crash, which queue recovery already handles.
+MAX_HOLD_SECONDS = 60.0
 
 _NOFOLLOW = os.O_NOFOLLOW
 _CLOEXEC = os.O_CLOEXEC
@@ -117,12 +122,30 @@ def _os_error(exc):
     return ShitError(INTERNAL)
 
 
+def bounded_names(fd, limit=None):
+    """Return the entry names of the directory descriptor `fd`, read lazily; more than `limit` is exit code 7.
+
+    The listing stops at the first name past the limit, so a hostile wide directory costs `limit + 1` entries."""
+    limit = MAX_DIR_ENTRIES if limit is None else limit
+    names = []
+    try:
+        with os.scandir(fd) as it:
+            for entry in it:
+                if len(names) >= limit:
+                    raise ShitError(INPUT_LIMIT)
+                names.append(entry.name)
+    except OSError:
+        raise ShitError(INTERNAL) from None
+    return names
+
+
 class Project:
     def __init__(self, repo_path, store_fd):
         self.repo = repo_path
         self._root = os.path.realpath(os.path.join(repo_path, STORE_NAME))
         self._fd = store_fd
         self._lock_fd = None
+        self._deadline = None
 
     # -- creation and opening -------------------------------------------------
 
@@ -214,8 +237,14 @@ class Project:
             raise ShitError(CONFINEMENT)
         return parts
 
+    def check_deadline(self):
+        """Exit code 7 when the lock-hold deadline has passed. Free of effect while no lock is held."""
+        if self._deadline is not None and time.monotonic() >= self._deadline:
+            raise ShitError(INPUT_LIMIT)
+
     def _walk(self, dir_parts):
         """Open the directory named by `dir_parts` below the store, refusing symlinks. Caller closes."""
+        self.check_deadline()
         fd = os.dup(self._fd)
         try:
             for part in dir_parts:
@@ -376,7 +405,7 @@ class Project:
             raise ShitError(CONFINEMENT)
         fd = self._walk(parts)
         try:
-            return sorted(os.listdir(fd))
+            return sorted(bounded_names(fd))
         except OSError:
             raise ShitError(INTERNAL) from None
         finally:
@@ -440,7 +469,7 @@ class Project:
                 return []
             raise
         try:
-            names = os.listdir(fd)
+            names = bounded_names(fd)
             seen, temps = {}, []
             for entry in names:
                 try:
@@ -507,7 +536,7 @@ class Project:
         return self._lock_fd is not None
 
     @contextlib.contextmanager
-    def locked(self, timeout=5.0, create=False):
+    def locked(self, timeout=5.0, create=False, hold=None):
         """Hold the store's exclusive advisory lock. Contention past `timeout` is exit code 1.
 
         `create` lets a write-capable caller create a missing `lock` file (a content-free file, a state-independent
@@ -516,6 +545,9 @@ class Project:
         The lock is taken on a fresh descriptor of the store directory itself: a descriptor, not a pathname, so
         unlinking or replacing the `lock` file cannot admit a second holder. The `lock` file is still opened and
         checked (a special file there is refused) but exclusion does not depend on it.
+
+        `hold` (default `MAX_HOLD_SECONDS`) bounds how long the lock may be used: past it, every confined store
+        operation raises exit code 7 (`check_deadline`), so a slow or hostile tree cannot pin the lock forever.
         """
         if self._lock_fd is not None:
             raise ShitError(INTERNAL)
@@ -549,8 +581,10 @@ class Project:
             self._close(fd)
             raise
         self._lock_fd = fd
+        self._deadline = time.monotonic() + (MAX_HOLD_SECONDS if hold is None else hold)
         try:
             yield
         finally:
+            self._deadline = None
             self._lock_fd = None
             self._close(fd)

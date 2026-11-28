@@ -237,6 +237,46 @@ class Locking(Base):
             pass
 
 
+class BoundedWork(Base):
+    def test_listing_wider_than_the_limit_is_input_limit(self):
+        with mock.patch.object(project_mod, "MAX_DIR_ENTRIES", 3):
+            for i in range(4):
+                (self.shit / "tasks" / f"t{i}.json").write_text("{}")
+            self.assertEqual(self.code(self.proj.list_dir, "tasks"), 7)
+
+    def test_listing_at_the_limit_is_returned(self):
+        with mock.patch.object(project_mod, "MAX_DIR_ENTRIES", 3):
+            for i in range(3):
+                (self.shit / "tasks" / f"t{i}.json").write_text("{}")
+            self.assertEqual(self.proj.list_dir("tasks"), ["t0.json", "t1.json", "t2.json"])
+
+    def test_publication_pairs_listing_is_bounded(self):
+        with mock.patch.object(project_mod, "MAX_DIR_ENTRIES", 3):
+            for i in range(4):
+                (self.shit / "tasks" / f"t{i}.json").write_text("{}")
+            self.assertEqual(self.code(self.proj.publication_pairs, "tasks"), 7)
+
+    def test_operation_past_its_hold_deadline_is_input_limit(self):
+        with self.proj.locked(hold=0):
+            self.assertEqual(self.code(self.proj.list_dir, "tasks"), 7)
+            self.assertEqual(self.code(self.proj.read, "tasks/none.json"), 7)
+
+    def test_operation_within_its_hold_deadline_works(self):
+        with self.proj.locked(hold=60):
+            self.assertEqual(self.proj.list_dir("tasks"), [])
+
+    def test_deadline_ends_with_the_lock(self):
+        with self.proj.locked(hold=0):
+            pass
+        self.assertEqual(self.proj.list_dir("tasks"), [])
+        with self.proj.locked():
+            self.assertEqual(self.proj.list_dir("tasks"), [])
+
+    def test_default_hold_is_bounded(self):
+        self.assertGreater(project_mod.MAX_HOLD_SECONDS, 0)
+        self.assertLessEqual(project_mod.MAX_HOLD_SECONDS, 600)
+
+
 if __name__ == "__main__":
     unittest.main()
 

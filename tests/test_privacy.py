@@ -334,6 +334,50 @@ class HostileTrees(Scan):
             self.write("a/b/c/d/e/f.txt", "x\n")
             self.assertEqual(self.scan()[0], 7)
 
+    def test_directory_width_is_bounded(self):
+        with mock.patch.object(privacy, "MAX_DIR_ENTRIES", 3):
+            for i in range(5):
+                self.write(f"wide/f{i}.txt", "x\n")
+            self.assertEqual(self.scan()[0], 7)
+
+    def test_directory_at_the_width_limit_is_scanned(self):
+        with mock.patch.object(privacy, "MAX_DIR_ENTRIES", 3):
+            for i in range(3):
+                self.write(f"wide/f{i}.txt", "x\n")
+            self.assertEqual(self.scan()[0], 0)
+
+    def test_wide_directory_is_listed_lazily(self):
+        # The listing stops past the limit instead of materializing every name.
+        with mock.patch.object(privacy, "MAX_DIR_ENTRIES", 3), mock.patch.object(os, "listdir", side_effect=AssertionError):
+            for i in range(5):
+                self.write(f"wide/f{i}.txt", "x\n")
+            self.assertEqual(self.scan()[0], 7)
+
+    def test_cumulative_bytes_are_bounded(self):
+        with mock.patch.object(privacy, "MAX_TOTAL_BYTES", 10):
+            self.write("a.txt", "123456\n")
+            self.write("b.txt", "123456\n")
+            self.assertEqual(self.scan()[0], 7)
+
+    def test_cumulative_bytes_at_the_limit_are_scanned(self):
+        with mock.patch.object(privacy, "MAX_TOTAL_BYTES", 14):
+            self.write("a.txt", "123456\n")
+            self.write("b.txt", "123456\n")
+            self.assertEqual(self.scan()[0], 0)
+
+    def test_budget_overrun_still_reports_hits_already_found(self):
+        with mock.patch.object(privacy, "MAX_TOTAL_BYTES", 200):
+            self.write("a.txt", FAKE_GITHUB + "\n")
+            self.write("z.txt", "x" * 300 + "\n")
+            code, out, _ = self.scan()
+        self.assertEqual(code, 7)
+        self.assertIn("a.txt:1", out)
+
+    def test_operation_deadline_is_input_limit(self):
+        self.write("a.txt", "x\n")
+        with mock.patch.object(privacy, "MAX_SECONDS", 0):
+            self.assertEqual(self.scan()[0], 7)
+
     def test_unknown_option_is_usage_and_not_echoed(self):
         code, out, err = run_main(privacy.main, ["--repo", str(self.repo), "--" + SENTINEL])
         self.assertEqual(code, 2)
