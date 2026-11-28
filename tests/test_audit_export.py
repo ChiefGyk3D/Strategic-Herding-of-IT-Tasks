@@ -341,6 +341,19 @@ class VerifierTests(Flow):
             with self.subTest(first_lifecycle_state=state):
                 self.assert_refused(rechain(self.good, advance_then_enqueue(state)))
 
+    def test_a_queue_caused_lifecycle_transition_may_share_the_first_queue_timestamp(self):
+        self.task("same-second", enqueue=False)
+        stamp = self.tick()
+        store_queue.enqueue(self.proj, "same-second", "human", now=stamp)
+        lease = store_queue.claim(
+            self.proj,
+            {"task_id": "same-second", "step": "draft", "worker": "w1", "worker_kind": "human"},
+            now=stamp,
+        )
+        store_queue.start(self.proj, self.present(lease), now=stamp)
+
+        audit_export.verify_bytes(self.export_bytes())
+
     def test_graph_proofs_cannot_name_a_task_without_a_creation_event(self):
         def add_unknown_shard(events, entries):
             proof = next(entry for entry in entries if entry["kind"] == "graph_changed")

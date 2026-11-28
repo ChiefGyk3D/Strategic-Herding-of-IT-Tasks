@@ -163,19 +163,40 @@ def _verify_lifecycle_effects(events, entries):
 
 
 def _verify_queue_starts(events, entries):
-    """Each task's first stateful queue entry must begin while its lifecycle is in an initial state."""
-    first = {}
+    """Each task's first stateful queue entry must follow an initial lifecycle state in event-chain order."""
+    queued = set()
+    effects = collections.Counter()
     for entry in entries:
         if entry["kind"] != "graph_changed":
-            first.setdefault(entry["task_id"], entry["timestamp"])
+            task_id = entry["task_id"]
+            queued.add(task_id)
+            allowed = queue_records.EFFECTS.get(entry["kind"], {"life": ()})["life"]
+            if entry["kind"] == "expired" and entry["state_after"] != "failed":
+                allowed = ()
+            effects[task_id] += bool(allowed)
+
+    transitions = collections.defaultdict(list)
+    for index, event in enumerate(events):
+        if event["event"] == "state_transition" and event["task_id"] in queued:
+            transition = (event["from_state"], event["to_state"], event["actor"])
+            if transition != ("review", "approved", "human"):
+                transitions[event["task_id"]].append(index)
+
+    boundaries = {}
+    for task_id in queued:
+        count = effects[task_id]
+        if count > len(transitions[task_id]):
+            raise _fail()
+        boundaries[task_id] = transitions[task_id][-count] if count else len(events)
+
     states = {}
-    for event in events:
+    for index, event in enumerate(events):
         task_id = event["task_id"]
         if event["event"] == "task_created":
             states[task_id] = "open"
-        elif event["event"] == "state_transition" and event["timestamp"] <= first.get(task_id, ""):
+        elif event["event"] == "state_transition" and index < boundaries.get(task_id, -1):
             states[task_id] = event["to_state"]
-    if any(states.get(task_id) not in lifecycle.STARTING_STATES for task_id in first):
+    if any(states.get(task_id) not in lifecycle.STARTING_STATES for task_id in queued):
         raise _fail()
 
 
