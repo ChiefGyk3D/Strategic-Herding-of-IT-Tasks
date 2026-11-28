@@ -764,7 +764,11 @@ class NetworkDenial(unittest.TestCase):
             "import sys\nm = sys.modules", "from sys import modules", "import sys as s\ns.modules['os']",
             "().__class__.__bases__[0].__subclasses__()", "x.__class__.__mro__", "f.__code__", "f.__closure__",
             "import types", "import inspect", "import gc\ngc.get_objects()", "from types import FunctionType",
-            "import marshal", "x = o.__reduce__()", "obj.__import__('os')", "mod.eval('1')", "mod.exec('1')",
+            "import marshal", "x = o.__reduce__()",
+            "import pickle\npickle.loads(b\"cos\\nsystem\\n(S'id'\\ntR.\")", "import _pickle", "from pickle import loads",
+            "import shelve", "import dill", "import cloudpickle", "import copyreg", "import codeop", "import cffi",
+            "import zipimport", "import pkgutil\npkgutil.get_data('a', 'b')", "import yaml\nyaml.load('x')",
+            "from copyreg import reduce", "import importlib.util", "from runpy import run_path", "import pickle as p", "obj.__import__('os')", "mod.eval('1')", "mod.exec('1')",
             "import json\ngetattr(json, 'loads')", "__builtins__",
             "import functools\ngetattr(functools, 'x')", "from operator import attrgetter",
             "import operator\noperator.attrgetter('system')(__import__('os'))", "import os\nlocals()['os']",
@@ -778,7 +782,7 @@ class NetworkDenial(unittest.TestCase):
                 "import os\nos.path.abspath('a')", "from os import fspath, sep", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
                 "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nold = os.umask(0o77)\nos.readlink('/proc/self/fd/3')", "import re\nre.compile('x')", "import hashlib",
                 "import sys\nsys.stdout.write('x')", "x = type(1) is int\nsuper().__init__()",
-                "import json\nx = json.dumps({})")
+                "import json\nx = json.dumps({})", "import sqlite3", "import hashlib\nimport errno\nimport stat")
         for src in good:
             with self.subTest(src=src):
                 self.assertEqual(process_launch_uses(src), set(), src)
@@ -844,7 +848,11 @@ def imported_roots(source):
 
 
 LAUNCH_MODULES = {"subprocess", "_posixsubprocess", "multiprocessing", "pty", "importlib", "runpy", "ctypes", "_ctypes",
-                  "pdb", "code", "idlelib", "builtins", "__builtin__", "types", "inspect", "gc", "marshal", "imp"}
+                  "pdb", "code", "idlelib", "builtins", "__builtin__", "types", "inspect", "gc", "marshal", "imp",
+                  # deserializers that can import and call anything while loading, and other code loaders
+                  "pickle", "cPickle", "_pickle", "pickletools", "shelve", "dill", "cloudpickle", "copyreg", "codeop",
+                  "cffi", "zipimport", "pkgutil", "yaml", "compileall", "py_compile", "zipapp", "pydoc", "timeit",
+                  "doctest", "trace", "cProfile", "profile", "bdb"}
 OS_MODULES = {"os", "posix", "nt"}
 LAUNCH_OS_ATTRS = ("system", "popen", "fork", "forkpty", "startfile", "posix_spawn", "posix_spawnp", "plock")
 LAUNCH_OS_PREFIXES = ("exec", "spawn")
@@ -917,7 +925,7 @@ def process_launch_uses(source):
 OS_ALLOWED_ATTRS = frozenset({
     "O_APPEND", "O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK", "O_RDONLY", "O_RDWR",
     "O_WRONLY", "close", "dup", "environ", "fchmod", "fdopen", "fspath", "fstat", "fsync", "getcwd", "geteuid",
-    "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "readlink", "rename", "sep", "stat",
+    "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "readlink", "rename", "scandir", "sep", "stat",
     "umask", "unlink", "write",
 })
 

@@ -9,11 +9,12 @@ Exit codes are the shared table in docs/exit-codes.md.
 
 import copy
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 
-import _bootstrap  # noqa: F401  (puts the repository root on sys.path)
+import _bootstrap  # puts the repository root on sys.path, and names it as ROOT
 from _helpers import run_main
 
 from shit import config, records, threads
@@ -271,6 +272,23 @@ class PageTests(unittest.TestCase):
                 threads.check_unique(pair)
             self.assertEqual(ctx.exception.code, 8)
 
+    OUTPUT_SENTENCE = ("Every line that carries text from the API (a path, an author or a comment body) starts with "
+                       "`file: ` or with two spaces; the summary line and the empty-list line hold only the "
+                       "repository, the pull request number and a count.")
+
+    def test_the_documented_output_rule_matches_the_real_output(self):
+        docs = (_bootstrap.ROOT / "docs" / "threads.md").read_text()
+        self.assertIn(self.OUTPUT_SENTENCE, docs)
+        hostile = ["::add-mask::x", "\x1b[31m", "a" + chr(0x202E), "line\nbreak", "::error::z"]
+        nodes = [node(f"T{i}", i + 1, path=text, body=text) for i, text in enumerate(hostile)]
+        found = threads.parse_page(page(nodes))[0]
+        fixed_line = re.compile(rf"(\d+ unresolved thread\(s\)|no unresolved threads) on {re.escape(REPO)}#9")
+        for lines in (threads.format_list(found, REPO, 9), threads.format_list([], REPO, 9)):
+            for line in lines:
+                self.assertTrue(line.startswith(("file: ", "  ")) or fixed_line.fullmatch(line), line)
+                self.assertFalse(line.startswith("::"), line)
+        self.assertIsNone(fixed_line.fullmatch("::add-mask::x"))  # the check bites on an unprefixed API line
+
     def test_empty_list_line(self):
         self.assertEqual(threads.format_list([], REPO, 9), [f"no unresolved threads on {REPO}#9"])
 
@@ -335,6 +353,34 @@ class PlanValidationTests(Case):
         for label, fn in tampers.items():
             with self.subTest(label):
                 self.refused(mut(fn))
+
+    def test_a_trusted_host_stands_for_a_null_host_and_nothing_else(self):
+        null_plan = self.good()
+        self.assertIsNone(null_plan["host"])
+        trusted = "git.example.org"
+        out = threads.parse_plan(json.dumps(null_plan).encode(), trusted_host=trusted)
+        self.assertEqual(out, {**null_plan, "host": trusted})  # equals the plan built for the trusted host
+        explicit = {**null_plan, "host": trusted}
+        self.assertEqual(threads.parse_plan(json.dumps(explicit).encode(), trusted_host=trusted), explicit)
+        upper = {**null_plan, "host": "Git.Example.org"}
+        self.assertEqual(threads.parse_plan(json.dumps(upper).encode(), trusted_host=trusted)["host"], trusted)
+        for other in ("other.example.org", "github.com", "git.example.org.evil.net"):
+            with self.subTest(other=other), self.assertRaises(ShitError) as ctx:
+                threads.parse_plan(json.dumps({**null_plan, "host": other}).encode(), trusted_host=trusted)
+            self.assertEqual(ctx.exception.code, 3)
+        # without a trusted host nothing changes: a null stays null and a host must still be a valid host name
+        self.assertIsNone(threads.parse_plan(json.dumps(null_plan).encode())["host"])
+
+    def test_tampering_is_still_refused_when_a_trusted_host_is_given(self):
+        plan = copy.deepcopy(self.good())
+        for fn in (lambda p: p["requests"][1].update(endpoint="repos/x/y/pulls/1/comments/101/replies"),
+                   lambda p: p.update(extra=1), lambda p: p["requests"][0].update(query="q"),
+                   lambda p: p["requests"].pop(0), lambda p: p.update(repo="a/b;c")):
+            bad = copy.deepcopy(plan)
+            fn(bad)
+            with self.assertRaises(ShitError) as ctx:
+                threads.parse_plan(json.dumps(bad).encode(), trusted_host="git.example.org")
+            self.assertEqual(ctx.exception.code, 3)
 
     def test_hostile_json_and_size(self):
         for raw in (b"[]", b"not json", b'{"a":1,"a":2}', b"\xef\xbb\xbf{}", b"[" * 30 + b"]" * 30):

@@ -235,8 +235,13 @@ def render_plan(plan):
     return json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def parse_plan(data):
-    """Validate a plan read from a file. It must equal, key for key, the plan this module would have built."""
+def parse_plan(data, trusted_host=None):
+    """Validate a plan read from a file. It must equal, key for key, the plan this module would have built.
+
+    With `trusted_host` (the launcher's own host, lower case) the plan is compared with the plan built for that
+    host: a null host in the file stands for the trusted host, an explicit host must equal it (case aside), and any
+    other host is refused. The returned plan always carries the trusted host.
+    """
     plan = records.parse_value(data, PLAN_LIMIT, PLAN_DEPTH)
     try:
         kind, host, repo, number = plan["kind"], plan["host"], plan["repo"], plan["pr"]
@@ -246,6 +251,10 @@ def parse_plan(data):
             raise _rejected()
         if host is not None:
             config.check_host(host)
+        if trusted_host is not None:
+            if host is not None and host.lower() != trusted_host.lower():
+                raise _rejected()
+            host = trusted_host
         rows = []
         resolves = set()
         for request in plan["requests"][1:]:
@@ -267,9 +276,9 @@ def parse_plan(data):
         rebuilt = build_plan(kind, host, repo, number, items)
     except (KeyError, TypeError, AttributeError, IndexError):
         raise _rejected() from None
-    if rebuilt != plan:
+    if rebuilt != {**plan, "host": host}:
         raise _rejected()
-    return plan
+    return rebuilt
 
 
 def request_args(plan, request, thread_id=None, cursor=None):

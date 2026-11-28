@@ -458,12 +458,10 @@ def make_handler(popen, which, environ, cwd, bases):
         if risky:
             return REJECTED, [f"refused: {risky[0]} is set in the environment (opt in with --allow-env {risky[0]})"]
         host = trusted_host(configured_host(args.config, base))
-        plan = threads.parse_plan(read_bounded(base / args.plan, threads.PLAN_LIMIT, base))
         # The host, and so where the token goes, comes only from this machine's configuration, never from the
-        # plan file. A plan may leave it out (null) or name the same host; any other host is refused, no call made.
-        if plan["host"] is not None and plan["host"].lower() != host:
-            raise ShitError(REJECTED)
-        plan = {**plan, "host": host}
+        # plan file. The file is compared with the plan built for that trusted host: a null host stands for it, an
+        # explicit one must equal it, and any other host is refused before any call.
+        plan = threads.parse_plan(read_bounded(base / args.plan, threads.PLAN_LIMIT, base), trusted_host=host)
         fds = []
         try:
             config_dir = None
