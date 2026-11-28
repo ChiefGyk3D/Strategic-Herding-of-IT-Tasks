@@ -24,6 +24,7 @@ from .errors import (
     CONFINEMENT,
     FAILED_CLOSED,
     ILLEGAL_TRANSITION,
+    INPUT_LIMIT,
     INTERNAL,
     LEASE_REFUSED,
     PRECONDITION,
@@ -525,7 +526,7 @@ def schema_statements():
         "CREATE TABLE edges (task_id TEXT NOT NULL REFERENCES tasks (id), "
         "needs_id TEXT NOT NULL REFERENCES tasks (id), "
         "type TEXT NOT NULL CHECK (type IN (" + dep_types + ")), "
-        "PRIMARY KEY (task_id, needs_id), CHECK (task_id <> needs_id)) STRICT, WITHOUT ROWID",
+        "PRIMARY KEY (task_id, needs_id, type), CHECK (task_id <> needs_id)) STRICT, WITHOUT ROWID",
 
         "CREATE TABLE apply_slots (target TEXT NOT NULL PRIMARY KEY CHECK (" + _text_check("target", 500) + "), "
         "task_id TEXT NOT NULL REFERENCES tasks (id), "
@@ -583,7 +584,7 @@ def fingerprint(conn):
 # The reviewed fingerprint of schema version 1, written out so that the value checked at open does not depend on the
 # builders above. A change to the DDL changes the generated value; `tests/test_store.py` fails until this literal is
 # updated on purpose, in the same change and with the schema review.
-PINNED_FINGERPRINT = "921add402caa4084ef47fccaa6bf2d33a6ae8fb127512e4922b5590a93e32284"
+PINNED_FINGERPRINT = "63962044ba8ad8c8fa97a8e7119b0382aa1dd11a4572b5c6d81191ee3dbbb7ca"
 
 
 @functools.lru_cache(maxsize=1)
@@ -1025,3 +1026,140 @@ def _verify_unmapped(conn, deep):
     if deep and conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
         found.add("integrity_check_failed")
     return sorted(found)
+
+
+# == dependency graph (issue 62, epic 57; docs/store.md, "Dependency graph") ===============================
+#
+# The same observable behavior as `shit/dependencies.py` (shape, missing node, duplicate, caps, cycle, in that
+# order) and the removal guard of `shit/queue.remove_edge`, as write helpers. Each add or remove is ONE
+# `write_transaction`. Edge `(task_id, needs_id, type)` means `task_id` needs `needs_id`.
+
+_GRAPH_SHAPE = ("task_id", "needs_id", "type")
+
+
+def _graph_slug(value):
+    if not isinstance(value, str) or not records.SLUG.fullmatch(value):
+        raise ShitError(REJECTED)
+    return value
+
+
+def _graph_edge(edge):
+    """The shape check of `dependencies._endpoints`: two slugs and a known type, else exit code 3."""
+    if not isinstance(edge, (tuple, list)) or len(edge) != len(_GRAPH_SHAPE):
+        raise ShitError(REJECTED)
+    task_id, needs_id, kind = edge
+    _graph_slug(task_id)
+    _graph_slug(needs_id)
+    if not isinstance(kind, str) or kind not in dependencies.TYPES:
+        raise ShitError(REJECTED)
+    return task_id, needs_id, kind
+
+
+def _graph_task_exists(conn, task_id):
+    return conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is not None
+
+
+def _graph_has_path(conn, start, goal):
+    """True when `goal` is `start` or one of the tasks `start` needs, directly or through other tasks."""
+    return conn.execute(
+        "SELECT 1 FROM (WITH RECURSIVE reach(id) AS (SELECT ? UNION SELECT e.needs_id FROM edges e "
+        "JOIN reach r ON e.task_id = r.id) SELECT id FROM reach) WHERE id = ? LIMIT 1", (start, goal)).fetchone() is not None
+
+
+def _graph_check_caps(conn, wanted):
+    """Exit code 7 past the per-task or total cap, counting `wanted` (every new edge, self edges included)."""
+    per_source = {}
+    for task_id, _, _ in wanted:
+        per_source[task_id] = per_source.get(task_id, 0) + 1
+    new_sources = 0
+    for task_id, count in per_source.items():
+        stored = conn.execute("SELECT count(*) FROM edges WHERE task_id = ?", (task_id,)).fetchone()[0]
+        if stored + count > dependencies.MAX_NEEDS_PER_TASK:
+            raise ShitError(INPUT_LIMIT)
+        if stored == 0:
+            new_sources += 1
+    if new_sources and conn.execute("SELECT count(DISTINCT task_id) FROM edges").fetchone()[0] + new_sources \
+            > dependencies.MAX_TASKS:
+        raise ShitError(INPUT_LIMIT)
+
+
+def add_edges(conn, additions):
+    """Add every `(task_id, needs_id, type)` in one transaction, or none.
+
+    Exit codes as `dependencies.add_edges`: 3 for a bad shape, a duplicate, a self edge or a cycle, 9 for an unknown
+    task, 7 past the per-task cap (200) or the total cap (2,000 dependent tasks). The order of the checks is the
+    same: each edge's shape and then its tasks, in the order given; then duplicates; then the caps; then cycles.
+    """
+    if not isinstance(additions, (list, tuple)):
+        raise ShitError(REJECTED)
+    with write_transaction(conn):
+        wanted = []
+        for addition in additions:
+            edge = _graph_edge(addition)
+            if not (_graph_task_exists(conn, edge[0]) and _graph_task_exists(conn, edge[1])):
+                raise ShitError(PRECONDITION)
+            wanted.append(edge)
+        seen = set()
+        for edge in wanted:
+            if edge in seen or conn.execute(
+                    "SELECT 1 FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge).fetchone():
+                raise ShitError(REJECTED)
+            seen.add(edge)
+        _graph_check_caps(conn, wanted)
+        if any(task_id == needs_id for task_id, needs_id, _ in wanted):
+            raise ShitError(REJECTED)
+        for edge in wanted:
+            conn.execute("INSERT INTO edges (task_id, needs_id, type) VALUES (?, ?, ?)", edge)
+        # With every edge in, a cycle exists exactly when some new edge's prerequisite reaches its dependent.
+        if any(_graph_has_path(conn, needs_id, task_id) for task_id, needs_id, _ in wanted):
+            raise ShitError(REJECTED)
+
+
+def add_edge(conn, task_id, needs_id, kind):
+    """One edge, one transaction (see `add_edges`)."""
+    add_edges(conn, [(task_id, needs_id, kind)])
+
+
+def remove_edge(conn, task_id, needs_id, kind):
+    """Remove one edge in one transaction. Exit code 3 for a bad shape, 9 when the edge is not there, and 4 (the
+    removal guard) while the dependent task holds a live lease, as `queue.remove_edge`."""
+    edge = _graph_edge((task_id, needs_id, kind))
+    with write_transaction(conn):
+        if conn.execute("SELECT 1 FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge).fetchone() is None:
+            raise ShitError(PRECONDITION)
+        if conn.execute("SELECT 1 FROM leases WHERE task_id = ?", (task_id,)).fetchone() is not None:
+            raise ShitError(ILLEGAL_TRANSITION)
+        conn.execute("DELETE FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge)
+
+
+def list_edges(conn):
+    """Every edge as `{task_id, needs_id, type}`, sorted by those three."""
+    try:
+        rows = conn.execute("SELECT task_id, needs_id, type FROM edges ORDER BY task_id, needs_id, type").fetchall()
+    except sqlite3.Error as exc:
+        raise map_error(exc) from None
+    return [{"task_id": a, "needs_id": b, "type": c} for a, b, c in rows]
+
+
+def needs_of(conn, task_id):
+    """What `task_id` needs directly, as `{needs_id, type}` sorted by those two (`dependencies.group_by_task`)."""
+    _graph_slug(task_id)
+    try:
+        rows = conn.execute("SELECT needs_id, type FROM edges WHERE task_id = ? ORDER BY needs_id, type",
+                            (task_id,)).fetchall()
+    except sqlite3.Error as exc:
+        raise map_error(exc) from None
+    return [{"needs_id": a, "type": b} for a, b in rows]
+
+
+def prerequisite_closure(conn, task_id):
+    """Ids of every task `task_id` needs, directly or through others (sorted; never `task_id` itself)."""
+    _graph_slug(task_id)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM (WITH RECURSIVE reach(id) AS (SELECT e.needs_id FROM edges e WHERE e.task_id = ? "
+            "UNION SELECT e.needs_id FROM edges e JOIN reach r ON e.task_id = r.id) SELECT id FROM reach) "
+            "ORDER BY id", (task_id,)).fetchall()
+    except sqlite3.Error as exc:
+        raise map_error(exc) from None
+    return [row[0] for row in rows]

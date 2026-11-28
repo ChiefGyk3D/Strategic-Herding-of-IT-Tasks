@@ -60,7 +60,7 @@ The wait for another writer is `[store] busy_timeout_ms` in `config.toml` (0 to 
 | `records` | Index of record files by kind, id, task, SHA-256 and size. Bodies stay files. |
 | `queue_entries` | The queue log with its hash chain columns. Append-only. |
 | `leases` | At most one live lease per task. |
-| `edges` | Dependency edges, no self edge. |
+| `edges` | Dependency edges, no self edge, one row per dependent, prerequisite and type. |
 | `apply_slots` | One slot per apply target. |
 
 The rules are generated from `shit/lifecycle.py`, `shit/queue_records.py`, `shit/dependencies.py` and `shit/records.py`, so the database cannot drift from the code:
@@ -121,6 +121,16 @@ Messages are the fixed text of `docs/exit-codes.md`. They never carry a path or 
 - A process of the same user can open the file with any SQLite client and bypass every control above, including the triggers (it can also drop and recreate them; the next open of the store then refuses on the fingerprint).
 - `PRAGMA journal_mode=WAL` writes the database header outside an explicit transaction, because SQLite does not allow the switch inside one. It runs only after the header checks pass.
 - Rows are checked for what the database can express. Control and bidirectional characters in messages are still the job of the record validators (`shit/_text.py`) before a write.
+
+## Dependency graph (issue 62)
+
+`store.add_edge`, `store.add_edges`, `store.remove_edge` and the reads `store.list_edges`, `store.needs_of` and `store.prerequisite_closure` are the database version of `shit/dependencies.py` (which stays until the file queue is removed). An edge `(task_id, needs_id, type)` means `task_id` needs `needs_id`. Each add (one edge or a batch) and each removal is one `write_transaction`, so a refusal leaves nothing behind. The reads are single `SELECT` statements.
+
+The order of the checks, and the exit codes, are those of `dependencies.add_edges`: each edge's shape (two slugs and one of the four types, else 3) and then its tasks (an unknown task is 9), in the order given; then duplicates (3); then the caps (7): 200 edges per dependent task and 2,000 dependent tasks with edges in all (`dependencies.MAX_NEEDS_PER_TASK`, `MAX_TASKS`), counting a self edge as the file version does; then a self edge or a cycle (3). The cycle check runs inside the transaction: with the new edges inserted, a recursive query (`UNION`, so a diamond or a long chain terminates and is walked once) asks whether any new edge's prerequisite reaches its dependent; if so the transaction is rolled back. `remove_edge` refuses a bad shape (3) and an edge that is not there, matched on all three columns (9), and then, as `queue.remove_edge` does, a dependent that holds a live lease row (4). No SQL text is built from an argument: every statement is a literal with `?` parameters, and each function that runs one is on the exact allowlist of `tests/test_store_lint.py`.
+
+`edges` now has the primary key `(task_id, needs_id, type)`, as the file graph allows the same pair with more than one type (a `draft` and an `apply` edge between the same two tasks). The pinned schema fingerprint changed with it.
+
+What the database does not do: the caps are enforced by the helpers only (a hand written `INSERT` can exceed them; the schema keeps the foreign keys, the type list and the no-self-edge check), and a cycle can likewise be written by hand. `store.verify` does not look for cycles. The queue population cap (queued tasks and shard owners together stay within 2,000, `queue._check_population`) belongs to the enqueue operation, not to the graph helpers. The `graph_changed` queue entry that the file queue writes for each change is the job of the queue operations (C3, C4): this module changes the table only. `tests/test_store_graph.py` replays random operation sequences, including hostile and oversized ids, through both implementations and requires the same exit code, the same edges and the same closure after every operation.
 
 ## Not built yet
 
