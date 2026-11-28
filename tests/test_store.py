@@ -1215,6 +1215,30 @@ class VerifyTests(RowFixture):
     def test_deep_check_runs_integrity_check(self):
         self.assertEqual(store.verify(self.conn, deep=True), [])
 
+    def test_sqlite_failures_while_verifying_become_fixed_errors(self):
+        def corrupt():
+            exc = sqlite3.DatabaseError("database disk image is malformed: /secret/path SELECT secret")
+            exc.sqlite_errorcode = 11
+            return exc
+
+        for label, make, code in (("corrupt", corrupt, errors.FAILED_CLOSED), ("io error", io_error, errors.FAILED_CLOSED),
+                                  ("busy", busy_error, errors.BUSY)):
+            for needle in ("FROM queue_entries", "FROM leases", "FROM apply_slots", "PRAGMA foreign_key_check"):
+                with self.subTest(label=label, failing=needle):
+                    proxy = FailingReads(self.conn, needle, make())
+                    with self.assertRaises(ShitError) as caught:
+                        store.verify(proxy)
+                    self.assertEqual(caught.exception.code, code)
+                    self.assertEqual(str(caught.exception), errors.MESSAGES[code])
+                    self.assertIsNone(caught.exception.__cause__)
+
+    def test_a_closed_connection_is_a_fixed_error_not_a_raw_one(self):
+        self.conn.close()
+        with self.assertRaises(ShitError) as caught:
+            store.verify(self.conn)
+        self.assertEqual(caught.exception.code, errors.INTERNAL)
+        self.assertEqual(str(caught.exception), errors.MESSAGES[errors.INTERNAL])
+
 
 class WriteOrderTests(RowFixture):
     """Review round 3: the statement-level rules that remain for lease rows, slots and renewals."""
@@ -1314,6 +1338,32 @@ class WriteTransactionEdgeTests(Base):
         self.assertIsNone(caught.exception.__cause__)
         self.assertTrue(caught.exception.__suppress_context__)
 
+    def test_an_interrupt_while_closing_still_ends_in_the_fixed_error(self):
+        class Dying:
+            in_transaction = False
+
+            def execute(self, sql, *args):
+                if sql == "COMMIT":
+                    raise busy_error()
+
+            def close(self):
+                raise KeyboardInterrupt("interrupt during close")
+
+        with self.assertRaises(store.AmbiguousCommit), store.write_transaction(Dying()):
+            pass
+
+        class DyingAfterFailedRollback(Dying):
+            in_transaction = True
+
+            def execute(self, sql, *args):
+                if sql == "ROLLBACK":
+                    raise io_error()
+
+        with self.assertRaises(ShitError) as caught, store.write_transaction(DyingAfterFailedRollback()):
+            raise busy_error()
+        self.assertEqual(caught.exception.code, errors.FAILED_CLOSED)
+        self.assertNotIsInstance(caught.exception, KeyboardInterrupt)
+
     def test_an_interrupt_during_rollback_abandons_the_connection(self):
         real = store.connect(self.proj, busy_timeout_ms=200)
 
@@ -1328,6 +1378,45 @@ class WriteTransactionEdgeTests(Base):
             raise busy_error()
         self.assertEqual(caught.exception.code, errors.FAILED_CLOSED)
         self.assertTrue(proxy.closed)
+
+
+class JsonProbeTests(Base):
+    """The triggers need SQLite's JSON functions; a runtime without them is refused as unsupported (exit 8)."""
+
+    def broken_connect(self, name):
+        real_connect = sqlite3.connect
+
+        def connect(*args, **kwargs):
+            conn = real_connect(*args, **kwargs)
+
+            def missing(*_):
+                raise sqlite3.OperationalError("no such function: " + name)
+
+            conn.create_function(name, -1, missing)
+            return conn
+
+        return connect
+
+    def test_each_missing_json_function_refuses_before_anything_is_installed(self):
+        for name in ("json_valid", "json_type", "json_array_length", "json_extract"):
+            with self.subTest(function=name), mock.patch.object(store.sqlite3, "connect", self.broken_connect(name)):
+                self.assertEqual(code_of(store.init_store, self.proj), errors.FAILED_CLOSED)
+                raw = sqlite3.connect(self.db, isolation_level=None)
+                try:
+                    self.assertEqual(raw.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
+                finally:
+                    raw.close()
+
+    def test_the_probe_passes_on_a_normal_runtime(self):
+        store.init_store(self.proj)
+        store.connect(self.proj).close()
+
+    def test_connect_refuses_too(self):
+        store.init_store(self.proj)
+        with mock.patch.object(store.sqlite3, "connect", self.broken_connect("json_each_missing_stub")):
+            store.connect(self.proj).close()  # an unrelated function name changes nothing
+        with mock.patch.object(store.sqlite3, "connect", self.broken_connect("json_extract")):
+            self.assertEqual(code_of(store.connect, self.proj), errors.FAILED_CLOSED)
 
 
 class InitTests(Base):
@@ -1776,6 +1865,18 @@ class FaultyConnection:
     def close(self):
         self.closed = True
         self.real.close()
+
+
+class FailingReads:
+    """A real connection whose read statements containing `needle` raise `error`."""
+
+    def __init__(self, real, needle, error):
+        self.real, self.needle, self.error = real, needle, error
+
+    def execute(self, sql, *args):
+        if self.needle in sql:
+            raise self.error
+        return self.real.execute(sql, *args)
 
 
 class ErrorMappingTests(Base):

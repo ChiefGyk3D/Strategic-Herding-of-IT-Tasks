@@ -739,6 +739,7 @@ def _open_once(project, timeout, initialize, final):
         conn.execute("PRAGMA recursive_triggers = ON")  # so that INSERT OR REPLACE fires the delete triggers
         if hasattr(conn, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
             conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
+        _check_json(conn)
         if initialize:
             _install_schema(conn)
         _check_header(conn)
@@ -762,6 +763,18 @@ def _open_once(project, timeout, initialize, final):
 def _require_wal(row):
     """The journal_mode pragma answers with the mode in force. Anything but wal (a filesystem that cannot do it) is refused."""
     if not row or str(row[0]).lower() != "wal":
+        raise ShitError(FAILED_CLOSED)
+
+
+def _check_json(conn):
+    """The schema's triggers use SQLite's JSON functions; an SQLite built without them is an unsupported runtime."""
+    try:
+        row = conn.execute(
+            "SELECT json_valid('[1]'), json_type('[1]'), json_array_length('[1]'), json_extract('{\"a\":1}', '$.a'), "
+            "(SELECT count(*) FROM json_each('[1]'))").fetchone()
+    except sqlite3.Error:
+        raise ShitError(FAILED_CLOSED) from None
+    if tuple(row) != (1, "array", 1, 1, 1):
         raise ShitError(FAILED_CLOSED)
 
 
@@ -844,8 +857,10 @@ class AmbiguousCommit(ShitError):
 
 
 def _abandon(conn):
-    """Close a connection whose transaction state cannot be trusted, so nothing can reuse it."""
-    with contextlib.suppress(Exception):
+    """Close a connection whose transaction state cannot be trusted, so nothing can reuse it.
+
+    Even an interrupt during the close is swallowed: the caller raises the fail-closed error right after."""
+    with contextlib.suppress(BaseException):
         conn.close()
 
 
@@ -925,8 +940,15 @@ def verify(conn, deep=False):
     its lease row, an apply slot and the lease it hangs on), so a crash, a writer that commits halfway or a hand edit
     can leave a state no single statement would have produced. The write helpers of the queue run this in their tests
     after every operation (docs/store.md, "Invariants across statements"). `deep=True` adds `PRAGMA
-    integrity_check`, which reads every page.
+    integrity_check`, which reads every page. An SQLite failure while reading raises the usual fixed `ShitError`.
     """
+    try:
+        return _verify_unmapped(conn, deep)
+    except sqlite3.Error as exc:
+        raise map_error(exc) from None
+
+
+def _verify_unmapped(conn, deep):
     found = set()
     live = conn.execute(
         "SELECT q.task_id, q.state_after FROM queue_entries q WHERE q.seq = (SELECT max(m.seq) FROM queue_entries m "

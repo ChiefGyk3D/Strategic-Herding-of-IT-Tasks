@@ -50,7 +50,8 @@ STORE = "shit/store.py"
 ALLOWED_METHODS = {
     "_open_once": {"execute", "setconfig"}, "_install_schema": {"execute"}, "_check_header": {"execute"},
     "_check_settings": {"execute"}, "fingerprint": {"execute"}, "expected_fingerprint": {"execute"},
-    "write_transaction": {"execute"}, "_fail_transaction": {"execute"}, "verify": {"execute"},
+    "write_transaction": {"execute"}, "_fail_transaction": {"execute"}, "_verify_unmapped": {"execute"},
+    "_check_json": {"execute"},
 }
 ALLOWED_REFLECTION = {("_open_once", "setconfig")}
 CONNECTORS = {"_open_once", "expected_fingerprint"}
@@ -81,26 +82,93 @@ def _with_parents(tree):
     return tree
 
 
+FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
 def _enclosing_function(node):
+    """The name of the nearest enclosing function, but only when it is a top-level definition.
+
+    A function defined inside another one (or a lambda) answers with a name no allowlist contains, so it can never
+    borrow the authority of a privileged function by sharing its spelling."""
     while node is not None:
         node = getattr(node, "parent", None)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(node, FUNCTIONS):
+            if isinstance(node, ast.Lambda) or not isinstance(getattr(node, "parent", None), ast.Module):
+                return "<nested>"
             return node.name
     return None
 
 
+def _bound_names(scope):
+    """Names a function scope binds itself: parameters, assignments, loop and with targets, imports, nested defs."""
+    names = set()
+    if not isinstance(scope, ast.Lambda):
+        names.add(None)
+    args = scope.args
+    for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+        if arg is not None:
+            names.add(arg.arg)
+    body = scope.body if isinstance(scope.body, list) else [scope.body]
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                names.add(node.id)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.update((a.asname or a.name).split(".")[0] for a in node.names)
+            elif isinstance(node, ast.arg):
+                names.add(node.arg)
+    return names
+
+
 def _in_write_transaction(node):
-    while node is not None:
-        node = getattr(node, "parent", None)
-        if isinstance(node, ast.With):
-            for item in node.items:
+    """True when `node` sits in `with write_transaction(...)` and that name is the module-level helper.
+
+    A parameter, assignment, import or nested definition of the same name in any enclosing function shadows the
+    helper, so the guard it provides is not the real one."""
+    shadowed = False
+    inside_with = False
+    scope = node
+    while scope is not None:
+        scope = getattr(scope, "parent", None)
+        if isinstance(scope, ast.With):
+            for item in scope.items:
                 call = item.context_expr
-                if isinstance(call, ast.Call):
-                    func = call.func
-                    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-                    if name == "write_transaction":
-                        return True
-    return False
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "write_transaction":
+                    inside_with = True
+        if isinstance(scope, FUNCTIONS) and "write_transaction" in _bound_names(scope):
+            shadowed = True
+    return inside_with and not shadowed
+
+
+def identity_findings(source):
+    """Privileged store functions must be unique, top-level definitions that nothing rebinds or shadows."""
+    tree = _with_parents(ast.parse(source))
+    privileged = (set(ALLOWED_METHODS) | CONNECTORS | TXN_OWNERS | SCHEMA_CONSUMERS | {n for _, n in BUILDERS}
+                  | {"write_transaction", "schema_statements"})
+    found = []
+    defs = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in privileged:
+            defs.setdefault(node.name, []).append(node)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in privileged:
+            found.append((node.lineno, "assignment rebinding " + node.id))
+        if isinstance(node, ast.arg) and node.arg in privileged:
+            found.append((node.lineno, "parameter named " + node.arg))
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if (alias.asname or alias.name) in privileged:
+                    found.append((node.lineno, "import binding " + (alias.asname or alias.name)))
+        if isinstance(node, (ast.Global, ast.Nonlocal)) and set(node.names) & privileged:
+            found.append((node.lineno, "global or nonlocal of a privileged name"))
+    for name, nodes in defs.items():
+        if len(nodes) != 1:
+            found.append((nodes[-1].lineno, name + " defined " + str(len(nodes)) + " times"))
+        for node in nodes:
+            if not isinstance(node.parent, ast.Module):
+                found.append((node.lineno, name + " defined inside another function or class"))
+    return found
 
 
 def sql_findings(source, rel="x.py", builders=frozenset()):
@@ -191,12 +259,24 @@ def _reflection_findings(node, function, inside):
     return []
 
 
+def _connect_shape_ok(call, function):
+    """`_open_once` opens the URI `_uri(path)` builds; `expected_fingerprint` opens only ':memory:'."""
+    if not call.args:
+        return False
+    first = call.args[0]
+    if function == "_open_once":
+        return isinstance(first, ast.Call) and isinstance(first.func, ast.Name) and first.func.id == "_uri"
+    if function == "expected_fingerprint":
+        return _text(first) == ":memory:"
+    return False
+
+
 def access_findings(source, rel, allowed=None):
     """Database access rules (see the module docstring). Every database method, however reached, is a finding
     outside the store; inside the store it must be a direct call in one of the functions listed for it."""
     tree = _with_parents(ast.parse(source))
     inside = rel == STORE
-    found = []
+    found = list(identity_findings(source)) if inside else []
     for node in ast.walk(tree):
         function = _enclosing_function(node)
         if isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
@@ -235,6 +315,8 @@ def access_findings(source, rel, allowed=None):
         if node.attr == "connect" and isinstance(node.value, ast.Name) and node.value.id == "sqlite3":
             if not (inside and _is_call_func(node) and function in CONNECTORS):
                 found.append((node.lineno, "sqlite3.connect outside its functions, or aliased"))
+            elif not _connect_shape_ok(node.parent, function):
+                found.append((node.lineno, "sqlite3.connect with an argument that is not the expected one"))
             continue
         if node.attr not in DB_METHODS:
             continue
@@ -447,6 +529,46 @@ class BiteTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertTrue(access_findings(source, STORE), source)
 
+    def test_privileged_names_cannot_be_borrowed_by_look_alikes(self):
+        bad = (
+            "def expected_fingerprint(path):\n    return sqlite3.connect(path)",
+            ("def innocent():\n    def _open_once(path):\n        return sqlite3.connect(_uri(path))\n"
+             "    return _open_once('/elsewhere')"),
+            ("def f(conn):\n    def write_transaction(_):\n        return contextlib.nullcontext()\n"
+             "    with write_transaction(conn):\n        conn.execute('DELETE FROM edges')"),
+            ("def f(conn, write_transaction):\n    with write_transaction(conn):\n"
+             "        conn.execute('DELETE FROM edges')"),
+            ("def f(conn):\n    write_transaction = nullcontext\n    with write_transaction(conn):\n"
+             "        conn.execute('DELETE FROM edges')"),
+            ("def f(conn):\n    from elsewhere import helper as write_transaction\n    with write_transaction(conn):\n"
+             "        conn.execute('DELETE FROM edges')"),
+            "def write_transaction(conn):\n    pass\n\ndef write_transaction(conn):\n    pass",
+            "write_transaction = something",
+            "def _open_once(path):\n    return sqlite3.connect(path)",
+            "def expected_fingerprint():\n    return sqlite3.connect('/other.db')",
+            "class Holder:\n    def write_transaction(self):\n        pass",
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE, FUTURE), source)
+
+    def test_a_shadowed_write_transaction_is_not_the_guard_even_on_its_own(self):
+        shadowed = ("def f(conn):\n    def write_transaction(_):\n        return None\n"
+                    "    with write_transaction(conn):\n        conn.execute('DELETE FROM edges')")
+        genuine = "def f(conn):\n    with write_transaction(conn):\n        conn.execute('DELETE FROM edges')"
+        for source, expected in ((shadowed, False), (genuine, True)):
+            tree = _with_parents(ast.parse(source))
+            call = next(n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "execute")
+            self.assertEqual(_in_write_transaction(call), expected)
+
+    def test_the_real_helpers_are_unique_top_level_definitions(self):
+        source = (ROOT / STORE).read_text(encoding="utf-8")
+        self.assertEqual(identity_findings(source), [])
+        tree = ast.parse(source)
+        top = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+        for name in ("write_transaction", "_open_once", "expected_fingerprint", "_install_schema", "schema_statements"):
+            self.assertEqual(top.count(name), 1, name)
+
     def test_install_schema_keeps_its_own_transaction(self):
         tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
         function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_install_schema")
@@ -458,7 +580,7 @@ class BiteTests(unittest.TestCase):
             'def f(conn):\n    return conn.execute("SELECT count(*) FROM tasks").fetchone()',
             'def f(conn):\n    return conn.execute("PRAGMA user_version").fetchone()',
             'def f(conn):\n    with write_transaction(conn):\n        conn.execute("INSERT INTO tasks VALUES (?)", row)',
-            'def f(conn):\n    with store.write_transaction(conn) as c:\n        c.execute("DELETE FROM edges")',
+            'def f(conn):\n    with write_transaction(conn) as c:\n        c.execute("DELETE FROM edges")',
             'def _install_schema(conn):\n    for sql in schema_statements():\n        conn.execute(sql)',
             'def _open_once(conn):\n    conn.execute("PRAGMA foreign_keys = ON")',
         )
