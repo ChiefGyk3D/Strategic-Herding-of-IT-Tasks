@@ -15,7 +15,29 @@ except ModuleNotFoundError:
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "shit"
 MODEL_NAMES = ("ollama", "llm", "gemini", "codex", "claude", "openai")
-OUTBOUND_ROOTS = {"http", "socket", "subprocess", "urllib"}
+# Top-level modules whose calls can cross a process or network boundary.
+OUTBOUND_MODULE_ROOTS = frozenset({
+    "aiohttp",
+    "anthropic",
+    "boto3",
+    "ftplib",
+    "google",
+    "grpc",
+    "http",
+    "httpx",
+    "litellm",
+    "ollama",
+    "openai",
+    "paramiko",
+    "requests",
+    "smtplib",
+    "socket",
+    "subprocess",
+    "telnetlib",
+    "urllib",
+    "urllib3",
+    "websockets",
+})
 
 
 def _call_name(node):
@@ -23,6 +45,8 @@ def _call_name(node):
     while isinstance(node, ast.Attribute):
         parts.append(node.attr)
         node = node.value
+        if isinstance(node, ast.Call):
+            node = node.func
     if isinstance(node, ast.Name):
         parts.append(node.id)
     return ".".join(reversed(parts))
@@ -42,15 +66,30 @@ def model_call_sites(source, module="shit.fixture"):
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.split(".")[0] in OUTBOUND_ROOTS:
+                if alias.name.split(".")[0] in OUTBOUND_MODULE_ROOTS:
                     outbound_aliases.add(alias.asname or alias.name.split(".")[0])
         elif isinstance(node, ast.ImportFrom):
             if node.module and node.module.startswith("shit"):
                 package_names.update(alias.asname or alias.name for alias in node.names)
-            elif node.module and node.module.split(".")[0] in OUTBOUND_ROOTS:
+            elif node.module and node.module.split(".")[0] in OUTBOUND_MODULE_ROOTS:
                 outbound_aliases.update(alias.asname or alias.name for alias in node.names)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             package_names.add(node.name)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            value = node.value
+            if not isinstance(value, ast.Name) or value.id not in outbound_aliases:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id not in outbound_aliases:
+                    outbound_aliases.add(target.id)
+                    changed = True
 
     found = set()
 
@@ -68,7 +107,7 @@ def model_call_sites(source, module="shit.fixture"):
         def visit_Call(self, node):
             target = _call_name(node.func)
             root = target.split(".", 1)[0]
-            is_outbound = root in OUTBOUND_ROOTS or root in outbound_aliases
+            is_outbound = root in outbound_aliases
             is_model = (
                 _has_model_name(target)
                 and root not in package_names
@@ -123,6 +162,63 @@ class ModelPathScannerTests(unittest.TestCase):
         for source in samples:
             with self.subTest(source=source):
                 self.assertTrue(model_call_sites(source), source)
+
+    def test_scanner_flags_supported_outbound_modules(self):
+        samples = {
+            "requests": "import requests\ndef send():\n    requests.post('x')\n",
+            "httpx": "import httpx\ndef send():\n    httpx.post('x')\n",
+            "aiohttp": "import aiohttp\ndef send():\n    aiohttp.request('GET', 'x')\n",
+            "urllib3": "import urllib3\ndef send():\n    urllib3.request('GET', 'x')\n",
+            "websockets": "import websockets\ndef send():\n    websockets.connect('x')\n",
+            "grpc": "import grpc\ndef send():\n    grpc.insecure_channel('x')\n",
+            "smtplib": "import smtplib\ndef send():\n    smtplib.SMTP('x')\n",
+            "ftplib": "import ftplib\ndef send():\n    ftplib.FTP('x')\n",
+            "telnetlib": "import telnetlib\ndef send():\n    telnetlib.Telnet('x')\n",
+            "paramiko": "import paramiko\ndef send():\n    paramiko.SSHClient()\n",
+            "boto3": "import boto3\ndef send():\n    boto3.client('runtime')\n",
+            "google": "import google.generativeai\ndef send():\n    google.generativeai.generate_text()\n",
+            "anthropic": "import anthropic\ndef send():\n    anthropic.Anthropic()\n",
+            "openai": "import openai\ndef send():\n    openai.OpenAI()\n",
+            "ollama": "import ollama\ndef send():\n    ollama.generate()\n",
+            "litellm": "import litellm\ndef send():\n    litellm.completion()\n",
+        }
+        for module_name, source in samples.items():
+            with self.subTest(module_name=module_name):
+                self.assertTrue(model_call_sites(source), source)
+
+    def test_scanner_resolves_outbound_import_aliases(self):
+        samples = {
+            "module alias": (
+                "import openai as client\n"
+                "def send(text):\n    client.responses.create(input=text)\n"
+            ),
+            "imported class alias": (
+                "from openai import OpenAI as C\n"
+                "def send(text):\n    C().chat.completions.create(input=text)\n"
+            ),
+            "imported function alias": (
+                "from requests import post as p\n"
+                "def send():\n    p('x')\n"
+            ),
+            "assignment alias": (
+                "import openai\nc = openai\n"
+                "def send(text):\n    c.responses.create(input=text)\n"
+            ),
+        }
+        for alias_form, source in samples.items():
+            with self.subTest(alias_form=alias_form):
+                self.assertTrue(model_call_sites(source), source)
+
+    def test_scanner_ignores_unrelated_aliases_and_module_mentions(self):
+        source = '''
+import unrelated as client
+client.responses.create()
+requests = []
+requests.append("local plan item")
+# import openai as client
+EXAMPLE = "requests.post('x')"
+'''
+        self.assertEqual(model_call_sites(source), set())
 
     def test_scanner_ignores_comments_strings_and_package_adapter_names(self):
         source = '''
