@@ -26,13 +26,23 @@ EXECUTORS = {"execute", "executemany", "executescript"}
 DB_METHODS = EXECUTORS | {"cursor", "backup", "iterdump", "create_function", "create_aggregate", "create_collation",
                           "set_authorizer", "enable_load_extension", "load_extension", "setconfig", "blobopen",
                           "set_progress_handler", "set_trace_callback", "commit", "rollback"}
+DB_NAMES = EXECUTORS | {"cursor"}
+REFLECTORS = {"getattr", "hasattr", "setattr", "delattr", "attrgetter", "methodcaller"}
 STORE = "shit/store.py"
+# The exact functions of the store that may call each database method. C3 and later add to this list on purpose.
+ALLOWED_METHODS = {
+    "_open_once": {"execute", "setconfig"}, "_install_schema": {"execute"}, "_check_header": {"execute"},
+    "_check_settings": {"execute"}, "fingerprint": {"execute"}, "expected_fingerprint": {"execute"},
+    "write_transaction": {"execute"}, "_fail_transaction": {"execute"},
+}
+ALLOWED_REFLECTION = {("_open_once", "setconfig")}
+CONNECTORS = {"_open_once", "expected_fingerprint"}
 # The only functions that may assemble SQL text: schema DDL from this code's own vocabulary.
 BUILDERS = {(STORE, name) for name in (
     "schema_statements", "_guard", "_no_pair", "_queue_guards", "_lease_guards", "_chain_guard", "_stamp_check",
     "_slug_check", "_hex_check", "_text_check", "_seconds", "_pair_rows", "_kind_rules")}
 # Functions of the store that run their own BEGIN IMMEDIATE / pragmas / scratch in-memory database.
-TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "expected_fingerprint"}
+TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "_fail_transaction", "expected_fingerprint"}
 NAMED_SQL_VARIABLES = {("_install_schema", "sql"), ("expected_fingerprint", "sql"), ("_check_settings", "sql")}
 
 
@@ -127,25 +137,69 @@ def import_findings(source):
     return found
 
 
-def access_findings(source, rel):
-    """Database access rules. Outside the store: no database method at all. Inside: see the module docstring."""
+def _is_call_func(node):
+    parent = getattr(node, "parent", None)
+    return isinstance(parent, ast.Call) and parent.func is node
+
+
+def _reflection_findings(node, function, inside):
+    """getattr, hasattr, setattr, delattr, attrgetter and methodcaller reaching a database method by name."""
+    func = node.func
+    name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+    if name not in REFLECTORS:
+        return []
+    index = 0 if name in ("attrgetter", "methodcaller") else 1
+    args = node.args
+    if len(args) <= index:
+        return [(node.lineno, "reflection without a fixed name")]
+    target = _text(args[index])
+    if target is None:
+        return [(node.lineno, "reflection with a computed name")]
+    if target in DB_METHODS and not (inside and (function, target) in ALLOWED_REFLECTION):
+        return [(node.lineno, "reflection on a database method")]
+    return []
+
+
+def access_findings(source, rel, allowed=None):
+    """Database access rules (see the module docstring). Every database method, however reached, is a finding
+    outside the store; inside the store it must be a direct call in one of the functions listed for it."""
     tree = _with_parents(ast.parse(source))
     inside = rel == STORE
     found = []
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-            continue
-        method = node.func.attr
-        if not inside:
-            if method in DB_METHODS:
-                found.append((node.lineno, "database method outside the store"))
-            continue
-        if method in ("executescript", "cursor"):
-            found.append((node.lineno, method))
-        if method not in EXECUTORS or not node.args:
-            continue
         function = _enclosing_function(node)
-        arg = node.args[0]
+        if isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+            found.append((node.lineno, "from-import of sqlite3"))
+        if isinstance(node, ast.ImportFrom) and any(a.name in DB_METHODS for a in node.names):
+            found.append((node.lineno, "import of a database method"))
+        if isinstance(node, ast.Call):
+            found.extend(_reflection_findings(node, function, inside))
+        if isinstance(node, ast.Subscript) and _text(node.slice) in DB_NAMES:
+            found.append((node.lineno, "subscript dispatch to a database method"))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value in DB_NAMES \
+                and not isinstance(getattr(node, "parent", None), ast.Call):
+            found.append((node.lineno, "database method name used as data"))
+        if not isinstance(node, ast.Attribute):
+            continue
+        if node.attr == "connect" and isinstance(node.value, ast.Name) and node.value.id == "sqlite3":
+            if not (inside and _is_call_func(node) and function in CONNECTORS):
+                found.append((node.lineno, "sqlite3.connect outside its functions, or aliased"))
+            continue
+        if node.attr not in DB_METHODS:
+            continue
+        if not inside:
+            found.append((node.lineno, "database method outside the store"))
+            continue
+        if not _is_call_func(node):
+            found.append((node.lineno, "database method used without being called directly"))
+            continue
+        if node.attr not in (ALLOWED_METHODS if allowed is None else allowed).get(function, ()):
+            found.append((node.lineno, "database method in a function not on the list"))
+            continue
+        call = node.parent
+        if node.attr not in EXECUTORS or not call.args:
+            continue
+        arg = call.args[0]
         literal = _text(arg)
         if literal is None:
             if not (isinstance(arg, ast.Name) and (function, arg.id) in NAMED_SQL_VARIABLES):
@@ -203,6 +257,13 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(access_findings(source, STORE), [])
         # Something was collected: the rule saw executor calls.
         self.assertGreater(source.count(".execute("), 10)
+        used = {f for f in ALLOWED_METHODS}
+        defined = {n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)}
+        self.assertLessEqual(used, defined)  # the list names real functions only
+
+
+# A store with later operations added on purpose: functions `f` and the owners may call `execute`.
+FUTURE = {**ALLOWED_METHODS, "f": {"execute"}}
 
 
 class BiteTests(unittest.TestCase):
@@ -259,6 +320,36 @@ class BiteTests(unittest.TestCase):
         )
         for source in bad:
             with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE, FUTURE), source)
+
+    def test_every_bypass_from_the_review_is_caught(self):
+        outside = (
+            'getattr(conn, "execute")(user_sql)',
+            "run = conn.execute\nrun(text)",
+            "list(map(conn.execute, statements))",
+            'handlers = {"execute": 1}\nhandlers["execute"]',
+            'name = "exec" + "ute"\ngetattr(conn, name)(text)',
+            'import operator\noperator.attrgetter("execute")(conn)(text)',
+            "from sqlite3 import connect",
+            "def go(c, t):\n    return c.execute(t)",
+            "from somewhere import executescript",
+        )
+        for source in outside:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, "shit/other.py"), source)
+        inside = (
+            "def unsafe(conn, text):\n    run = conn.execute\n    run(text)",
+            'def unsafe(conn, text):\n    getattr(conn, "execute")(text)',
+            "def unsafe(path):\n    c = sqlite3.connect\n    return c(path)",
+            "def unsafe(path):\n    return sqlite3.connect(path)",
+            'def unsafe(conn):\n    return conn.execute("SELECT 1")',
+            'def unsafe(conn):\n    return conn["execute"]("SELECT 1")',
+            "from sqlite3 import connect",
+            'def _open_once(conn):\n    return conn.execute(sql_from_somewhere)',
+            'def _open_once(conn, name):\n    return getattr(conn, name)',
+        )
+        for source in inside:
+            with self.subTest(source=source):
                 self.assertTrue(access_findings(source, STORE), source)
 
     def test_inside_the_store_allowed_shapes_pass(self):
@@ -272,7 +363,7 @@ class BiteTests(unittest.TestCase):
         )
         for source in good:
             with self.subTest(source=source):
-                self.assertEqual(access_findings(source, STORE), [], source)
+                self.assertEqual(access_findings(source, STORE, FUTURE), [], source)
 
 
 if __name__ == "__main__":

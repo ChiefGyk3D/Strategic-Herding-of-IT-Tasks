@@ -6,6 +6,7 @@ plain `sqlite3` connection opened by the test itself, which is allowed outside `
 
 import hashlib
 import os
+import random
 import re
 import sqlite3
 import stat
@@ -284,6 +285,30 @@ class ConfinementTests(Base):
                 code, calls = self.swap_sidecar_on_open(suffix, times=10)
                 self.assertEqual(code, errors.CONFINEMENT)
                 self.assertEqual(calls, 2)  # one retry, then a refusal
+
+    def test_a_sidecar_that_disappears_is_not_accepted(self):
+        self.init_store()
+        holder = store.connect(self.proj)
+        self.addCleanup(holder.close)
+        path = str(self.db)
+        for suffix in ("-wal", "-shm"):
+            with self.subTest(sidecar=suffix):
+                snapshot = {s: store._lstat(path + s, required=False) for s in ("-wal", "-shm")}
+                self.assertIsNotNone(snapshot[suffix])
+                os.rename(path + suffix, path + suffix + ".away")
+                try:
+                    self.assertRaises(store._SidecarMoved, store._verify_sidecars, path, snapshot, False)
+                    with self.assertRaises(ShitError) as caught:
+                        store._verify_sidecars(path, snapshot, True)
+                    self.assertEqual(caught.exception.code, errors.CONFINEMENT)
+                finally:
+                    os.rename(path + suffix + ".away", path + suffix)
+        none = {"-wal": None, "-shm": None}
+        os.rename(path + "-wal", path + "-wal.away")
+        try:
+            store._verify_sidecars(path, none, True)  # absent before and after: fine
+        finally:
+            os.rename(path + "-wal.away", path + "-wal")
 
     def test_a_single_sidecar_replacement_is_retried_once(self):
         self.init_store()
@@ -681,6 +706,267 @@ class TransitionTests(RowFixture):
         self.assertEqual(self.put_code("held", "hold-owner", hold_kind="owner"), errors.LEASE_REFUSED)
 
 
+def entry_dicts(conn):
+    """The queue log of a store, as the validated records `queue_records.replay` reads."""
+    cursor = conn.execute("SELECT * FROM queue_entries WHERE kind <> 'graph_changed' ORDER BY seq")
+    names = [d[0] for d in cursor.description]
+    out = []
+    for number, row in enumerate(cursor.fetchall(), start=1):
+        entry = {"schema": "queue-entry", "schema_version": 1}
+        for name, value in zip(names, row, strict=True):
+            if value is not None and name not in ("seq", "prev_hash", "hash", "shards"):
+                entry[name] = value
+        entry["id"] = f"queue-{number:04d}"
+        out.append(queue_records.validate_entry(entry))
+    return out
+
+
+class LeaseConsistencyTests(RowFixture):
+    """Queue rows must agree with the lease they claim, as `queue_records.replay` demands (review round 2)."""
+
+    def replays(self):
+        queue_records.replay(entry_dicts(self.conn))
+
+    def test_start_and_renewal_must_use_the_claims_worker_and_step(self):
+        self.reach("dispatched")
+        self.assertEqual(self.put_code("started", "running", **{**self.started_cols(), "worker": "other"}),
+                         errors.LEASE_REFUSED)
+        self.assertEqual(self.put_code("started", "running", **{**self.started_cols(), "step": "review"}),
+                         errors.LEASE_REFUSED)
+        self.put("started", "running", **self.started_cols())
+        for change in ({"worker": "other"}, {"step": "review"}):
+            with self.subTest(change=change):
+                self.assertEqual(self.put_code("renewed", "running", **{**self.renew_cols(1800), **change}),
+                                 errors.LEASE_REFUSED)
+        self.replays()
+
+    def test_a_renewal_must_extend_and_come_before_expiry_within_the_ceilings(self):
+        self.reach("running")  # claim expires 901 seconds after the claim
+        cases = {
+            "shortens the lease": self.renew_cols(60),
+            "does not change the expiry": self.renew_cols(901 - 4),
+            "more than a day past the renewal time": self.renew_cols(90000),
+        }
+        for label, cols in cases.items():
+            with self.subTest(label=label):
+                self.assertEqual(self.put_code("renewed", "running", **cols), errors.LEASE_REFUSED)
+        self.put("renewed", "running", **self.renew_cols(1800))
+        self.clock += timedelta(seconds=2000)  # now past the new expiry
+        self.assertEqual(self.put_code("renewed", "running", **self.renew_cols(2800 + 2000)), errors.LEASE_REFUSED)
+        self.replays()
+
+    def test_a_renewal_after_expiry_is_refused(self):
+        self.reach("running")
+        self.clock += timedelta(seconds=1000)
+        self.assertEqual(self.put_code("renewed", "running", **self.renew_cols(1500)), errors.LEASE_REFUSED)
+
+    def test_total_lifetime_and_renewal_count_are_capped(self):
+        self.reach("running")
+        claim = datetime.strptime(self.conn.execute("SELECT timestamp FROM queue_entries WHERE kind = 'claimed'")
+                                  .fetchone()[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        expiry = claim + timedelta(seconds=901)
+        accepted, code = 0, None
+        for _ in range(12):
+            self.clock = expiry - timedelta(seconds=100)  # renew just before the lease would lapse
+            expiry += timedelta(seconds=80000)
+            cols = {**self.renew_cols(0), "expires_at": expiry.strftime("%Y-%m-%dT%H:%M:%SZ")}
+            code = self.put_code("renewed", "running", **cols)
+            if code is not None:
+                break
+            accepted += 1
+        self.assertEqual(code, errors.LEASE_REFUSED)
+        self.assertEqual(accepted, 7)  # 901 + 8 * 80,000 would pass the 604,800-second ceiling
+        self.replays()
+
+    def test_renewal_count_ceiling(self):
+        self.reach("running")
+        claim_expiry = self.conn.execute("SELECT expires_at FROM queue_entries WHERE kind = 'claimed'").fetchone()[0]
+        expiry = datetime.strptime(claim_expiry, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        base = self.tip("queue_entries")
+        with store.write_transaction(self.conn):
+            for number in range(queue_records.MAX_RENEWALS + 1):
+                expiry += timedelta(seconds=1)
+                row = {"id": f"queue-{number + 10:04d}", "task_id": "alpha", "timestamp": self.stamp(number),
+                       "actor": "wrapper", "kind": "renewed", "state_after": "running", "lease_id": self.LEASE,
+                       "generation": 1, "worker": "worker-one", "step": "draft",
+                       "expires_at": expiry.strftime("%Y-%m-%dT%H:%M:%SZ"), "prev_hash": base,
+                       "hash": hashlib.sha256(str(number + 5000).encode()).hexdigest()}
+                columns = list(row)
+                try:
+                    self.conn.execute("INSERT INTO queue_entries (" + ", ".join(columns) + ") VALUES ("
+                                      + ", ".join("?" for _ in columns) + ")", [row[c] for c in columns])
+                except sqlite3.IntegrityError as exc:
+                    self.assertEqual(number, queue_records.MAX_RENEWALS)
+                    self.assertEqual(store.map_error(exc).code, errors.LEASE_REFUSED)
+                    return
+                base = row["hash"]
+        self.fail("the 1,001st renewal was accepted")
+
+    def apply_claim(self):
+        self.put("enqueued", "waiting", actor="human")
+        self.put("ready", "ready")
+        self.put("claimed", "dispatched", **{**self.lease_cols(), "step": "apply"})
+        self.put("started", "running", **{**self.started_cols(), "step": "apply"})
+
+    def test_apply_markers_need_an_apply_claim_and_the_order_none_started_finished(self):
+        self.reach("running")  # a draft claim
+        marker = {"lease_id": self.LEASE, "generation": 1}
+        self.assertEqual(self.put_code("apply_started", "running", **marker), errors.ILLEGAL_TRANSITION)
+        self.setUp()
+        self.apply_claim()
+        self.assertEqual(self.put_code("apply_finished", "running", **marker), errors.ILLEGAL_TRANSITION)
+        self.put("apply_started", "running", **marker)
+        self.assertEqual(self.put_code("apply_started", "running", **marker), errors.ILLEGAL_TRANSITION)
+        self.put("apply_finished", "running", **marker)
+        self.assertEqual(self.put_code("apply_finished", "running", **marker), errors.ILLEGAL_TRANSITION)
+        self.replays()
+
+    def test_a_claim_needs_no_live_lease_row_and_respects_not_before(self):
+        self.reach("dispatched")
+        self.put("dispatch_failed", "ready", lease_id=self.LEASE, generation=1, not_before=self.stamp(600))
+        self.assertEqual(self.put_code("claimed", "dispatched", **self.lease_cols(generation=2, lease=self.LEASE_B)),
+                         errors.LEASE_REFUSED)  # before not_before
+        self.clock += timedelta(seconds=700)
+        self.put("claimed", "dispatched", **self.lease_cols(generation=2, lease=self.LEASE_B))
+        self.replays()
+
+    def lease_row_for(self, claim_cols):
+        row = self.conn.execute("SELECT timestamp, expires_at FROM queue_entries WHERE kind = 'claimed' "
+                                "ORDER BY seq DESC LIMIT 1").fetchone()
+        return {"task_id": "alpha", "lease_id": claim_cols["lease_id"], "generation": claim_cols["generation"],
+                "step": claim_cols["step"], "worker": claim_cols["worker"], "worker_kind": claim_cols["worker_kind"],
+                "claimed_at": row[0], "expires_at": row[1], "renewals": 0}
+
+    def test_claim_is_refused_while_a_lease_row_is_live(self):
+        self.reach("dispatched")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.put("released", "ready", lease_id=self.LEASE, generation=1)
+        self.assertEqual(self.put_code("claimed", "dispatched", **self.lease_cols(generation=2, lease=self.LEASE_B)),
+                         errors.LEASE_REFUSED)  # the old lease row was not deleted first
+        with store.write_transaction(self.conn):
+            self.conn.execute("DELETE FROM leases")
+        self.put("claimed", "dispatched", **self.lease_cols(generation=2, lease=self.LEASE_B))
+
+    def update_lease(self, expires, renewals):
+        def run():
+            with store.write_transaction(self.conn):
+                self.conn.execute("UPDATE leases SET expires_at = ?, renewals = ?", (expires, renewals))
+        return code_of(run)
+
+    def test_entries_and_the_lease_row_agree_in_both_write_orders(self):
+        self.reach("dispatched")
+        claim = self.lease_cols()
+        self.insert("leases", self.lease_row_for(claim))
+        self.put("started", "running", **self.started_cols())
+        base = self.clock
+
+        def at(seconds):
+            return (base + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def renew(seconds):
+            return {**self.renew_cols(0), "expires_at": at(seconds)}
+
+        # Entry first, then the lease row.
+        self.put("renewed", "running", **renew(1800))
+        self.assertIsNone(self.update_lease(at(1800), 1))
+        # Lease row first, then the entry.
+        self.assertIsNone(self.update_lease(at(2700), 2))
+        self.put("renewed", "running", **renew(2700))
+        # An entry that disagrees with the lease row is refused.
+        self.assertIsNone(self.update_lease(at(3600), 3))
+        self.assertEqual(self.put_code("renewed", "running", **renew(3700)), errors.LEASE_REFUSED)
+        self.put("renewed", "running", **renew(3600))
+        self.replays()
+
+    def test_the_lease_row_may_not_be_shorter_than_the_log_or_jump_more_than_a_day(self):
+        self.reach("running")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.put("renewed", "running", **self.renew_cols(1800))
+        self.assertEqual(self.update_lease(self.stamp(1000), 1), errors.LEASE_REFUSED)  # shorter than the log
+        self.assertEqual(self.update_lease(self.stamp(1800 + 90000), 1), errors.LEASE_REFUSED)  # beyond a day
+        self.assertIsNone(self.update_lease(self.stamp(1800), 1))
+
+    def test_a_started_entry_must_match_an_existing_lease_row(self):
+        self.reach("dispatched")
+        row = self.lease_row_for(self.lease_cols())
+        self.insert("leases", row)
+        self.put("started", "running", **self.started_cols())
+
+
+class ReplayDifferentialTests(RowFixture):
+    """Whatever the database accepts, `queue_records.replay` must accept too (seeded random sequences)."""
+
+    KINDS = ("enqueued", "ready", "claimed", "started", "renewed", "released", "expired", "dispatch_failed",
+             "apply_started", "apply_finished", "submitted", "held", "failed", "reopened", "done", "orphan_removed")
+
+    def candidate(self, rng, task, last):
+        kind = rng.choice(self.KINDS)
+        lease = last.get("lease") or self.LEASE
+        generation = last.get("generation", 1)
+        worker, step = last.get("worker", "worker-one"), last.get("step", "draft")
+        if rng.random() < 0.15:
+            worker = "other"
+        if rng.random() < 0.15:
+            step = rng.choice(("apply", "review", "draft"))
+        if rng.random() < 0.1:
+            generation += rng.choice((-1, 1))
+        if rng.random() < 0.1:
+            lease = rng.choice((self.LEASE, self.LEASE_B))
+        stamp = self.stamp
+        states = {"enqueued": ("waiting", "ready"), "ready": ("ready",), "claimed": ("dispatched",),
+                  "started": ("running",), "renewed": ("dispatched", "running"), "released": ("ready",),
+                  "expired": ("ready", "failed"), "dispatch_failed": ("ready",), "apply_started": ("running",),
+                  "apply_finished": ("running",), "submitted": ("review",),
+                  "held": ("hold-owner", "hold-ci"), "failed": ("failed",), "reopened": ("ready", "waiting"),
+                  "done": ("done",), "orphan_removed": queue_records.STATES}[kind]
+        state = rng.choice(states)
+        cols = {}
+        actor = "human" if kind in ("enqueued", "reopened") else "wrapper"
+        if kind == "claimed":
+            cols = {"lease_id": lease, "generation": last.get("generation", 0) + rng.choice((1, 1, 1, 2)),
+                    "worker": worker, "worker_kind": "ai", "step": step,
+                    "expires_at": stamp(rng.choice((100, 900, 5000)))}
+        elif kind == "started":
+            cols = {"lease_id": lease, "generation": generation, "worker": worker, "step": step,
+                    "attempt": last.get("attempts", 0) + rng.choice((1, 1, 2))}
+        elif kind == "renewed":
+            cols = {"lease_id": lease, "generation": generation, "worker": worker, "step": step,
+                    "expires_at": stamp(rng.choice((50, 1000, 2000, 100000)))}
+        elif kind in ("released", "expired", "submitted", "apply_started", "apply_finished"):
+            cols = {"lease_id": lease, "generation": generation}
+        elif kind == "dispatch_failed":
+            cols = {"lease_id": lease, "generation": generation, "not_before": stamp(rng.choice((10, 400)))}
+        elif kind in ("held", "failed"):
+            if rng.random() < 0.6:
+                cols = {"lease_id": lease, "generation": generation}
+            if kind == "held":
+                cols["hold_kind"] = state.split("-")[1]
+        return kind, state, actor, cols
+
+    def test_database_acceptance_implies_replay_acceptance(self):
+        rng = random.Random(59)
+        accepted_kinds = set()
+        last = {}
+        for round_number in range(350):
+            kind, state, actor, cols = self.candidate(rng, "alpha", last)
+            number = self.conn.execute("SELECT count(*) FROM queue_entries WHERE kind <> 'graph_changed'").fetchone()[0]
+            self.count = number
+            try:
+                self.put(kind, state, actor=actor, **cols)
+            except ShitError:
+                self.clock += timedelta(seconds=rng.choice((0, 0, 30, 300)))
+                continue
+            accepted_kinds.add(kind)
+            if kind == "claimed":
+                last = {**last, "lease": cols["lease_id"], "generation": cols["generation"], "worker": cols["worker"],
+                        "step": cols["step"], "attempts": last.get("attempts", 0)}
+            if kind == "started":
+                last["attempts"] = cols["attempt"]
+            queue_records.replay(entry_dicts(self.conn))  # raises ShitError(3) if the log is not replayable
+        self.assertGreaterEqual(len(accepted_kinds), 9, accepted_kinds)
+        self.assertGreater(self.conn.execute("SELECT count(*) FROM queue_entries").fetchone()[0], 15)
+
+
 class LeaseSlotTests(RowFixture):
     def lease_row(self, **more):
         return {"task_id": "alpha", "lease_id": self.LEASE, "generation": 1, "step": "draft", "worker": "worker-one",
@@ -728,7 +1014,7 @@ class LeaseSlotTests(RowFixture):
         def run():
             with store.write_transaction(self.conn):
                 self.conn.execute("UPDATE leases SET expires_at = ?, renewals = 1", (too_long,))
-        self.assertEqual(code_of(run), errors.REJECTED)
+        self.assertEqual(code_of(run), errors.LEASE_REFUSED)  # past a day from the old expiry; the CHECK is a second line
 
     def test_apply_slots_need_an_apply_step_lease_and_cannot_be_edited(self):
         row = self.claim(step="draft")
@@ -778,11 +1064,22 @@ class FingerprintTests(Base):
             conn.execute(sql)
         conn.close()
 
+    def test_the_pinned_fingerprint_equals_what_the_ddl_generates(self):
+        # A DDL change must update the literal on purpose, together with the schema review.
+        self.assertEqual(store.PINNED_FINGERPRINT, store.expected_fingerprint())
+
+    def test_open_checks_against_the_pinned_literal_not_the_builders(self):
+        self.init_store()
+        with mock.patch.object(store, "PINNED_FINGERPRINT", "0" * 64):
+            self.assertEqual(code_of(store.connect, self.proj), errors.FAILED_CLOSED)
+        with mock.patch.object(store, "expected_fingerprint", lambda: "0" * 64):
+            store.connect(self.proj).close()  # the generator is not consulted at open
+
     def test_untouched_store_verifies_and_fingerprint_is_stable(self):
         self.init_store()
         conn = store.connect(self.proj)
         self.addCleanup(conn.close)
-        self.assertEqual(store.fingerprint(conn), store.expected_fingerprint())
+        self.assertEqual(store.fingerprint(conn), store.PINNED_FINGERPRINT)
         self.assertRegex(store.expected_fingerprint(), r"^[0-9a-f]{64}$")
 
     def test_dropped_trigger_is_refused(self):
@@ -899,6 +1196,31 @@ class TransactionTests(Base):
         self.assertFalse(real.in_transaction)
         self.assertEqual(real.execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
 
+    def test_error_after_a_commit_that_landed_is_ambiguous_not_a_plain_failure(self):
+        real = store.connect(self.proj, busy_timeout_ms=200)
+        proxy = FaultyConnection(real, commit="commit-then-error")
+        with self.assertRaises(store.AmbiguousCommit) as caught, store.write_transaction(proxy):
+            self.add_task(proxy)
+        self.assertEqual(caught.exception.code, errors.FAILED_CLOSED)
+        self.assertEqual(str(caught.exception), errors.MESSAGES[errors.FAILED_CLOSED])
+        self.assertTrue(proxy.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            real.execute("SELECT 1")
+        # The write is durable: the caller must re-read before it retries anything.
+        self.assertEqual(self.raw().execute("SELECT count(*) FROM tasks").fetchone()[0], 1)
+
+    def test_error_after_a_commit_that_did_not_land_is_also_ambiguous(self):
+        real = store.connect(self.proj, busy_timeout_ms=200)
+        proxy = FaultyConnection(real, commit="rollback-then-error")
+        with self.assertRaises(store.AmbiguousCommit), store.write_transaction(proxy):
+            self.add_task(proxy)
+        self.assertTrue(proxy.closed)
+        self.assertEqual(self.raw().execute("SELECT count(*) FROM tasks").fetchone()[0], 0)
+
+    def test_ambiguous_commit_is_a_shit_error_with_a_fixed_message(self):
+        self.assertTrue(issubclass(store.AmbiguousCommit, ShitError))
+        self.assertEqual(store.AmbiguousCommit().code, errors.FAILED_CLOSED)
+
     def test_begin_immediate_is_used(self):
         seen = []
         self.conn.set_trace_callback(seen.append)
@@ -978,6 +1300,12 @@ class FaultyConnection:
             return None  # the transaction stays open
         if sql == "COMMIT" and self.commit == "busy":
             raise busy_error()
+        if sql == "COMMIT" and self.commit == "commit-then-error":
+            self.real.execute("COMMIT")  # the write is durable, then the API reports an error
+            raise io_error()
+        if sql == "COMMIT" and self.commit == "rollback-then-error":
+            self.real.execute("ROLLBACK")
+            raise io_error()
         return self.real.execute(sql, *args)
 
     def close(self):

@@ -75,6 +75,8 @@ TOKEN_EXIT = {
     "E15": LEASE_REFUSED,  # lease deleted while an apply slot is still held
     "E16": LEASE_REFUSED,  # apply slot without a matching apply-step lease, or edited
     "E17": REJECTED,  # started entry whose attempt is not the previous one plus one
+    "E18": LEASE_REFUSED,  # renewal outside its window, or worker, step or lease row that disagree
+    "E19": ILLEGAL_TRANSITION,  # apply marker for a non-apply claim, repeated, or out of order
 }
 _TOKEN = re.compile(r"E[0-9]{1,3}")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
@@ -137,7 +139,7 @@ _LAST_CLAIM = ("(SELECT q.seq FROM queue_entries q WHERE q.task_id = NEW.task_id
                "ORDER BY q.seq DESC LIMIT 1)")
 # Trigger conditions are written in this code only; this is the whole alphabet they may use (no quote
 # escapes, semicolons, comments or double quotes).
-_CONDITION = re.compile(r"[A-Za-z0-9_ ,()'<>=.*|+-]*")
+_CONDITION = re.compile(r"[A-Za-z0-9_ ,()'<>=.*|+%-]*")
 _EVENTS = ("BEFORE INSERT", "BEFORE UPDATE", "BEFORE DELETE")
 
 
@@ -243,6 +245,64 @@ def _chain_guard(table):
     return _guard(table + "_chain", "BEFORE INSERT", table, condition, "E11")
 
 
+def _sec(expression):
+    """Whole seconds of a fixed-width stamp expression."""
+    return "CAST(strftime('%s', " + expression + ") AS INTEGER)"
+
+
+def _claim(column):
+    """A column of the task's latest claim entry."""
+    return "(SELECT c." + _name(column) + " FROM queue_entries c WHERE c.seq = " + _LAST_CLAIM + ")"
+
+
+_LAST_EXPIRY = ("(SELECT x.expires_at FROM queue_entries x WHERE x.task_id = NEW.task_id "
+                "AND x.kind IN ('claimed', 'renewed') ORDER BY x.seq DESC LIMIT 1)")
+_RENEWED_SO_FAR = ("(SELECT count(*) FROM queue_entries r WHERE r.task_id = NEW.task_id AND r.kind = 'renewed' "
+                   "AND r.seq > " + _LAST_CLAIM + ")")
+
+
+def _since_claim(kind):
+    return ("EXISTS (SELECT 1 FROM queue_entries a WHERE a.task_id = NEW.task_id AND a.kind = '" + _name(kind)
+            + "' AND a.seq > " + _LAST_CLAIM + ")")
+
+
+def _lease_consistency_guards():
+    """Entry fields against the claim they belong to and against the lease row, in either write order."""
+    entries = "queue_entries"
+    row = "EXISTS (SELECT 1 FROM leases l WHERE l.task_id = NEW.task_id)"
+    return [
+        _guard("queue_entries_start_matches_claim", "BEFORE INSERT", entries,
+               "NEW.kind IN ('started', 'renewed') AND (NEW.worker IS NOT " + _claim("worker")
+               + " OR NEW.step IS NOT " + _claim("step") + ")", "E9"),
+        _guard("queue_entries_renewal_window", "BEFORE INSERT", entries,
+               "NEW.kind = 'renewed' AND (NEW.expires_at <= " + _LAST_EXPIRY + " OR NEW.timestamp >= " + _LAST_EXPIRY
+               + " OR " + _sec("NEW.expires_at") + " - " + _sec("NEW.timestamp") + " > " + str(queue_records.MAX_TTL)
+               + " OR " + _sec("NEW.expires_at") + " - " + _sec(_LAST_EXPIRY) + " > " + str(queue_records.MAX_TTL)
+               + " OR " + _sec("NEW.expires_at") + " - " + _sec(_claim("timestamp")) + " > "
+               + str(queue_records.MAX_LIFETIME) + " OR " + _RENEWED_SO_FAR + " + 1 > "
+               + str(queue_records.MAX_RENEWALS) + ")", "E18"),
+        _guard("queue_entries_apply_claim", "BEFORE INSERT", entries,
+               "NEW.kind IN ('apply_started', 'apply_finished') AND " + _claim("step") + " IS NOT 'apply'", "E19"),
+        _guard("queue_entries_apply_start_once", "BEFORE INSERT", entries,
+               "NEW.kind = 'apply_started' AND " + _since_claim("apply_started"), "E19"),
+        _guard("queue_entries_apply_finish_after_start", "BEFORE INSERT", entries,
+               "NEW.kind = 'apply_finished' AND (NOT " + _since_claim("apply_started") + " OR "
+               + _since_claim("apply_finished") + ")", "E19"),
+        _guard("queue_entries_no_lease_to_reopen", "BEFORE INSERT", entries,
+               "NEW.kind IN ('reopened', 'done') AND " + _PREV_STATE + " IN ('dispatched', 'running')", "E8"),
+        _guard("queue_entries_claim_needs_no_lease_row", "BEFORE INSERT", entries,
+               "NEW.kind = 'claimed' AND " + row, "E10"),
+        _guard("queue_entries_claim_after_not_before", "BEFORE INSERT", entries,
+               "NEW.kind = 'claimed' AND NEW.timestamp < coalesce((SELECT d.not_before FROM queue_entries d WHERE "
+               "d.task_id = NEW.task_id AND d.kind IN ('dispatch_failed', 'started') ORDER BY d.seq DESC LIMIT 1), '')",
+               "E10"),
+        _guard("queue_entries_renewal_matches_lease_row", "BEFORE INSERT", entries,
+               "NEW.kind = 'renewed' AND " + row + " AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.task_id = "
+               "NEW.task_id AND l.expires_at IN (NEW.expires_at, " + _LAST_EXPIRY + ") AND l.renewals IN ("
+               + _RENEWED_SO_FAR + ", " + _RENEWED_SO_FAR + " + 1))", "E18"),
+    ]
+
+
 def _queue_guards():
     guards = []
     entries = "queue_entries"
@@ -278,7 +338,7 @@ def _queue_guards():
     guards.append(_guard("queue_entries_attempt", "BEFORE INSERT", entries,
                          "NEW.kind = 'started' AND NEW.attempt IS NOT (SELECT count(*) FROM queue_entries q WHERE "
                          "q.task_id = NEW.task_id AND q.kind = 'started') + 1", "E17"))
-    return guards
+    return guards + _lease_consistency_guards()
 
 
 def _lease_guards():
@@ -294,7 +354,10 @@ def _lease_guards():
                "NEW.task_id IS NOT OLD.task_id OR NEW.lease_id IS NOT OLD.lease_id OR NEW.generation IS NOT "
                "OLD.generation OR NEW.step IS NOT OLD.step OR NEW.worker IS NOT OLD.worker OR NEW.worker_kind IS NOT "
                "OLD.worker_kind OR NEW.claimed_at IS NOT OLD.claimed_at OR NEW.expires_at <= OLD.expires_at OR "
-               "NEW.renewals <> OLD.renewals + 1", "E14"),
+               "NEW.renewals <> OLD.renewals + 1 OR " + _sec("NEW.expires_at") + " - " + _sec("OLD.expires_at")
+               + " > " + str(queue_records.MAX_TTL) + " OR NEW.expires_at < coalesce((SELECT x.expires_at FROM "
+               "queue_entries x WHERE x.task_id = NEW.task_id AND x.kind IN ('claimed', 'renewed') "
+               "ORDER BY x.seq DESC LIMIT 1), '')", "E14"),
         _guard("leases_slots_first", "BEFORE DELETE", "leases",
                "EXISTS (SELECT 1 FROM apply_slots s WHERE s.task_id = OLD.task_id)", "E15"),
         _guard("apply_slots_match_lease", "BEFORE INSERT", "apply_slots",
@@ -460,9 +523,15 @@ def fingerprint(conn):
     return _fingerprint_rows(rows)
 
 
+# The reviewed fingerprint of schema version 1, written out so that the value checked at open does not depend on the
+# builders above. A change to the DDL changes the generated value; `tests/test_store.py` fails until this literal is
+# updated on purpose, in the same change and with the schema review.
+PINNED_FINGERPRINT = "f3e50f596b501193939e6962570d3027dace358b5da1979429dcbbf2f40206e0"
+
+
 @functools.lru_cache(maxsize=1)
 def expected_fingerprint():
-    """The fingerprint the DDL in this code produces, computed once on a scratch in-memory database."""
+    """The fingerprint the DDL in this code produces now (a development check: the open uses PINNED_FINGERPRINT)."""
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         for sql in schema_statements():
@@ -569,10 +638,10 @@ def _verify_sidecars(path, snapshot, final):
     for suffix in _SIDECARS:
         sidecar = path + suffix
         now = _lstat(sidecar, required=False)  # a wide mode, link or foreign owner refuses here
-        if now is None:
-            continue
         before = snapshot[suffix]
-        if before is not None and (before.st_dev, before.st_ino) != (now.st_dev, now.st_ino):
+        if now is None and before is None:
+            continue
+        if now is None or (before is not None and (before.st_dev, before.st_ino) != (now.st_dev, now.st_ino)):
             if final:
                 raise ShitError(CONFINEMENT)
             raise _SidecarMoved
@@ -611,7 +680,7 @@ def _open_once(project, timeout, initialize, final):
         _require_wal(conn.execute("PRAGMA journal_mode = WAL").fetchone())
         conn.execute("PRAGMA synchronous = FULL")
         _check_settings(conn, timeout)
-        if fingerprint(conn) != expected_fingerprint():
+        if fingerprint(conn) != PINNED_FINGERPRINT:
             raise ShitError(FAILED_CLOSED)
         _verify_sidecars(path, snapshot, final)
         return conn
@@ -693,18 +762,47 @@ def connect(project, busy_timeout_ms=None):
     return _open(project, busy_timeout_ms, initialize=False)
 
 
+class AmbiguousCommit(ShitError):
+    """COMMIT raised and the connection is no longer in a transaction, so the write may or may not be durable.
+
+    The exit code is 8 with the usual fixed message. The connection is closed. A caller must open a new
+    connection and re-read the state before it repeats anything that is not idempotent."""
+
+    def __init__(self):
+        super().__init__(FAILED_CLOSED)
+
+
 def _abandon(conn):
     """Close a connection whose transaction state cannot be trusted, so nothing can reuse it."""
     with contextlib.suppress(Exception):
         conn.close()
 
 
+def _fail_transaction(conn, exc):
+    """Roll back after `exc` and raise the mapped error; close the connection if the rollback cannot be trusted."""
+    try:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        clean = not conn.in_transaction
+    except sqlite3.Error:
+        clean = False
+    if not clean:
+        _abandon(conn)
+        raise ShitError(FAILED_CLOSED) from None
+    if isinstance(exc, sqlite3.Error):
+        raise map_error(exc) from None
+    raise exc
+
+
 @contextlib.contextmanager
 def write_transaction(conn):
     """BEGIN IMMEDIATE, then commit on success or roll back on any exception (including KeyboardInterrupt).
 
-    If the rollback itself fails, or the connection is still inside a transaction afterwards, the connection
-    is closed and exit code 8 is raised: a caller never gets back a connection in an unknown state.
+    - A failed rollback, or a connection still in a transaction after it, closes the connection and raises exit 8.
+    - If COMMIT itself raises while the connection is still in its transaction, the commit did not happen: it is
+      rolled back and the error mapped (a busy store is exit 13).
+    - If COMMIT raises and the connection is no longer in a transaction, the outcome is unknown (the write may have
+      landed). The connection is closed and `AmbiguousCommit` (exit 8) is raised.
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -712,17 +810,13 @@ def write_transaction(conn):
         raise map_error(exc) from None
     try:
         yield conn
+    except BaseException as exc:
+        _fail_transaction(conn, exc)  # always raises
+        raise
+    try:
         conn.execute("COMMIT")
     except BaseException as exc:
-        try:
-            if conn.in_transaction:
-                conn.execute("ROLLBACK")
-            clean = not conn.in_transaction
-        except sqlite3.Error:
-            clean = False
-        if not clean:
-            _abandon(conn)
-            raise ShitError(FAILED_CLOSED) from None
-        if isinstance(exc, sqlite3.Error):
-            raise map_error(exc) from None
-        raise
+        if conn.in_transaction:
+            _fail_transaction(conn, exc)  # the commit did not happen
+        _abandon(conn)
+        raise AmbiguousCommit() from exc
