@@ -18,9 +18,10 @@ import os
 import re
 import stat
 
-from . import _cli, brief, config, evidence, queue, records
+from . import _cli, brief, config, evidence, queue, records, store_check
 from ._text import check_text, decode
 from .errors import (
+    BUSY,
     CONFINEMENT,
     FAILED_CLOSED,
     ILLEGAL_TRANSITION,
@@ -39,7 +40,7 @@ MAX_TASKS = 5000
 NEEDS_BRIEF = {"running", "review", "approved", "closed", "blocked", "failed"}
 NEEDS_REPORT = {"review", "approved", "closed"}
 NEEDS_DISPOSITION = {"approved", "closed"}
-PRIORITY = (CONFINEMENT, INPUT_LIMIT, REJECTED, FAILED_CLOSED, ILLEGAL_TRANSITION, PRECONDITION)
+PRIORITY = (CONFINEMENT, INPUT_LIMIT, REJECTED, FAILED_CLOSED, ILLEGAL_TRANSITION, PRECONDITION, BUSY)
 DISPOSITION_KEYS = {
     "schema", "schema_version", "id", "task_id", "created_at", "actor", "status", "question", "choice",
     "rationale", "supersedes_id",
@@ -277,6 +278,7 @@ def run_check(repo, task=None):
             raise ShitError(CONFINEMENT)
         failures = _Failures()
         queue_line = None
+        store_lines = []  # set below, once the project is read
         ids, bad_names = _task_ids(project)
         if bad_names:
             failures.add(REJECTED, "tasks", "unexpected entry")
@@ -300,6 +302,10 @@ def run_check(repo, task=None):
         findings, queue_line = queue.diagnose(project, events_ok)  # read-only: the queue state and any queue pending record
         for code, text in findings:
             failures.add(code, "queue", text)
+        store_findings, store_lines, store_warnings = store_check.diagnose(project)  # read-only, from the SQLite store
+        for code, text in store_findings:
+            failures.add(code, "store", text)
+        failures.warnings.extend(store_warnings)
     finally:
         project.close()
         os.close(repo_fd)
@@ -307,6 +313,7 @@ def run_check(repo, task=None):
     lines = [line for _, line in failures.items] + failures.warnings
     if queue_line:
         lines.append(queue_line)
+    lines.extend(store_lines)
     lines.append(f"check: {'failed' if code else 'ok'} ({len(ids)} task{'s' if len(ids) != 1 else ''})")
     return code, lines
 

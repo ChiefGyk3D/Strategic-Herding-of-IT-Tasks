@@ -19,7 +19,7 @@ to the caller, who can ask `store.queue_entry_for_key` (the reconciling read) wi
 
 import secrets
 
-from . import commands, store, store_tasks
+from . import audit_export, commands, store, store_tasks
 from . import task as task_mod
 
 _ATTEMPTS = 3
@@ -73,9 +73,11 @@ def _run(project, call, now, config, busy_timeout_ms):
 
     def run():
         for attempt in range(_ATTEMPTS):
-            conn = store_tasks._connect(project, True, busy_timeout_ms)
+            conn = store_tasks._connect(project, True, busy_timeout_ms, write=True)
             try:
-                return call(conn, now, key, _meter(project, conn))
+                result = call(conn, now, key, _meter(project, conn))
+                audit_export.after_commit(project, conn)
+                return result
             except store.AmbiguousCommit:
                 if attempt == _ATTEMPTS - 1:
                     raise

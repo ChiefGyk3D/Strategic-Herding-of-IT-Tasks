@@ -20,7 +20,7 @@ For privacy scan findings, output contains only the file path and line number. I
 | 5 | confinement_violation | `confinement violation` | A path escapes its root or encounters a symlink, hard link, FIFO, socket, or device file. |
 | 6 | privacy_hit | `privacy scan hit` | A privacy rule matched; only the file path and line number may be reported. |
 | 7 | input_limit | `input exceeds limit` | A record exceeds the byte-size or nesting-depth limit, or a scan, listing or lock hold exceeds its bound ([bounded-work.md](bounded-work.md)). |
-| 8 | hook_failed_closed | `hook verification failed` | A hook could not verify its required state and failed closed. For the queue this includes an interrupted queue commit that cannot be proven or a broken event log; the operator procedure is in docs/queue-spec.md, Q-REC-02. For the SQLite store it also covers an unsupported SQLite or Python version, a corrupt or unreadable database, a wrong application id or schema version, a schema fingerprint mismatch and an append-only or no-delete trigger firing, an error at COMMIT whose outcome cannot be known, or a store file that exists but is not a complete store (docs/store.md). |
+| 8 | hook_failed_closed | `hook verification failed` | A hook could not verify its required state and failed closed. For the queue this includes an interrupted queue commit that cannot be proven or a broken event log; the operator procedure is in docs/queue-spec.md, Q-REC-02. For the SQLite store it also covers an unsupported SQLite or Python version, a corrupt or unreadable database, a wrong application id or schema version, a schema fingerprint mismatch and an append-only or no-delete trigger firing, an error at COMMIT whose outcome cannot be known, or a store file that exists but is not a complete store (docs/store.md). It also covers the audit export (docs/audit-export.md): a database older than or different from its export, a missing export when a write is attempted, an export that does not verify. |
 | 9 | precondition_missing | `precondition missing` | A required record, file, directory, or prior state was not found. |
 | 10 | human_approval_required | `human approval required` | The operation requires an explicit human approval that is absent. |
 | 11 | tool_unavailable | `subprocess or tool unavailable` | An allowed subprocess or required local tool is unavailable or cannot start. |
@@ -86,8 +86,16 @@ For privacy scan findings, output contains only the file path and line number. I
 | `check` | 4 | At least one lifecycle history contains an illegal transition. |
 | `check` | 5 | At least one path or file type violated confinement. |
 | `check` | 7 | At least one record exceeded a size or depth limit, or `on_exceed = "fail"` limits in `config.toml` were exceeded. |
-| `check` | 8 | The queue state does not verify, or a queue pending record is present (the check only reports it, it never recovers). |
+| `check` | 8 | The queue state does not verify, or a queue pending record is present (the check only reports it, it never recovers). In the SQLite store: an invariant does not hold, or the audit export is missing, damaged, or does not match the database (docs/audit-export.md). |
 | `check` | 9 | A requested check target was not found. |
+| `check` | 13 | The SQLite store could not be read within its lock wait (only when nothing worse was found). |
+| `audit` | 0 | The export was written or was current, or the export verified. |
+| `audit` | 2 | Audit arguments are invalid. |
+| `audit` | 5 | The export file, or the database, violated confinement. |
+| `audit` | 7 | The export is over its size limit. |
+| `audit` | 8 | The export does not verify, or the database is older than, different from or has lost its export (replace the export only with `--accept-database`). |
+| `audit` | 9 | The store, the repository or the export file was not found. |
+| `audit` | 13 | The store was busy. |
 | `doctor` | 0 | All local readiness checks passed. |
 | `doctor` | 1 | An unexpected internal failure occurred. |
 | `doctor` | 2 | Doctor arguments are invalid. |
