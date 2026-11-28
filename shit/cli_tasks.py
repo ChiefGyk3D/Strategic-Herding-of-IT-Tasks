@@ -23,10 +23,21 @@ import os
 import sys
 from pathlib import Path
 
-from . import artifacts, audit, backend, backend_name, check, commands, store
+from . import (
+    artifacts,
+    audit,
+    backend,
+    backend_name,
+    check,
+    commands,
+    file_backend_state,
+    store,
+)
 from . import project as project_mod
 from .errors import INTERNAL, MESSAGES, OK, PRECONDITION, USAGE, ShitError
 from .lifecycle import ACTORS, STATES
+
+FILE_BACKEND_ARTIFACTS = file_backend_state.FILE_BACKEND_ARTIFACTS
 
 
 class _Parser(argparse.ArgumentParser):
@@ -148,10 +159,7 @@ def _init(ns):
             raise ShitError(USAGE)
         selected = ns.backend or configured.name
         if selected == backend_name.SQLITE:
-            if not proj.exists(store.DB_NAME) and any(
-                proj.exists(name)
-                for name in ("events.jsonl", "events.chain", "queue.jsonl", "queue.chain")
-            ):
+            if not proj.exists(store.DB_NAME) and file_backend_state.present(proj):
                 raise ShitError(PRECONDITION)
             store.init_store(proj, configured.busy_timeout_ms)
     finally:

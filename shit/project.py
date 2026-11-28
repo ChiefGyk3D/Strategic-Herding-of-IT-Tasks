@@ -259,6 +259,44 @@ class Project:
             os.close(fd)
             raise
 
+    def check_repo_target(self, parts):
+        """Refuse an apply target whose existing repository path is aliased or not a plain path.
+
+        Existing directory positions must be real directories. An existing final file must be regular and have one
+        link. A missing component ends the walk: every later component is necessarily a non-existing tail.
+        """
+        try:
+            fd = os.open(self.repo, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC)
+        except OSError as exc:
+            raise _os_error(exc) from None
+        try:
+            for index, part in enumerate(parts):
+                self.check_deadline()
+                try:
+                    st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return
+                except OSError as exc:
+                    raise _os_error(exc) from None
+                final = index == len(parts) - 1
+                if final:
+                    if stat.S_ISREG(st.st_mode):
+                        if st.st_nlink != 1:
+                            raise ShitError(CONFINEMENT)
+                    elif not stat.S_ISDIR(st.st_mode):
+                        raise ShitError(CONFINEMENT)
+                    return
+                if not stat.S_ISDIR(st.st_mode):
+                    raise ShitError(CONFINEMENT)
+                try:
+                    nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | _NOFOLLOW | _CLOEXEC, dir_fd=fd)
+                except OSError as exc:
+                    raise _os_error(exc) from None
+                os.close(fd)
+                fd = nxt
+        finally:
+            self._close(fd)
+
     def _stat_leaf(self, dirfd, name, links=1):
         """lstat the leaf: None when absent, else its stat result after type and link checks."""
         try:

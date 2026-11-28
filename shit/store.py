@@ -2286,7 +2286,7 @@ def _target_or_reject(target):
     return key
 
 
-def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, key=None):
+def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, key=None, project=None):
     """Mark the apply step started (once per attempt) and take a slot for every target, all or none (Q-SER-02).
 
     The entry is written first and the slots after it; the lease row has existed since the claim."""
@@ -2305,6 +2305,9 @@ def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, k
         queued, lease = _presented(conn, presented)
         if queued["state"] != "running" or lease["step"] != "apply" or queued["apply_phase"] is not None:
             raise ShitError(ILLEGAL_TRANSITION)
+        if project is not None:
+            for target in targets:
+                project.check_repo_target(target.split("/"))
         held_targets = [row[0] for row in conn.execute("SELECT target FROM apply_slots").fetchall()]
         for target in wanted:
             if any(held == target or held.startswith(target + "/") or target.startswith(held + "/")

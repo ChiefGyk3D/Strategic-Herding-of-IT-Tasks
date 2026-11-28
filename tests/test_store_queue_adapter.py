@@ -118,6 +118,56 @@ class FlowTests(AdapterCase):
         self.assertEqual(code_of(store_queue.status, self.proj, now=self.tick(), config={"nope": 1}), errors.REJECTED)
         self.consistent()
 
+    def test_apply_targets_refuse_existing_symlinks_and_hard_links(self):
+        real = self.repo / "real"
+        real.mkdir()
+        target = real / "output.txt"
+        target.write_text("x")
+        (self.repo / "file-link").symlink_to(target)
+        (self.repo / "dir-link").symlink_to(real, target_is_directory=True)
+        (self.repo / "inside-link").symlink_to("real", target_is_directory=True)
+        (self.repo / "outside-link").symlink_to(self.repo.parent, target_is_directory=True)
+        (self.repo / "chain-link").symlink_to("inside-link", target_is_directory=True)
+        (self.repo / "hard-link").hardlink_to(target)
+
+        cases = (
+            "file-link",
+            "dir-link/output.txt",
+            "inside-link/output.txt",
+            "outside-link/output.txt",
+            "chain-link/output.txt",
+            "real/output.txt",
+            "hard-link",
+        )
+        for number, path in enumerate(cases):
+            with self.subTest(path=path):
+                task_id = f"apply-{number}"
+                self.task(task_id)
+                request = {"task_id": task_id, "step": "apply", "worker": "w1", "worker_kind": "human"}
+                lease = store_queue.claim(self.proj, request, now=self.tick())
+                store_queue.start(self.proj, self.present(lease), now=self.tick())
+                self.assertEqual(
+                    code_of(store_queue.apply_start, self.proj, self.present(lease), [path], now=self.tick()),
+                    errors.CONFINEMENT,
+                )
+
+    def test_same_physical_target_aliases_cannot_take_two_apply_slots(self):
+        real = self.repo / "real"
+        real.mkdir()
+        (self.repo / "alias").symlink_to(real, target_is_directory=True)
+        leases = []
+        for task_id in ("physical-a", "physical-b"):
+            self.task(task_id)
+            request = {"task_id": task_id, "step": "apply", "worker": "w1", "worker_kind": "human"}
+            lease = store_queue.claim(self.proj, request, now=self.tick())
+            store_queue.start(self.proj, self.present(lease), now=self.tick())
+            leases.append(lease)
+        store_queue.apply_start(self.proj, self.present(leases[0]), ["real/new.txt"], now=self.tick())
+        self.assertEqual(
+            code_of(store_queue.apply_start, self.proj, self.present(leases[1]), ["alias/new.txt"], now=self.tick()),
+            errors.CONFINEMENT,
+        )
+
 
 class RecordRulesTests(AdapterCase):
     def record(self, task_id, kind, rid, **kwargs):

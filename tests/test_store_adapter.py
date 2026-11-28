@@ -17,7 +17,7 @@ from pathlib import Path
 
 from _bootstrap import ROOT, make_git_dir
 
-from shit import commands, errors, records, store, store_tasks
+from shit import check, commands, errors, records, store, store_tasks
 from shit import task as task_mod
 from shit.errors import ShitError
 from shit.log import EventLog
@@ -276,8 +276,8 @@ class BodyTests(StoreCase):
         orphan = (self.shit / "evidence" / "ev-1.json").read_bytes()
         self.assertIsNone(store.get_record(self.conn(), "evidence", "ev-1"))
         self.assertEqual(self.count_rows("events"), 1)
-        self.consistent()  # an unindexed body is not an inconsistency
-        result = self.evidence(now=T2)  # a retry at another time adopts the body that is on disk
+        self.assertEqual(store_tasks.verify_bodies(self.proj, self.conn(), include_orphans=True), ["body_orphan"])
+        result = self.evidence(now=T1)  # an exact retry adopts the body that is on disk
         self.assertEqual(result["created_at"], T1)
         self.assertEqual((self.shit / "evidence" / "ev-1.json").read_bytes(), orphan)
         self.assertEqual(store.record_event(self.conn(), "evidence", "ev-1")["timestamp"], T1)
@@ -296,6 +296,23 @@ class BodyTests(StoreCase):
         self.proj.write_atomic("evidence/ev-1.json", b"not json")
         self.assertEqual(code_of(self.evidence, "ev-1", "t1", T3), errors.REJECTED)
         self.assertEqual((self.count_rows("events"), self.count_rows("records")), before)
+
+    def test_an_orphan_body_with_different_submitted_content_is_refused_and_reported(self):
+        self.make()
+        self.proj.ensure_dir("decisions")
+        orphan = commands.artifacts.dump("decision", commands._base(
+            "decision", "d-1", "t1", "human", T1, status="accepted", question="q", choice="old",
+            rationale="old"))
+        self.proj.write_atomic("decisions/d-1.json", orphan)
+        before = (self.count_rows("events"), self.count_rows("records"))
+        code = code_of(store_tasks.add_decision, self.proj, task_id="t1", decision_id="d-1", status="rejected",
+                       question="q", choice="new", rationale="new", actor="human", now=T2)
+        self.assertEqual(code, errors.REJECTED)
+        self.assertEqual((self.count_rows("events"), self.count_rows("records")), before)
+        self.assertEqual((self.shit / "decisions" / "d-1.json").read_bytes(), orphan)
+        check_code, lines = check.run_check(self.repo)
+        self.assertEqual(check_code, errors.FAILED_CLOSED)
+        self.assertIn("store: record body_orphan does not verify", lines)
 
     def test_an_orphan_task_body_with_the_same_content_is_adopted_and_another_is_refused(self):
         def data_for(title):
@@ -493,7 +510,7 @@ class CrashTests(StoreCase):
                 self.assertIsNone(store.get_record(self.conn(), "evidence", "ev-1"))
                 self.assertEqual(self.count_rows("events"), 1)
                 self.consistent()
-                self.evidence(now=T2)
+                self.evidence(now=T1)
                 self.assertIsNotNone(store.get_record(self.conn(), "evidence", "ev-1"))
                 self.assertEqual(self.count_rows("events"), 2)
                 self.consistent()

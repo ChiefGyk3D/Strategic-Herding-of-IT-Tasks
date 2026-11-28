@@ -100,14 +100,28 @@ def _check_published(project, conn, kind, record_id):
     _read_body(project, kind, record_id, index)
 
 
-def verify_bodies(project, conn):
+def verify_bodies(project, conn, *, include_orphans=False):
     """Read-only: names of the problems between the records index and the body files.
 
     `body_missing` (no file under a recorded name), `body_unreadable` (a symlink, a second link or a special file there)
     and `body_differs_from_index` (bytes that do not match the digest).
     A file with no index row is not a problem: it is what a crash between the body and the transaction leaves."""
     found = set()
-    for row in store.list_records(conn):
+    rows = store.list_records(conn)
+    if include_orphans:
+        indexed = {(row["kind"], row["record_id"]) for row in rows}
+        for kind in ("task", *commands.DIRS):
+            try:
+                names = project.list_dir(_directory(kind))
+            except ShitError as exc:
+                if exc.code == PRECONDITION:
+                    continue
+                raise
+            for name in names:
+                record_id = name[:-5] if name.endswith(".json") else ""
+                if records.SLUG.fullmatch(record_id) and (kind, record_id) not in indexed:
+                    found.add("body_orphan")
+    for row in rows:
         try:
             data = project.read(_body_path(row["kind"], row["record_id"]), limit=_MAX_BODY)
         except ShitError as exc:
@@ -275,12 +289,9 @@ def _add(project, kind, record, check, busy_timeout_ms):
             if store.get_record(conn, kind, record_id) is not None:
                 raise ShitError(USAGE)
             existing = _publish(project, kind, record_id, data)
-            current = record
-            if existing != data:
-                # A crash left this body without its index row: complete it from the file on disk.
-                current = artifacts.load(kind, existing)
-                if (current["task_id"], current["actor"]) != (task_id, record["actor"]):
-                    raise ShitError(REJECTED)
+            if _digest(existing) != _digest(data):
+                raise ShitError(REJECTED)
+            current = artifacts.load(kind, existing)
             sha256, size = _digest(existing)
             _fault("body-published")
             store.add_record(conn, kind, current, sha256, size, check=lambda row: check(conn, row, current))
