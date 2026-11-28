@@ -722,6 +722,121 @@ class NetworkDenial(unittest.TestCase):
             self.assertTrue(imported_roots(src) & {"socket", "urllib", "subprocess"}, src)
 
 
+    def test_nothing_under_the_package_can_launch_a_process(self):
+        """H-29f every file under shit/ at any depth is Python and none launches a process, in any spelling."""
+        package = ROOT / "shit"
+        others = sorted(
+            p.relative_to(package).as_posix()
+            for p in package.rglob("*")
+            if p.is_file() and p.suffix != ".py" and "__pycache__" not in p.parts
+        )
+        self.assertEqual(others, [], "a file that is not Python under shit/ is never scanned")
+        files = sorted(package.rglob("*.py"))
+        self.assertGreaterEqual(len(files), 10)
+        for path in files:
+            self.assertEqual(process_launch_uses(path.read_text()), set(), path.relative_to(ROOT).as_posix())
+            self.assertEqual(os_surface_findings(path.read_text()), set(), path.relative_to(ROOT).as_posix())
+        # Outside the package the only program that may launch a process is named here, exactly. A new script
+        # that launches one fails this test until a person adds it with a reason.
+        launchers = {"refresh.py": "regenerates the starter set", "threads_run.py": "runs a review-thread plan with gh"}
+        for path in sorted((ROOT / "scripts").glob("*.py")):
+            if process_launch_uses(path.read_text()):
+                self.assertIn(path.name, launchers, path.name)
+
+    def test_process_launch_scan_bites(self):
+        """H-29g the process-launch scan reports every spelling: os calls, aliases, dynamic imports, eval."""
+        bad = (
+            "import os\nos.system('true')", "import os\nos.popen('true')", "import os\nos.execv('/bin/true', [])",
+            "import os\nos.execvp('true', [])", "import os\nos.spawnl(0, '/bin/true')", "import os\nos.fork()",
+            "import os\nos.posix_spawn('/bin/true', [], {})", "import os as o\no.system('true')",
+            "import os as o\nf = o.popen", "from os import system", "from os import system as s",
+            "from os import path, execv", "import posix\nposix.system('true')", "import posix\nposix.fork()",
+            "from posix import fork", "import pty", "import importlib", "from importlib import import_module",
+            "__import__('sub' + 'process')", "eval('1')", "exec('1')", "import runpy", "import _posixsubprocess",
+            "import subprocess", "from subprocess import run", "import multiprocessing", "import ctypes",
+            "import os\ngetattr(os, 'sys' + 'tem')('true')", "import os\nx = os\nx.system('true')",
+            "import os\nos.__dict__['sys' + 'tem']('id')", "import os\nvars(os)['system']('id')",
+            "import os\nobject.__getattribute__(os, 'system')('id')", "import os\nglobals()['os'].system('id')",
+            "import sys\nsys.modules['os'].system('id')",
+            "import builtins\nbuiltins.__import__('subprocess').run(['/bin/true'])",
+            "import builtins\nbuiltins.exec('import os; os.system(\"id\")')", "import builtins",
+            "import sys\ngetattr(sys, 'modules')['os'].system('id')", "import sys as s\ngetattr(s, 'mod' + 'ules')",
+            "import sys\nm = sys.modules", "from sys import modules", "import sys as s\ns.modules['os']",
+            "().__class__.__bases__[0].__subclasses__()", "x.__class__.__mro__", "f.__code__", "f.__closure__",
+            "import types", "import inspect", "import gc\ngc.get_objects()", "from types import FunctionType",
+            "import marshal", "x = o.__reduce__()",
+            "import pickle\npickle.loads(b\"cos\\nsystem\\n(S'id'\\ntR.\")", "import _pickle", "from pickle import loads",
+            "import shelve", "import dill", "import cloudpickle", "import copyreg", "import codeop", "import cffi",
+            "import zipimport", "import pkgutil\npkgutil.get_data('a', 'b')", "import yaml\nyaml.load('x')",
+            "from copyreg import reduce", "import importlib.util", "from runpy import run_path", "import pickle as p", "obj.__import__('os')", "mod.eval('1')", "mod.exec('1')",
+            "import json\ngetattr(json, 'loads')", "__builtins__",
+            "import functools\ngetattr(functools, 'x')", "from operator import attrgetter",
+            "import operator\noperator.attrgetter('system')(__import__('os'))", "import os\nlocals()['os']",
+            "import os\nos.__getattribute__('system')", "compile('1', 'f', 'eval')",
+        )
+        for src in bad:
+            with self.subTest(src=src):
+                self.assertTrue(process_launch_uses(src), src)
+        good = ("import os\nos.path.join('a')", "import os\nos.path.realpath(os.fspath('a'))",
+                "import os\nx = os.path.isabs('a') and os.path.normpath('b')", "import os\nos.path.commonpath(['a'])",
+                "import os\nos.path.abspath('a')", "from os import fspath, sep", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
+                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nold = os.umask(0o77)\nos.readlink('/proc/self/fd/3')", "import re\nre.compile('x')", "import hashlib",
+                "import sys\nsys.stdout.write('x')", "x = type(1) is int\nsuper().__init__()",
+                "import json\nx = json.dumps({})", "import sqlite3", "import hashlib\nimport errno\nimport stat")
+        for src in good:
+            with self.subTest(src=src):
+                self.assertEqual(process_launch_uses(src), set(), src)
+
+
+    def test_os_module_object_never_escapes_in_the_package(self):
+        """H-29h the os module object is only ever used through an allowlisted attribute of the filesystem."""
+        bad = (
+            "import os\na = [os]\na[0].system('id')", "import os\n(o,) = (os,)\no.system('id')",
+            "import os\nf = (lambda: os)()\nf.system('id')", "import os\nx = os", "import os\nx = {'k': os}",
+            "import os\nprint(os)", "import os\ndef f():\n    return os", "import os\nys = [os for _ in range(1)]",
+            "import os\nz = os if True else None", "import os\nos.system('id')", "import os\nos.popen('id')",
+            "import os\nos.execv('/bin/id', [])", "import os\nos.__dict__['system']('id')", "import os as o",
+            "import os\nimport posix", "import nt", "from os import *", "from os import system", "from os import path as p",
+            "from os.path import join", "from posix import fork", "import os\ndef f(os):\n    return os.system('id')",
+            "import os\ngetattr(os, 'sys' + 'tem')('id')", "import os\ngetattr(os, 'system')('id')",
+            "import os\nos = None", "import os\nfor os in []:\n    pass", "import os\nx = os,\n",
+            "import os\nmap(os.system, ['id'])", "import os\nsorted([1], key=os)", "import os\nos[0]",
+            "import os\nclass C:\n    m = os", "import os\nos.path.os.system('printf x')",
+            "import os\nos.path.sys.modules", "import os\nos.path.genericpath", "import os\nos.path.os.execv('/bin/true', [])",
+            "import os\nx = os.path", "import os\nos.path", "import os\nf = os.path.join", "import os\nos.path.join.__globals__",
+            "import os\nos.path.exists('x')", "import os\nos.path.__dict__", "import posixpath\nposixpath.os.system('id')",
+            "import genericpath\ngenericpath.os.system('id')", "import ntpath", "from posixpath import os",
+            "from os import path\npath.os.execv('/bin/true', ['true'])", "from os import path", "import os.path",
+            "import os\nmap(os.path.join, ['a'])", "import os\nos.path.join.__call__('a')", "import os\nwith os as o:\n    pass",
+        )
+        for src in bad:
+            with self.subTest(src=src):
+                self.assertTrue(os_surface_findings(src), src)
+        good = ("import os\nos.path.join('a')", "import os\nfd = os.open('x', os.O_RDONLY | os.O_NOFOLLOW)",
+                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nos.close(3)\nos.fstat(3)",
+                "from os import sep", "import os\nx = os.environ.get('A')", "import re\nos2 = re.compile('x')",
+                "import os\nwith os.fdopen(3, 'rb') as fh:\n    fh.read()", "x = 1")
+        for src in good:
+            with self.subTest(src=src):
+                self.assertEqual(os_surface_findings(src), set(), src)
+
+    def test_the_os_allowlist_has_no_process_launcher_and_is_all_used(self):
+        """H-29i the allowlist names no launching function and every name on it is used somewhere in the package."""
+        self.assertFalse({a for a in OS_ALLOWED_ATTRS if _launches(a)})
+        used = set()
+        for path in (ROOT / "shit").rglob("*.py"):
+            used |= {n.attr for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Attribute)
+                     and isinstance(n.value, ast.Name) and n.value.id == "os"}
+        self.assertEqual(OS_ALLOWED_ATTRS - used, set(), "an allowlisted name the package does not use")
+        used_path = set()
+        for path in (ROOT / "shit").rglob("*.py"):
+            used_path |= {n.attr for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Attribute)
+                          and isinstance(n.value, ast.Attribute) and n.value.attr == "path"
+                          and isinstance(n.value.value, ast.Name) and n.value.value.id == "os"}
+        self.assertEqual(OS_PATH_ALLOWED - used_path, set(), "an allowlisted path function the package does not use")
+        self.assertFalse(OS_PATH_ALLOWED & {"os", "sys", "genericpath", "stat", "__dict__"})
+
+
 def imported_roots(source):
     found = set()
     for node in ast.walk(ast.parse(source)):
@@ -729,6 +844,144 @@ def imported_roots(source):
             found |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module:
             found.add(node.module.split(".")[0])
+    return found
+
+
+LAUNCH_MODULES = {"subprocess", "_posixsubprocess", "multiprocessing", "pty", "importlib", "runpy", "ctypes", "_ctypes",
+                  "pdb", "code", "idlelib", "builtins", "__builtin__", "types", "inspect", "gc", "marshal", "imp",
+                  # deserializers that can import and call anything while loading, and other code loaders
+                  "pickle", "cPickle", "_pickle", "pickletools", "shelve", "dill", "cloudpickle", "copyreg", "codeop",
+                  "cffi", "zipimport", "pkgutil", "yaml", "compileall", "py_compile", "zipapp", "pydoc", "timeit",
+                  "doctest", "trace", "cProfile", "profile", "bdb"}
+OS_MODULES = {"os", "posix", "nt"}
+LAUNCH_OS_ATTRS = ("system", "popen", "fork", "forkpty", "startfile", "posix_spawn", "posix_spawnp", "plock")
+LAUNCH_OS_PREFIXES = ("exec", "spawn")
+DYNAMIC_NAMES = {"__import__", "eval", "exec", "vars", "globals", "locals", "compile", "breakpoint", "__builtins__", "builtins"}
+# Reflection that reaches a module's contents without naming them: never needed by the package.
+REFLECTION_ATTRS = {"__dict__", "__getattribute__", "__getattr__", "__globals__", "__builtins__", "__subclasses__",
+                    "__loader__", "__spec__", "attrgetter", "methodcaller", "__import__", "exec", "eval", "breakpoint",
+                    "vars", "globals", "locals", "modules", "__class__", "__bases__", "__base__", "__mro__",
+                    "__code__", "__closure__", "__func__", "__self__", "__reduce__", "__reduce_ex__"}
+
+
+def _launches(attr):
+    return attr in LAUNCH_OS_ATTRS or attr.startswith(LAUNCH_OS_PREFIXES)
+
+
+def process_launch_uses(source):
+    """Spellings in `source` that can start a process or import code dynamically (empty set when none).
+
+    Covers imports of process modules (any depth, aliased or not), `os`/`posix` calls and references such as
+    system, popen, exec* and spawn* (also through `import os as o` and `from os import system`), `__import__`,
+    `eval` and `exec`, and `getattr` on a module name with a computed attribute.
+    """
+    found = set()
+    aliases = set(OS_MODULES)
+    tree = ast.parse(source)
+    modules = {(a.asname or a.name).split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in LAUNCH_MODULES:
+                    found.add(f"import {a.name}")
+                if a.name.split(".")[0] in OS_MODULES and a.asname:
+                    aliases.add(a.asname)
+        elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name) and node.value.id in aliases:
+            aliases |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            root = node.module.split(".")[0]
+            found |= {f"from {node.module} import {a.name}" for a in node.names
+                      if a.name in REFLECTION_ATTRS or a.name in DYNAMIC_NAMES}
+            if root in LAUNCH_MODULES:
+                found.add(f"from {node.module}")
+            if root == "operator":
+                found |= {f"from operator import {a.name}" for a in node.names if a.name in REFLECTION_ATTRS}
+            if root in OS_MODULES:
+                found |= {f"from {node.module} import {a.name}" for a in node.names if _launches(a.name)}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in aliases
+                and _launches(node.attr)):
+            found.add(f"{node.value.id}.{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr in REFLECTION_ATTRS:
+            found.add(f"reflection .{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr == "modules" and isinstance(node.value, ast.Name) \
+                and node.value.id == "sys":
+            found.add("sys.modules")
+        elif isinstance(node, ast.Name) and node.id in DYNAMIC_NAMES:
+            found.add(node.id)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            target = node.args[0] if node.args else None
+            name = node.args[1] if len(node.args) > 1 else None
+            literal = isinstance(name, ast.Constant) and isinstance(name.value, str)
+            if isinstance(target, ast.Name) and target.id in aliases and not (literal and not _launches(name.value)):
+                found.add("getattr on a process-capable module")
+            elif isinstance(target, ast.Name) and target.id in modules and target.id not in aliases:
+                found.add("getattr on an imported module")
+    return found
+
+
+# The only `os` attributes the package uses, computed from the tree and reviewed: file-descriptor and path
+# primitives, none of which starts a process. Anything else on `os`, or `os` used as a value, is a finding.
+OS_ALLOWED_ATTRS = frozenset({
+    "O_APPEND", "O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK", "O_RDONLY", "O_RDWR",
+    "O_WRONLY", "close", "dup", "environ", "fchmod", "fdopen", "fspath", "fstat", "fsync", "getcwd", "geteuid",
+    "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "readlink", "rename", "scandir", "sep", "stat",
+    "umask", "unlink", "write",
+})
+
+# `os.path` is a module (it re-exports `os` and `sys`), so it is never a safe value itself: it may only be the base
+# of a call to one of these path functions, all used by the package and none able to reach another module.
+OS_PATH_ALLOWED = frozenset({"abspath", "commonpath", "isabs", "join", "normpath", "realpath"})
+# Modules that re-export `os` (posixpath.os, genericpath.os, ntpath.os): never imported inside the package.
+OS_REEXPORT_MODULES = {"posixpath", "genericpath", "ntpath", "macpath"}
+
+
+def _path_call_ok(path_attr, parent):
+    """`os.path` only as the base of a call to an allowlisted path function: os.path.join(...)."""
+    func = parent.get(path_attr)
+    call = parent.get(func)
+    return (isinstance(func, ast.Attribute) and func.value is path_attr and func.attr in OS_PATH_ALLOWED
+            and isinstance(call, ast.Call) and call.func is func)
+
+
+def os_surface_findings(source):
+    """Conservative rule: `os`, `posix` and `nt` may appear only as `import os`, `from os import <allowed>`, or the
+    value of an attribute access whose attribute is in OS_ALLOWED_ATTRS (or `getattr(os, "<allowed>", ...)`).
+
+    Any other use of the module object (assignment, container element, call argument, return, lambda or
+    comprehension capture, subscript, alias, star import, a parameter named like it) is a finding.
+    """
+    tree = ast.parse(source)
+    parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in OS_MODULES and (a.name != "os" or a.asname):
+                    found.add(f"import {a.name} as {a.asname}")
+                if a.name.split(".")[0] in OS_REEXPORT_MODULES:
+                    found.add(f"import {a.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in OS_REEXPORT_MODULES:
+            found.add(f"from {node.module}")
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in OS_MODULES:
+            if node.module != "os":
+                found.add(f"from {node.module}")
+            # `path` is a module object: `from os import path` is refused, only functions and constants come in
+            found |= {f"from os import {a.name}" for a in node.names
+                      if a.name not in OS_ALLOWED_ATTRS - {"path"} or a.asname}
+        elif isinstance(node, ast.arg) and node.arg in OS_MODULES:
+            found.add(f"parameter {node.arg}")
+        elif isinstance(node, ast.Name) and node.id in OS_MODULES:
+            up = parent.get(node)
+            attribute_ok = (isinstance(up, ast.Attribute) and up.value is node and up.attr in OS_ALLOWED_ATTRS
+                            and (up.attr != "path" or _path_call_ok(up, parent)))
+            call_ok = (
+                isinstance(up, ast.Call) and isinstance(up.func, ast.Name) and up.func.id == "getattr"
+                and up.args and up.args[0] is node and len(up.args) >= 2 and not up.keywords
+                and isinstance(up.args[1], ast.Constant) and up.args[1].value in OS_ALLOWED_ATTRS - {"path"}
+            )
+            if not isinstance(node.ctx, ast.Load) or not (attribute_ok or call_ok):
+                found.add(f"{node.id} used as a value or with a disallowed attribute (line {node.lineno})")
     return found
 
 
