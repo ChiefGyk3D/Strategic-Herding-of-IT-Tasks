@@ -15,6 +15,7 @@ is rejected. Errors are fixed strings and never echo the rejected value.
 import re
 import tomllib
 
+from shit import backend_name
 from shit._text import check_size, check_text, decode, has_placeholder, read_bounded
 from shit.errors import rejected
 
@@ -23,17 +24,28 @@ MAX_BYTES = 8192
 _SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}")
 # Host name of the code host (for example a self-hosted GitHub Enterprise), no scheme, no port, no path.
-_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?){0,8}")
+_HOST = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?){0,8}"
+)
 _LOG = re.compile(r"\.shit/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){0,3}")
 _CONTEXT_WINDOWS = (32768, 65536)
 _MAX_TEXT = 500
 _MAX_ROLES = 16
 _MAX_LIMIT = 10_000_000
 _MODES = ("warn", "fail")
+_BACKENDS = ("files", backend_name.SQLITE)
 
 # Event kinds the yardstick report (shit/yardstick.py) can weight, in docs/schemas.md event order.
-WEIGHT_KEYS = ("task_created", "state_transition", "brief_recorded", "report_recorded", "decision_recorded",
-               "evidence_recorded", "review_recorded", "command_failed")
+WEIGHT_KEYS = (
+    "task_created",
+    "state_transition",
+    "brief_recorded",
+    "report_recorded",
+    "decision_recorded",
+    "evidence_recorded",
+    "review_recorded",
+    "command_failed",
+)
 _MAX_WEIGHT = 1000
 
 # table -> {key: kind}. Kinds: "int1" exact schema version, "text" bounded string, "slug" lowercase slug,
@@ -50,9 +62,13 @@ SCHEMA = {
     "log": {"file": "log"},
     "privacy": {"scan": "bool"},
     "local_model": {"context_tokens": "window"},
-    "limits": {"instruction_max_bytes": "limit", "listed_roles_max": "limit", "on_exceed": "mode"},
+    "limits": {
+        "instruction_max_bytes": "limit",
+        "listed_roles_max": "limit",
+        "on_exceed": "mode",
+    },
     "yardstick": {name: "weight" for name in WEIGHT_KEYS},
-    "store": {"busy_timeout_ms": "timeout"},
+    "store": {"backend": "backend", "busy_timeout_ms": "timeout"},
 }
 REQUIRED = {
     "": ["schema_version"],
@@ -69,7 +85,10 @@ DEFAULTS = {
     "privacy": {"scan": True},
     "limits": {"on_exceed": "warn"},
     "yardstick": {name: 1 for name in WEIGHT_KEYS},
-    "store": {"busy_timeout_ms": 60000},  # equals store.DEFAULT_BUSY_TIMEOUT_MS (a test keeps them equal)
+    "store": {
+        "backend": "files",
+        "busy_timeout_ms": 60000,
+    },  # store.py keeps the timeout default equal
 }
 
 
@@ -109,6 +128,10 @@ def _check_value(kind, value):
     if kind == "timeout":
         if type(value) is not int or not 0 <= value <= 600000:
             raise rejected("store: busy_timeout_ms must be an integer from 0 to 600000")
+        return value
+    if kind == "backend":
+        if value not in _BACKENDS:
+            raise rejected("store: backend is not recognized")
         return value
     if kind == "mode":
         if value not in _MODES:

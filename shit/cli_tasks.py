@@ -21,10 +21,10 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-from . import artifacts, commands
+from . import artifacts, audit, backend, backend_name, check, commands, store
 from . import project as project_mod
-from . import task as task_mod
 from .errors import INTERNAL, MESSAGES, OK, USAGE, ShitError
 from .lifecycle import ACTORS, STATES
 
@@ -51,6 +51,7 @@ def _actor(p):
 def register(subparsers):
     """Add the task commands to an argparse subparsers object; each sets `func`."""
     p = _add_sub(subparsers, "init", help="create the .shit store")
+    p.add_argument("--backend", choices=("files", backend_name.SQLITE), default=None)
     p.set_defaults(func=_init)
 
     p = _add_sub(subparsers, "task", help="create, show or move a task")
@@ -93,6 +94,9 @@ def register(subparsers):
     _actor(p)
     p.set_defaults(func=_close)
 
+    check.register(subparsers)
+    audit.register(subparsers)
+
 
 def _evidence_args(a):
     a.add_argument("--path", required=True)
@@ -120,8 +124,12 @@ def _decision_args(a):
     a.add_argument("--supersedes")
 
 
-_ADD_ARGS = {"evidence": _evidence_args, "report": _report_args, "review": _review_args,
-             "decision": _decision_args}
+_ADD_ARGS = {
+    "evidence": _evidence_args,
+    "report": _report_args,
+    "review": _review_args,
+    "decision": _decision_args,
+}
 
 
 def _root(ns):
@@ -133,7 +141,14 @@ def _open(ns):
 
 
 def _init(ns):
-    project_mod.Project.init(_root(ns)).close()
+    proj = project_mod.Project.init(_root(ns))
+    try:
+        selected = ns.backend or backend.resolve(proj.repo).name
+        if selected == backend_name.SQLITE:
+            selected_backend = backend.resolve(proj.repo)
+            store.init_store(proj, selected_backend.busy_timeout_ms)
+    finally:
+        proj.close()
     return {"initialized": True}
 
 
@@ -145,55 +160,155 @@ def _with_project(ns, fn):
         proj.close()
 
 
+def _backend(ns):
+    return backend.resolve(Path(_root(ns)))
+
+
 def _task_create(ns):
-    return _with_project(ns, lambda p: commands.new_task(
-        p, task_id=ns.id, title=ns.title, summary=ns.summary, owner=ns.owner, actor=ns.actor))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.records.new_task(
+            p,
+            task_id=ns.id,
+            title=ns.title,
+            summary=ns.summary,
+            owner=ns.owner,
+            actor=ns.actor,
+            **_timeout(selected),
+        ),
+    )
 
 
 def _task_show(ns):
-    return _with_project(ns, lambda p: task_mod.get_task(p, ns.id))
+    selected = _backend(ns)
+    return _with_project(
+        ns, lambda p: selected.tasks.get_task(p, ns.id, **_timeout(selected))
+    )
 
 
 def _task_move(ns):
-    return _with_project(ns, lambda p: task_mod.transition(
-        p, ns.id, ns.state, ns.actor, commands._text(ns.reason),
-        blocked_reason=None if ns.blocked_reason is None else commands._text(ns.blocked_reason),
-        blocking_item=None if ns.blocking_item is None else commands._text(ns.blocking_item)))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.tasks.transition(
+            p,
+            ns.id,
+            ns.state,
+            ns.actor,
+            commands._text(ns.reason),
+            blocked_reason=None
+            if ns.blocked_reason is None
+            else commands._text(ns.blocked_reason),
+            blocking_item=None
+            if ns.blocking_item is None
+            else commands._text(ns.blocking_item),
+            **_timeout(selected),
+        ),
+    )
+
+
+def _timeout(selected):
+    return (
+        {}
+        if selected.busy_timeout_ms is None
+        else {"busy_timeout_ms": selected.busy_timeout_ms}
+    )
 
 
 def _evidence_run(ns):
-    return _with_project(ns, lambda p: commands.add_evidence(
-        p, task_id=ns.task, evidence_id=ns.id, path=ns.path, description=ns.description, actor=ns.actor))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.records.add_evidence(
+            p,
+            task_id=ns.task,
+            evidence_id=ns.id,
+            path=ns.path,
+            description=ns.description,
+            actor=ns.actor,
+            **_timeout(selected),
+        ),
+    )
 
 
 def _report_run(ns):
-    return _with_project(ns, lambda p: commands.add_report(
-        p, task_id=ns.task, report_id=ns.id, outcome=ns.outcome, summary=ns.summary, evidence_ids=ns.evidence,
-        actor=ns.actor, log_reference=ns.log_reference))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.records.add_report(
+            p,
+            task_id=ns.task,
+            report_id=ns.id,
+            outcome=ns.outcome,
+            summary=ns.summary,
+            evidence_ids=ns.evidence,
+            actor=ns.actor,
+            log_reference=ns.log_reference,
+            **_timeout(selected),
+        ),
+    )
 
 
 def _review_run(ns):
-    return _with_project(ns, lambda p: commands.add_review(
-        p, task_id=ns.task, review_id=ns.id, report_id=ns.report, verdict=ns.verdict, summary=ns.summary,
-        actor=ns.actor))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.records.add_review(
+            p,
+            task_id=ns.task,
+            review_id=ns.id,
+            report_id=ns.report,
+            verdict=ns.verdict,
+            summary=ns.summary,
+            actor=ns.actor,
+            **_timeout(selected),
+        ),
+    )
 
 
 def _decision_run(ns):
-    return _with_project(ns, lambda p: commands.add_decision(
-        p, task_id=ns.task, decision_id=ns.id, status=ns.status, question=ns.question, choice=ns.choice,
-        rationale=ns.rationale, actor=ns.actor, supersedes_id=ns.supersedes))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.records.add_decision(
+            p,
+            task_id=ns.task,
+            decision_id=ns.id,
+            status=ns.status,
+            question=ns.question,
+            choice=ns.choice,
+            rationale=ns.rationale,
+            actor=ns.actor,
+            supersedes_id=ns.supersedes,
+            **_timeout(selected),
+        ),
+    )
 
 
-_ADD_RUN = {"evidence": _evidence_run, "report": _report_run, "review": _review_run,
-            "decision": _decision_run}
+_ADD_RUN = {
+    "evidence": _evidence_run,
+    "report": _report_run,
+    "review": _review_run,
+    "decision": _decision_run,
+}
 
 
 def _show(ns):
-    return _with_project(ns, lambda p: commands.show(p, ns.kind, ns.id))
+    selected = _backend(ns)
+    return _with_project(
+        ns, lambda p: selected.records.show(p, ns.kind, ns.id, **_timeout(selected))
+    )
 
 
 def _close(ns):
-    return _with_project(ns, lambda p: commands.close_task(p, ns.task, ns.actor, commands._text(ns.reason)))
+    selected = _backend(ns)
+    return _with_project(
+        ns,
+        lambda p: selected.records.close_task(
+            p, ns.task, ns.actor, commands._text(ns.reason), **_timeout(selected)
+        ),
+    )
 
 
 def build_parser():
@@ -209,15 +324,35 @@ def main(argv=None, *, cwd=None, stdout=None, stderr=None):
     try:
         ns = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
         ns.cwd = cwd or os.getcwd()
+        if hasattr(ns, "repo") and ns.repo is None:
+            ns.repo = ns.cwd
         result = ns.func(ns)
-        out.write(json.dumps(result, indent=2, ensure_ascii=True, allow_nan=False) + "\n")
+        if isinstance(result, tuple) and len(result) == 2:
+            code, lines = result
+            for line in lines:
+                out.write(line + "\n")
+            if code:
+                err.write(f"shit: {MESSAGES[code]}\n")
+            return code
+        out.write(
+            json.dumps(result, indent=2, ensure_ascii=True, allow_nan=False) + "\n"
+        )
         return OK
     except SystemExit as exc:  # argparse --help
         return exc.code if isinstance(exc.code, int) else USAGE
     except ShitError as exc:
         err.write(f"shit: {exc.message}\n")
         return exc.code
-    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError, MemoryError):
+    except (
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+        AttributeError,
+        RecursionError,
+        MemoryError,
+    ):
         # Fixed output only: never an exception text, path or value.
         err.write(f"shit: {MESSAGES[INTERNAL]}\n")
         return INTERNAL

@@ -2,7 +2,30 @@
 
 **SELF-REVIEW:** the implementer's own account. A human peer review is still required.
 
-`shit/store.py` is the base of the SQLite store that is replacing the file-based queue (`docs/queue.md`). The queue operations are ported in a delimited section ("Queue operations" below), and the file queue stays until the CLI moves over. `shit/store.py` is the only module that imports `sqlite3`.
+`shit/store.py` is the base of the SQLite store that is replacing the file-based queue (`docs/queue.md`). The queue operations are ported in a delimited section ("Queue operations" below), and the file queue remains available during the migration. `shit/store.py` is the only module that imports `sqlite3`.
+
+## Selecting a backend
+
+The validated project configuration selects one backend for command-line task, record, dependency and queue operations:
+
+```toml
+[store]
+backend = "sqlite"
+busy_timeout_ms = 60000
+```
+
+`backend` accepts only `"files"` and `"sqlite"`; its default is `"files"`, so an existing project does not change storage without an explicit configuration edit. Command handlers resolve this setting once through `shit/backend.py`. The files selection binds the existing modules without changing their call path. The SQLite selection binds the compatible `store_tasks` and `store_queue` adapters and passes `busy_timeout_ms` to them.
+
+`shit init --backend sqlite` creates the database for a project selected for SQLite. A `[store] backend = "sqlite"` configuration also makes plain `shit init` create it. The `check` and `audit` commands are registered in the same command-line parser as the task commands.
+
+## Migration and rollback
+
+1. Stop writers and add `[store] backend = "sqlite"` to `config.toml`. Run `shit init --backend sqlite`.
+2. The backends do not share state. Creating the SQLite store does not import the file tasks, records, queue or dependencies; populate or migrate the new backend separately before using it.
+3. Run `shit check` and require its store section to finish with `check: ok`. Run `shit audit verify --database` and require the export and database comparison to pass.
+4. To roll back command routing, stop writers and set `backend = "files"` again. The file state is unchanged by SQLite operations, but it also does not contain work written only to SQLite.
+
+Phase 2 removes the file protocol and its tests only after the SQLite store receives the planned adversarial review. It is not part of this phase.
 
 **Scope of the protection.** Like the queue, the store protects against crashes, races and mistakes of cooperating processes of the same operating-system user. A hostile process of that user can open the database directly and bypass every control here. The checks below catch accidents and a casual swap; they are not a boundary against that user.
 
