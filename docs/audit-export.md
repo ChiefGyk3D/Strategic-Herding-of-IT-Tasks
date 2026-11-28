@@ -11,7 +11,7 @@ The SQLite store (`docs/store.md`) is the authority. The audit export is a secon
 
 ## File
 
-`.shit/audit-export.txt`, ASCII, LF, mode 0600 (a mode with a bit outside 0600, a symlink, a hard link, a file of another owner or a non-regular file is refused with exit code 5). It is rewritten whole by temporary file, `fsync`, rename and a directory `fsync` (`Project.write_atomic`), so a reader sees the old file or the new one. Its name is `audit-export.txt` and its location is fixed (a configurable location, for example another filesystem, is deferred).
+`.shit/audit-export.txt`, ASCII, LF, mode 0600 (a mode with a bit outside 0600, a symlink, a file of another owner or a non-regular file is refused with exit code 5). A verified opened inode may have link count 1, or 0 when atomic replacement unlinks that old inode after the reader opens it; link count 2 or more is refused as a hard link. This lets an in-flight reader finish from its already-opened complete old inode without accepting a multiply linked file. The export is rewritten whole by temporary file, `fsync`, rename and a directory `fsync` (`Project.write_atomic`), so a reader sees the old file or the new one. Its name is `audit-export.txt` and its location is fixed (a configurable location, for example another filesystem, is deferred).
 
 ```
 SHIT-AUDIT-EXPORT 1

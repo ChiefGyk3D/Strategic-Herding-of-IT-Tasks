@@ -80,8 +80,8 @@ def _task_statuses(project, conn):
 
 
 def _audit_files(project):
-    footer = audit_export.read_footer(project)
-    return footer, audit_export.read_export(project) if footer is not None else None
+    exported = audit_export.read_export(project)
+    return (None, None) if exported is None else (audit_export.footer_from_bytes(exported), exported)
 
 
 def diagnose(project, now=None, *, conn=None, audit_files=None):

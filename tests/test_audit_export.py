@@ -748,6 +748,23 @@ class FileTests(Flow):
         self.assertEqual(self.export_path.stat().st_nlink, 1)
         self.assertEqual([p.name for p in (self.repo / ".shit").iterdir() if p.name.startswith(".tmp-")], [])
 
+    def test_a_reader_accepts_the_unlinked_inode_and_keeps_its_old_bytes_after_replacement(self):
+        expected = self.export_bytes()
+        replacement = b"replacement inode\n"
+        replaced = []
+
+        def replace_after_open(stage):
+            if stage == "opened" and not replaced:
+                self.proj.write_atomic(audit_export.EXPORT_PATH, replacement, limit=audit_export.MAX_EXPORT_BYTES)
+                replaced.append(True)
+
+        with mock.patch.object(audit_export, "_fault", replace_after_open):
+            preserved = audit_export.read_export(self.proj)
+        self.assertEqual(preserved, expected)
+        audit_export.verify_bytes(preserved)
+        self.assertEqual(replaced, [True])
+        self.assertEqual(self.export_path.read_bytes(), replacement)
+
     def test_the_mode_holds_under_a_loose_umask(self):
         old = os.umask(0)
         try:
