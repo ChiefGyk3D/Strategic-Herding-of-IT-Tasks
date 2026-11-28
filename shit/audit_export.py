@@ -164,6 +164,17 @@ def verify_bytes(data):
             if queue_records.dump_entry(entry) != text:
                 raise _fail()
         queue_records.replay(entries)
+        created = {
+            event["task_id"]: event["timestamp"]
+            for event in events
+            if event["event"] == "task_created"
+        }
+        if any(
+            entry.get("task_id") is not None
+            and (entry["task_id"] not in created or created[entry["task_id"]] > entry["timestamp"])
+            for entry in entries
+        ):
+            raise _fail()
         found = Footer(Tip(len(event_lines), previous["E"]), Tip(len(queue_lines), previous["Q"]), footer.body_sha256)
         if found != footer:
             raise _fail()
@@ -306,6 +317,15 @@ def status(project, conn):
         return compare(footer, conn)
 
 
+def _verified_footer(project):
+    """Read and verify the complete bounded export, returning its footer shape."""
+    data = read_export(project)
+    if data is None:
+        return None
+    verified = verify_bytes(data)
+    return Footer(verified.events, verified.queue, verified.body_sha256)
+
+
 def guard(project, conn):
     """For a connection that only reads: refuse (exit code 8) when the database is provably not the one the export
     was made from (older than it, or with a different entry). A missing export is not proof, so it is not refused
@@ -323,14 +343,16 @@ def sync(project, conn, *, accept=False):
     true (the operator's explicit "this database is the truth now", `shit audit export --accept-database`). The
     write lock of the database is held while the file is written, so two writers cannot make the file go back."""
     try:
-        if status(project, conn).state == CURRENT:
-            return False
+        footer = _verified_footer(project)
+        with store.read_snapshot(conn):
+            if compare(footer, conn).state == CURRENT:
+                return False
     except ShitError as exc:
         if not (accept and exc.code == FAILED_CLOSED):  # an unreadable export may be replaced only on request
             raise
     with store.write_transaction(conn):
         try:
-            found = compare(read_footer(project), conn)
+            found = compare(_verified_footer(project), conn)
         except ShitError as exc:
             if not (accept and exc.code == FAILED_CLOSED):
                 raise

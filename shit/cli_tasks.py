@@ -25,7 +25,7 @@ from pathlib import Path
 
 from . import artifacts, audit, backend, backend_name, check, commands, store
 from . import project as project_mod
-from .errors import INTERNAL, MESSAGES, OK, USAGE, ShitError
+from .errors import INTERNAL, MESSAGES, OK, PRECONDITION, USAGE, ShitError
 from .lifecycle import ACTORS, STATES
 
 
@@ -143,10 +143,17 @@ def _open(ns):
 def _init(ns):
     proj = project_mod.Project.init(_root(ns))
     try:
-        selected = ns.backend or backend.resolve(proj.repo).name
+        configured = backend.resolve(proj.repo)
+        if ns.backend is not None and ns.backend != configured.name:
+            raise ShitError(USAGE)
+        selected = ns.backend or configured.name
         if selected == backend_name.SQLITE:
-            selected_backend = backend.resolve(proj.repo)
-            store.init_store(proj, selected_backend.busy_timeout_ms)
+            if not proj.exists(store.DB_NAME) and any(
+                proj.exists(name)
+                for name in ("events.jsonl", "events.chain", "queue.jsonl", "queue.chain")
+            ):
+                raise ShitError(PRECONDITION)
+            store.init_store(proj, configured.busy_timeout_ms)
     finally:
         proj.close()
     return {"initialized": True}

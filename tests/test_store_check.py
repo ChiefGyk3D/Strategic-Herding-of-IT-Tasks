@@ -155,6 +155,33 @@ class FailureTests(StoreCheckCase):
         self.assertEqual(code, errors.FAILED_CLOSED)
         self.assertIn("store: invariant task_without_body_record does not hold", lines)
 
+    def test_a_missing_indexed_body_is_named_and_the_check_is_read_only(self):
+        (self.repo / ".shit" / "tasks" / "a.json").unlink()
+        code, lines = self.run_checked()
+        self.assertEqual(code, errors.FAILED_CLOSED)
+        self.assertIn("store: record body_missing does not verify", lines)
+
+    def test_an_altered_indexed_body_is_named_and_the_check_is_read_only(self):
+        (self.repo / ".shit" / "tasks" / "a.json").write_bytes(b"{}")
+        code, lines = self.run_checked()
+        self.assertEqual(code, errors.REJECTED)
+        self.assertIn("store: record body_differs_from_index does not verify", lines)
+
+    def test_a_linked_indexed_body_is_named_and_the_check_is_read_only(self):
+        body = self.repo / ".shit" / "tasks" / "a.json"
+        saved = self.repo / "saved-body.json"
+        saved.write_bytes(body.read_bytes())
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                body.unlink()
+                if kind == "symlink":
+                    body.symlink_to(saved)
+                else:
+                    os.link(saved, body)
+                code, lines = self.run_checked()
+                self.assertEqual(code, errors.CONFINEMENT)
+                self.assertIn("store: record body_unreadable does not verify", lines)
+
     def test_a_database_that_cannot_be_opened_fails_with_the_code_of_the_refusal(self):
         self.raw_write("DROP TRIGGER tasks_no_delete")
         code, lines = self.run_checked()

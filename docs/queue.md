@@ -74,7 +74,7 @@ The spec text now matches the code.
 
 - Capability tags (Q-CLAIM-06) and execution capacity by resource class (Q-CLAIM-04 second half): the claim request has no tag field and nothing counts leases per worker. Issue 18 owns routing and capacity.
 - `dispatch_failed` backoff and the consecutive-failure hold (Q-RET-04, Q-RET-05): the entry kind and `not_before` are validated and honored on claim (Q-RET-06), but nothing writes them. Issue 18's dispatcher does.
-- Apply slots, `base_sha256`, `apply_started` and `apply_finished` writers (Q-SER-01, 02, 04 to 07): the kinds are accepted by validation; nothing produces them.
+- The file backend does not produce apply markers. The SQLite backend exposes apply start and finish and serializes lexical canonical target keys, including ancestor/descendant overlap. Apply priority and `base_sha256` remain unimplemented there, so Q-SER-04 and Q-SER-06 are not claimed.
 - Parallelism metrics (Q-MET-01 to Q-MET-06).
 - A command-line front end for the queue. The library API is complete for a human worker; a CLI wrapper is not written.
 - A task-level `shit check` comparison of queue and lifecycle: the queue verifies the agreement itself on every operation.

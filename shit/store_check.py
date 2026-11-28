@@ -8,7 +8,7 @@ nothing to report. Output is fixed text and names of invariants (fixed identifie
 
 from datetime import UTC, datetime
 
-from . import audit_export, store
+from . import audit_export, store, store_tasks
 from .errors import FAILED_CLOSED, ShitError
 
 _LIVE = ("dispatched", "running")
@@ -56,6 +56,8 @@ def diagnose(project, now=None):
         with store.read_snapshot(conn):
             for name in store.verify(conn, deep=True) + store.verify_tasks(conn):
                 findings.append((FAILED_CLOSED, f"invariant {name} does not hold"))
+            for name in store_tasks.verify_bodies(project, conn):
+                findings.append((FAILED_CLOSED, f"record {name} does not verify"))
             try:
                 lines.extend(_queue_lines(conn, now))
             except ShitError:

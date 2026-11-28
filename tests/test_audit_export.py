@@ -304,6 +304,17 @@ class VerifierTests(Flow):
                 forged = rechain(self.good, edit)  # a valid chain and footer: each record is valid on its own
                 self.assert_refused(forged)
 
+    def test_queue_entries_require_a_preceding_task_creation_event(self):
+        def remove_creation(events, entries):
+            task_id = entries[0]["task_id"]
+            events[:] = [
+                event
+                for event in events
+                if not (event["event"] == "task_created" and event["task_id"] == task_id)
+            ]
+
+        self.assert_refused(rechain(self.good, remove_creation))
+
     def test_an_edit_that_replay_accepts_still_verifies(self):
         def later(events, entries):
             entries[-1]["timestamp"] = "2026-11-27T23:00:00Z"
@@ -686,7 +697,7 @@ class FileTests(Flow):
     def test_the_footer_is_read_without_reading_the_whole_file(self):
         with mock.patch.object(audit_export, "read_export", side_effect=AssertionError("whole file read")):
             self.assertEqual(self.status().state, audit_export.CURRENT)
-            self.task("more")
+        self.task("more")  # a writer verifies the complete body before accepting the footer
         self.assertEqual(self.status().state, audit_export.CURRENT)
 
     def test_a_current_database_writes_nothing_to_the_export(self):
@@ -780,6 +791,16 @@ class ConcurrencyTests(Flow):
 
 
 class CommandTests(Flow):
+    def test_sync_refuses_a_current_looking_export_with_a_damaged_body(self):
+        self.flow()
+        data = bytearray(self.export_bytes())
+        data[60] ^= 1
+        self.export_path.write_bytes(bytes(data))
+        os.chmod(self.export_path, 0o600)
+        conn = store.connect(self.proj)
+        self.addCleanup(conn.close)
+        self.assertEqual(code_of(audit_export.sync, self.proj, conn), errors.FAILED_CLOSED)
+
     def test_export_replaces_a_lost_export_only_on_request_and_then_reports_current(self):
         self.flow()
         self.export_path.unlink()

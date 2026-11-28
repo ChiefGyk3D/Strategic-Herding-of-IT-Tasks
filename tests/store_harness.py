@@ -440,24 +440,25 @@ class Mutation:
     old: str  # text that occurs exactly once in shit/store.py
     new: str
     detector: str  # which part of the harness must notice: "processes", "sweep" or "model"
+    expected: str = ""
 
 
 MUTATIONS = (
     Mutation("drop-begin-immediate", 'try:\n        conn.execute("BEGIN IMMEDIATE")\n    except sqlite3.Error as exc:\n        raise map_error(exc) from None\n    try:\n        yield conn',
-             'try:\n        conn.execute("BEGIN")\n    except sqlite3.Error as exc:\n        raise map_error(exc) from None\n    try:\n        yield conn', "processes"),
-    Mutation("ignore-busy-timeout", "    timeout = _timeout(busy_timeout_ms)\n", "    timeout = 0\n", "processes"),
+             'try:\n        conn.execute("BEGIN")\n    except sqlite3.Error as exc:\n        raise map_error(exc) from None\n    try:\n        yield conn', "processes", "exit code 13"),
+    Mutation("ignore-busy-timeout", "    timeout = _timeout(busy_timeout_ms)\n", "    timeout = 0\n", "processes", "exit code 13"),
     Mutation("skip-lease-row", "def _insert_lease(conn, lease):\n    _require_transaction(conn)\n",
-             "def _insert_lease(conn, lease):\n    _require_transaction(conn)\n    return\n", "processes"),
+             "def _insert_lease(conn, lease):\n    _require_transaction(conn)\n    return\n", "processes", "claim_without_lease"),
     Mutation("drop-lease-before-slots",
              '    conn.execute("DELETE FROM apply_slots WHERE task_id = ?", (task_id,))\n    _fault("slots-dropped")\n'
              '    conn.execute("DELETE FROM leases WHERE task_id = ?", (task_id,))\n    _fault("lease-dropped")',
              '    conn.execute("DELETE FROM leases WHERE task_id = ?", (task_id,))\n    _fault("slots-dropped")\n'
              '    conn.execute("DELETE FROM apply_slots WHERE task_id = ?", (task_id,))\n    _fault("lease-dropped")',
-             "model"),
+             "model", "submit"),
     Mutation("commit-between-entry-and-lease-row",
              '    _require_transaction(conn)\n    conn.execute("INSERT INTO leases (task_id,',
              '    _require_transaction(conn)\n    conn.execute("COMMIT")\n    conn.execute("BEGIN IMMEDIATE")\n'
-             '    conn.execute("INSERT INTO leases (task_id,', "sweep"),
+             '    conn.execute("INSERT INTO leases (task_id,', "sweep", "claim_without_lease"),
 )
 
 

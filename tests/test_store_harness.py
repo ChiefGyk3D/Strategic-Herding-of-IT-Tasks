@@ -83,8 +83,13 @@ class MutationTests(Quiet):
             self.assertGreaterEqual(len(harness.MUTATIONS), 5)
             for mutation in harness.MUTATIONS:
                 with self.subTest(mutation=mutation.name):
+                    self.assertTrue(mutation.expected, mutation.name)
                     found = harness.detect(self.settings, mutation, directory)
                     self.assertTrue(found, f"{mutation.name} was not detected by {mutation.detector}")
+                    self.assertTrue(
+                        any(mutation.expected in problem for problem in found),
+                        f"{mutation.name} was not detected by its named guard: {found[:3]}",
+                    )
 
     def test_an_unmutated_copy_is_not_flagged(self):
         """The negative control: the same detectors say nothing about a copy with no breakage."""
