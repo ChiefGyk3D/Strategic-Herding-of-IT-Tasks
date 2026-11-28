@@ -1,6 +1,6 @@
 """Run a review-thread request plan with the GitHub CLI. This is the user's own step.
 
-    python3 scripts/threads_run.py PLAN.json
+    python3 scripts/threads_run.py [--config PATH] PLAN.json
 
 The plan comes from `shit threads list ...` or `shit threads apply ...` (docs/threads.md), saved to a file below
 the working directory. This launcher sits outside the `shit` package on purpose: no module of the package may
@@ -17,9 +17,14 @@ whose outcome is unknown could double-post); a resolve runs only after every rep
 when the answer says `isResolved` is true; the first failure stops the run and prints what was done; the output
 of `gh` (stdout and stderr) is never shown, only checked.
 
-Environment: `gh` gets only the variables in ENV_ALLOW, plus GH_PROMPT_DISABLED=1 and NO_COLOR=1. The token
-variables on the list are passed through untouched so `gh` can sign in; this script never reads, prints or logs
-them. Any other variable of yours is dropped. A value with a control character is dropped too.
+Host and credential: the host comes only from this machine's configuration (`--config`, else `config.toml` in the
+working directory, `[tracker] host`), else github.com; the plan never chooses it. A plan whose host is not null and
+differs is refused before any call (exit 3). Every call carries `--hostname HOST`. Only the token variables that
+apply to that host are passed: GH_TOKEN and GITHUB_TOKEN for github.com, GH_ENTERPRISE_TOKEN and
+GITHUB_ENTERPRISE_TOKEN for any other host. This script never reads, prints or logs their values.
+
+Environment: `gh` gets only the variables in ENV_ALLOW and the applicable token pair, plus GH_PROMPT_DISABLED=1 and
+NO_COLOR=1. Any other variable of yours is dropped, GH_HOST included. A value with a control character is dropped.
 
 Exit codes (docs/exit-codes.md): 0 done; 2 usage; 3 plan rejected; 5 plan path outside the working directory or
 not a regular file; 7 limit; 8 GitHub did not answer as required or a write failed; 9 plan file or thread not
@@ -35,25 +40,36 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from shit import _cli, threads
+from shit import _cli, config, threads
 from shit._text import read_bounded
+from shit.errors import REJECTED, ShitError
 
 CALL_TIMEOUT = 60
+DEFAULT_CONFIG = "config.toml"
 
 # The variables `gh` may receive. Nothing else from the caller's environment is passed on.
 ENV_ALLOW = (
     "PATH", "HOME", "LANG", "LC_ALL", "TERM", "TZ", "USER", "TMPDIR",
-    "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",  # the user's own credential
-    "GH_HOST", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy",
     "SSL_CERT_FILE", "SSL_CERT_DIR",
 )
 ENV_FORCE = {"GH_PROMPT_DISABLED": "1", "NO_COLOR": "1"}
+# The user's own credential, and only the pair that applies to the target host (never both pairs).
+DEFAULT_HOST = "github.com"
+TOKENS_DOTCOM = ("GH_TOKEN", "GITHUB_TOKEN")
+TOKENS_OTHER = ("GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
 
 
-def child_env(environ):
+def trusted_host(configured):
+    """The host every call goes to: the configured one, else github.com. A plan never chooses it."""
+    return (configured or DEFAULT_HOST).lower()
+
+
+def child_env(environ, host=DEFAULT_HOST):
     env = {}
-    for name in ENV_ALLOW:
+    tokens = TOKENS_DOTCOM if host.lower() == DEFAULT_HOST else TOKENS_OTHER
+    for name in (*ENV_ALLOW, *tokens):
         value = environ.get(name)
         if isinstance(value, str) and not any(unicodedata.category(c) in ("Cc", "Cs") for c in value):
             env[name] = value
@@ -126,20 +142,37 @@ def execute(plan, gh):
     return _cli.OK, lines
 
 
+def configured_host(config_arg, base):
+    """`[tracker] host` of --config, or of config.toml below the working directory if there is one, else None."""
+    if config_arg is None:
+        if not os.path.lexists(base / DEFAULT_CONFIG):
+            return None
+        config_arg = DEFAULT_CONFIG
+    return config.read(base / config_arg, base).get("tracker", {}).get("host")
+
+
 def make_handler(runner, which, environ, cwd):
     def handler(args):
         base = Path(cwd) if cwd is not None else Path.cwd()
+        host = trusted_host(configured_host(args.config, base))
         plan = threads.parse_plan(read_bounded(base / args.plan, threads.PLAN_LIMIT, base))
+        # The host, and so where the token goes, comes only from this machine's configuration, never from the
+        # plan file. A plan may leave it out (null) or name the same host; any other host is refused, no call made.
+        if plan["host"] is not None and plan["host"].lower() != host:
+            raise ShitError(REJECTED)
+        plan = {**plan, "host": host}
         path = which("gh", path=environ.get("PATH"))
         if path is None:
             raise _cli.CodedError(_cli.TOOL_UNAVAILABLE)
-        return execute(plan, Gh(path, runner, child_env(environ)))
+        return execute(plan, Gh(path, runner, child_env(environ, host)))
 
     return handler
 
 
 def build(runner, which, environ, cwd):
     parser = _cli.SafeParser(prog="threads_run")
+    parser.add_argument("--config", default=None, help="configuration file whose [tracker] host is trusted "
+                        "(default: config.toml in the working directory, if present)")
     parser.add_argument("plan", help="plan file from `shit threads`, below the working directory")
     parser.set_defaults(func=make_handler(runner, which, environ, cwd))
     return parser

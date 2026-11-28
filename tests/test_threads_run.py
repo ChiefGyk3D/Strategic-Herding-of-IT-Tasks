@@ -153,11 +153,96 @@ class ListTests(Case):
                 self.assertEqual(code, 8)
                 self.assertNotIn(SECRET, out + err)
 
-    def test_host_reaches_gh(self):
-        self.fake()
-        self.run_plan(self.plan_file(kind="list", host="git.example.org"))
+
+class HostTrustTests(Case):
+    def conf(self, host=None, name="config.toml"):
+        extra = f'host = "{host}"\n' if host else ""
+        (self.work / name).write_text(
+            "schema_version = 1\n[project]\nname = \"p\"\n[tracker]\nrepository = \"o/r\"\n" + extra +
+            "[review]\ndestination = \"reviewer\"\n[storage]\nroot = \".shit\"\n"
+            "[log]\nfile = \".shit/events.jsonl\"\n[local_model]\ncontext_tokens = 32768\n", encoding="utf-8")
+        return name
+
+    def run_with(self, plan_name, *opts, environ=None):
+        env = environ or self.environ()
+        return run_main(lambda a: launcher.main(a, environ=env, cwd=self.work), [*opts, plan_name])
+
+    def hostname(self):
         argv = self.calls()[0]["argv"]
-        self.assertEqual(argv[argv.index("--hostname") + 1], "git.example.org")
+        return argv[argv.index("--hostname") + 1]
+
+    def test_no_config_uses_github_com_and_always_names_it(self):
+        self.fake()
+        code, _, _ = self.run_with(self.plan_file(kind="list"))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.hostname(), "github.com")
+
+    def test_a_plan_naming_another_host_is_refused_with_no_call(self):
+        self.fake()
+        code, out, err = self.run_with(self.plan_file(kind="list", host="evil.example.net"))
+        self.assertEqual((code, out), (3, ""))
+        self.assertEqual(self.calls(), [])
+        self.assertNotIn("evil.example.net", err)
+
+    def test_configured_host_is_used_when_the_plan_has_none(self):
+        self.fake()
+        code, _, _ = self.run_with(self.plan_file(kind="list"), "--config", self.conf("git.example.org"))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.hostname(), "git.example.org")
+
+    def test_matching_host_is_accepted_and_case_does_not_matter(self):
+        self.fake()
+        code, _, _ = self.run_with(self.plan_file(kind="list", host="Git.Example.org"), "--config",
+                                   self.conf("git.example.org"))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.hostname(), "git.example.org")
+
+    def test_a_plan_host_that_differs_from_the_configured_host_is_refused(self):
+        self.fake()
+        for plan_host in ("github.com", "other.example.org"):
+            with self.subTest(plan_host=plan_host):
+                code, out, err = self.run_with(self.plan_file(kind="list", host=plan_host), "--config",
+                                               self.conf("git.example.org"))
+                self.assertEqual((code, out), (3, ""))
+                self.assertNotIn(plan_host, err)
+        self.assertEqual(self.calls(), [])
+
+    def test_default_config_in_the_working_directory_is_read(self):
+        self.fake()
+        self.conf("git.example.org")
+        self.assertEqual(self.run_with(self.plan_file(kind="list", host="github.com"))[0], 3)
+        self.assertEqual(self.run_with(self.plan_file(kind="list", host="git.example.org"))[0], 0)
+        self.assertEqual(self.hostname(), "git.example.org")
+
+    def test_a_bad_or_missing_config_is_refused_before_any_call(self):
+        self.fake()
+        (self.work / "bad.toml").write_text("schema_version = ", encoding="utf-8")
+        for opt, want in (("bad.toml", 3), ("missing.toml", 9), ("../x.toml", 5)):
+            with self.subTest(opt=opt):
+                self.assertEqual(self.run_with(self.plan_file(kind="list"), "--config", opt)[0], want)
+        self.assertEqual(self.calls(), [])
+
+    def test_only_the_tokens_for_the_target_host_reach_gh(self):
+        all_tokens = {"GH_TOKEN": "a", "GITHUB_TOKEN": "b", "GH_ENTERPRISE_TOKEN": "c", "GITHUB_ENTERPRISE_TOKEN": "d",
+                      "GH_HOST": "evil.example.net"}
+        self.fake()
+        self.run_with(self.plan_file(kind="list"), environ=self.environ(**all_tokens))
+        names = set(self.calls()[0]["env"])
+        self.assertEqual(names & set(all_tokens), {"GH_TOKEN", "GITHUB_TOKEN"})
+        self.setUp()
+        self.fake()
+        self.run_with(self.plan_file(kind="list"), "--config", self.conf("git.example.org"),
+                      environ=self.environ(**all_tokens))
+        names = set(self.calls()[0]["env"])
+        self.assertEqual(names & set(all_tokens), {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"})
+
+    def test_child_env_is_per_host(self):
+        env = {"GH_TOKEN": "a", "GITHUB_TOKEN": "b", "GH_ENTERPRISE_TOKEN": "c", "GITHUB_ENTERPRISE_TOKEN": "d"}
+        self.assertEqual(set(launcher.child_env(env, "github.com")) & set(env), {"GH_TOKEN", "GITHUB_TOKEN"})
+        self.assertEqual(set(launcher.child_env(env, "GitHub.com")) & set(env), {"GH_TOKEN", "GITHUB_TOKEN"})
+        self.assertEqual(set(launcher.child_env(env, "git.example.org")) & set(env),
+                         {"GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"})
+        self.assertNotIn("GH_HOST", launcher.ENV_ALLOW)
 
 
 class ApplyTests(Case):
