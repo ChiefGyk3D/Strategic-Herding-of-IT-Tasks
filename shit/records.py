@@ -33,10 +33,11 @@ def _reject():
     return ShitError(REJECTED)
 
 
-def scan_depth(data):
+def scan_depth(data, max_depth=MAX_DEPTH):
     """Return the maximum JSON nesting depth of `data` (bytes), ignoring brackets inside strings.
 
-    Raises ShitError(7) as soon as the depth exceeds MAX_DEPTH, so deep input never reaches the parser.
+    Raises ShitError(7) as soon as the depth exceeds `max_depth` (MAX_DEPTH by default), so deep input never
+    reaches the parser.
     """
     depth = deepest = 0
     in_string = escaped = False
@@ -53,7 +54,7 @@ def scan_depth(data):
         elif byte in (0x7B, 0x5B):
             depth += 1
             deepest = max(deepest, depth)
-            if deepest > MAX_DEPTH:
+            if deepest > max_depth:
                 raise ShitError(INPUT_LIMIT)
         elif byte in (0x7D, 0x5D):
             depth -= 1
@@ -73,21 +74,31 @@ def _no_constant(_name):
     raise ValueError("non-finite number")
 
 
-def parse(data):
-    """Parse one record's bytes into a dict. Size and depth are checked before parsing."""
-    if len(data) > MAX_RECORD_BYTES:
+def parse_value(data, limit, max_depth):
+    """Parse bytes of strict JSON with any top-level type: size, BOM and depth are checked before parsing.
+
+    Duplicate keys, NaN and Infinity, invalid UTF-8 and lone surrogates are refused with exit code 3; input
+    over `limit` bytes or `max_depth` levels is refused with exit code 7.
+    """
+    if len(data) > limit:
         raise ShitError(INPUT_LIMIT)
     if data.startswith(b"\xef\xbb\xbf"):
         raise _reject()
-    scan_depth(data)
+    scan_depth(data, max_depth)
     try:
         text = data.decode("utf-8")
         obj = json.loads(text, object_pairs_hook=_pairs, parse_constant=_no_constant)
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise _reject() from None
+    _check_strings(obj)
+    return obj
+
+
+def parse(data):
+    """Parse one record's bytes into a dict. Size and depth are checked before parsing."""
+    obj = parse_value(data, MAX_RECORD_BYTES, MAX_DEPTH)
     if not isinstance(obj, dict):
         raise _reject()
-    _check_strings(obj)
     return obj
 
 

@@ -18,6 +18,10 @@ The SQLite store that will replace the file queue is being built in steps; its f
 
 Bounded work (directory width, byte budget, scan and lock-hold deadlines) is described in [docs/bounded-work.md](docs/bounded-work.md).
 
+## Review threads
+
+`shit threads` validates a strict dispositions file and prints the exact `gh api` request plan for listing, replying to and resolving the review threads of any pull request; it never starts a process. A small launcher, `scripts/threads_run.py`, sits outside the package and runs the plan with the GitHub CLI when you run it yourself. See [docs/threads.md](docs/threads.md).
+
 ## Contributing
 
 Open an issue describing the change before sending a pull request, and link that issue from the pull request. Every change goes through a pull request; the `CI green` check must pass. Report security problems privately as described in [SECURITY.md](SECURITY.md).
