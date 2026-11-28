@@ -181,6 +181,25 @@ class ApplyTests(Case):
         self.assertEqual((code, out), (9, ""))
         self.assertEqual(self.writes(), [])
 
+    def test_a_resolve_target_the_read_did_not_return_writes_nothing(self):
+        rows = [{"comment_id": 102, "action": "reply", "body": "a"},
+                {"comment_id": 101, "action": "reply_resolve", "body": "b"}]
+        self.fake(read=[{"out": page([node("T2", 102)])}])
+        code, out, _ = self.run_plan(self.plan_file(rows))
+        self.assertEqual((code, out), (9, ""))
+        self.assertEqual(self.writes(), [])
+
+    def test_a_missing_thread_id_is_an_error_not_an_index_error(self):
+        from unittest import mock
+
+        rows = [{"comment_id": 101, "action": "reply_resolve", "body": "b"}]
+        self.fake(read=[{"out": page([node("T2", 102)])}])
+        with mock.patch.object(launcher.threads, "check_targets"):  # simulate the precondition being bypassed
+            code, out, _ = self.run_plan(self.plan_file(rows))
+        self.assertEqual(code, 8)
+        self.assertIn("resolve 101 failed", out)
+        self.assertEqual([("-X" in c["argv"]) for c in self.writes()], [True])
+
     def test_a_resolved_or_outdated_thread_is_not_a_target(self):
         gone = node("T1", 101)
         gone["isResolved"] = True

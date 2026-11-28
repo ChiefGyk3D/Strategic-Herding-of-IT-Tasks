@@ -100,6 +100,7 @@ def execute(plan, gh):
     found = read_threads(gh, plan, read_request)
     if plan["kind"] == "list":
         return _cli.OK, threads.format_list(found, plan["repo"], plan["pr"])
+    # Precondition, before any write: every replied or resolved comment is an unresolved thread of this PR (exit 9).
     threads.check_targets(found, [w["comment_id"] for w in writes])
     thread_of = {t["comment_id"]: t["thread_id"] for t in found}
     lines = []
@@ -110,7 +111,10 @@ def execute(plan, gh):
                 code, _out = gh.call(threads.request_args(plan, request))
                 ok = code == 0
             else:
-                ok = threads.resolved_ok(gh.json(threads.request_args(plan, request, thread_of[cid])))
+                thread_id = thread_of.get(cid)  # None only if the precondition above were bypassed: an error
+                ok = thread_id is not None and threads.resolved_ok(
+                    gh.json(threads.request_args(plan, request, thread_id))
+                )
         except _cli.CodedError as exc:
             lines.append(f"{done} of {len(writes)} done before this failure")
             return exc.code, lines
