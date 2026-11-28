@@ -52,6 +52,12 @@ ALLOWED_METHODS = {
     "_check_settings": {"execute"}, "fingerprint": {"execute"}, "expected_fingerprint": {"execute"},
     "write_transaction": {"execute"}, "_fail_transaction": {"execute"}, "_verify_unmapped": {"execute"},
     "_check_json": {"execute"},
+    # C3 (issue 61): reads, the snapshot owner and the three write helpers. Every statement in a write helper is a
+    # literal; the writes sit lexically inside `with write_transaction(conn)`.
+    "read_snapshot": {"execute"}, "_task_row": {"execute"}, "_history_rows": {"execute"}, "get_record": {"execute"},
+    "record_event": {"execute"}, "list_records": {"execute"}, "record_ids": {"execute"}, "list_events": {"execute"}, "_tip": {"execute"},
+    "create_task": {"execute"}, "transition_task": {"execute"}, "add_record": {"execute"},
+    "_verify_tasks_unmapped": {"execute"},
 }
 ALLOWED_REFLECTION = {("_open_once", "setconfig")}
 CONNECTORS = {"_open_once", "expected_fingerprint"}
@@ -60,7 +66,8 @@ BUILDERS = {(STORE, name) for name in (
     "schema_statements", "_guard", "_no_pair", "_queue_guards", "_lease_guards", "_chain_guard", "_stamp_check",
     "_slug_check", "_hex_check", "_text_check", "_seconds", "_pair_rows", "_kind_rules")}
 # Functions of the store that run their own BEGIN IMMEDIATE / pragmas / scratch in-memory database.
-TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "_fail_transaction", "expected_fingerprint"}
+TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "_fail_transaction", "expected_fingerprint",
+              "read_snapshot"}
 # A variable may be passed to execute only as the loop variable over `schema_statements()` in these two functions.
 SCHEMA_CONSUMERS = {"_install_schema", "expected_fingerprint"}
 
@@ -587,6 +594,80 @@ class BiteTests(unittest.TestCase):
         for source in good:
             with self.subTest(source=source):
                 self.assertEqual(access_findings(source, STORE, FUTURE), [], source)
+
+
+C3_WRITERS = ("create_task", "transition_task", "add_record")
+
+
+class TaskHelperLintTests(unittest.TestCase):
+    """Issue 61: the task, event and index helpers are on the list on purpose, and the list does not make them free."""
+
+    def test_each_write_helper_is_exactly_one_write_transaction(self):
+        tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
+        top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for name in C3_WRITERS:
+            _with_parents(top[name])
+            with self.subTest(name=name):
+                withs = [n for n in ast.walk(top[name]) if isinstance(n, ast.With)]
+                guarded = [w for w in withs if any(
+                    isinstance(i.context_expr, ast.Call) and getattr(i.context_expr.func, "id", "") == "write_transaction"
+                    for i in w.items)]
+                self.assertEqual(len(guarded), 1, name)
+                # Every statement that is not a read sits inside that one block.
+                writes = [n for n in ast.walk(top[name]) if isinstance(n, ast.Call) and getattr(n.func, "attr", "") == "execute"
+                          and not is_read_only(_text(n.args[0]) or "")]
+                self.assertGreaterEqual(len(writes), 2, name)
+                for call in writes:
+                    self.assertTrue(_in_write_transaction(call), name)
+
+    def test_the_read_helpers_never_write(self):
+        tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
+        top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for name in ("_task_row", "_history_rows", "get_task", "get_record", "record_event", "record_ids", "list_events",
+                     "_tip", "list_records", "_verify_tasks_unmapped"):
+            for call in ast.walk(top[name]):
+                if isinstance(call, ast.Call) and getattr(call.func, "attr", "") in EXECUTORS:
+                    with self.subTest(name=name):
+                        self.assertTrue(is_read_only(_text(call.args[0]) or ""), name)
+
+    def test_a_listed_helper_still_may_not_write_outside_its_transaction(self):
+        for name in C3_WRITERS:
+            source = 'def ' + name + '(conn):\n    conn.execute("INSERT INTO tasks VALUES (?)", row)'
+            with self.subTest(name=name):
+                self.assertTrue(access_findings(source, STORE), name)
+
+    def test_a_helper_that_is_not_on_the_list_may_not_execute_at_all(self):
+        source = 'def _insert_event(conn):\n    with write_transaction(conn):\n        conn.execute("INSERT INTO events VALUES (?)", row)'
+        found = access_findings(source, STORE)
+        self.assertIn("database method in a function not on the list", {kind for _, kind in found})
+
+    def test_text_built_sql_is_still_caught_inside_a_listed_helper(self):
+        sources = (
+            ("def create_task(conn, name):\n    with write_transaction(conn):\n"
+             '        conn.execute("INSERT INTO " + name + " VALUES (?)", row)'),
+            ("def add_record(conn, kind):\n    with write_transaction(conn):\n"
+             '        conn.execute(f"INSERT INTO records VALUES ({kind})", row)'),
+            ("def transition_task(conn, to):\n    sql = \"UPDATE tasks SET state = '%s'\" % to\n"
+             "    with write_transaction(conn):\n        conn.execute(sql)"),
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                found = access_findings(source, STORE) + sql_findings(source, STORE, BUILDERS)
+                self.assertTrue(found, source)
+
+    def test_the_read_snapshot_name_cannot_be_borrowed(self):
+        bad = (
+            'def f(conn):\n    conn.execute("BEGIN")',
+            'def innocent():\n    def read_snapshot(conn):\n        conn.execute("BEGIN")\n    return read_snapshot',
+            "def read_snapshot(conn):\n    pass\n\ndef read_snapshot(conn):\n    pass",
+            "read_snapshot = something",
+            "class Holder:\n    def read_snapshot(self):\n        pass",
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE), source)
+        self.assertEqual(access_findings('def read_snapshot(conn):\n    conn.execute("BEGIN")', STORE), [])
+        self.assertIn("read_snapshot", TXN_OWNERS)
 
 
 if __name__ == "__main__":
