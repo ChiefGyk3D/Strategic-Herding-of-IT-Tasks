@@ -1460,7 +1460,9 @@ class InitTests(Base):
 
     def test_a_name_that_no_longer_is_the_created_file_is_left_alone(self):
         def swap_then_fail(*args, **kwargs):
-            os.unlink(self.db)
+            # Keep the created file alive under another name, so the replacement cannot be given its inode number
+            # (a filesystem may reuse a freed inode at once, and the test must not depend on that either way).
+            os.rename(self.db, self.base / "created-file-kept")
             self.db.write_bytes(b"someone else's file")
             raise ShitError(errors.FAILED_CLOSED)
 
