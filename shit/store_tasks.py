@@ -54,8 +54,8 @@ def _body_path(kind, record_id):
 def _connect(project, create, busy_timeout_ms, *, write=False):
     """Open the store. A writer first makes the audit export current (or refuses a restored database, exit code 8);
     a reader refuses only a database that is provably not the one the export was made from (docs/audit-export.md)."""
-    if create:
-        store.init_store(project, busy_timeout_ms)  # a store that exists is verified and left alone
+    if create and not project.exists(store.DB_NAME):
+        store.init_store(project, busy_timeout_ms)
     conn = store.connect(project, busy_timeout_ms)
     try:
         if write:
