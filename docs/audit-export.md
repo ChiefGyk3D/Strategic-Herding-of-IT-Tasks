@@ -31,7 +31,7 @@ TIP events <seq> <hash> queue <seq> <hash> sha256 <hex>
 
 ## Where the tip is stored and when it is compared
 
-The tip is the footer of the export file itself, outside the database file. It is read from the last 1,024 bytes of the file (a bounded read), never by reading the whole export. The comparison with the database (`audit_export.compare`) asks, for each chain: does the database have a row at the export's sequence number, and is its hash the export's? The export's tips are read from the file BEFORE the database snapshot begins; an export is written after its commit, so a database read later always holds everything the export holds.
+The tip is the footer of the export file itself, outside the database file. Readers may obtain it from a bounded read of the last 1,024 bytes. Before a writer accepts an export as current, it reads the complete size-bounded file, verifies the footer body digest and both chains, and compares the verified tips with the database. An export is written after its commit, so a database read later always holds everything the export holds.
 
 | State | Meaning | Reader (`get_task`, `show`, `entry_for_key`) | Writer (every operation that writes) | `shit check` |
 |---|---|---|---|---|
@@ -64,7 +64,7 @@ Each adapter write is: open, then `audit_export.sync` (a writer makes the export
 
 ## Offline verifier
 
-`audit_export.verify_bytes(data)` takes the bytes of an export and returns the tips and the body digest, or raises. It checks, in this order of work: size, ASCII, the magic line, the footer and the body digest it records, then for each chain the sequence numbers, the recomputed hash of every line, the record itself (validated by the code that wrote it, and re-dumped to the same bytes), the id that follows the sequence (`event-0001`, `queue-0001`), and the replay rules: `EventLog.verify_lines` (unique ids, timestamps never going back, every transition continuing the task's history) for events and `queue_records.replay` (the whole queue state machine, one task at a time) for the queue. Finally the footer must name the tips the body has. A failure is exit code 8; over the size limit is 7. Nothing in the output names a record, a path or the failing line.
+`audit_export.verify_bytes(data)` takes the bytes of an export and returns the tips and the body digest, or raises. It checks, in this order of work: size, ASCII, the magic line, the footer and the body digest it records, then for each chain the sequence numbers, the recomputed hash of every line, the record itself (validated by the code that wrote it, and re-dumped to the same bytes), the id that follows the sequence (`event-0001`, `queue-0001`), and the replay rules: `EventLog.verify_lines` (unique ids, timestamps never going back, every transition continuing the task's history) for events and `queue_records.replay` (the whole queue state machine, one task at a time) for the queue. It also requires every task named by the queue chain to have a no-later creation event in the event chain. Finally the footer must name the tips the body has. A failure is exit code 8; over the size limit is 7. Nothing in the output names a record, a path or the failing line.
 
 The export is a plain file, so a copy kept off the machine verifies by itself: no database and no repository are needed (the module imports the store, so the Python `sqlite3` module must be importable, but it opens no database).
 
@@ -87,6 +87,7 @@ Output is fixed text: `audit-export: ok (events N, queue M)`, then `tip events N
 
 - `store: queue N tasks (state count, ...)`, `store: pending P, leases L live, E past expiry` (`P` is the waiting and ready tasks; a lease is past expiry when its task is `dispatched` or `running` and the lease's expiry is not after the clock; nothing is expired by the check);
 - every invariant that `store.verify(conn, deep=True)` (including `PRAGMA integrity_check`) and `store.verify_tasks` name, as `store: invariant <name> does not hold` (exit 8);
+- missing, unreadable, multiply linked or digest-mismatched record bodies, reported by fixed problem names without body content (the store finding is exit 8; the check's existing priority may select exit 3 or 5 when its file-backend scan reports the same damaged path);
 - the export: `store: audit export verified (events N, queue M)` (the whole file is verified, not only its footer), a warning when it is `behind`, and a failure for `missing`, `database_older`, `diverged`, a damaged or unreadable export (8 or 5), or a database that cannot be opened (the exit code of the refusal; a busy store is 13).
 
 The exit code is the check's usual priority (`docs/exit-codes.md`).

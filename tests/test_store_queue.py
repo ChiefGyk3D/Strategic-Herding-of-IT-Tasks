@@ -474,6 +474,53 @@ class ApplyTests(Base):
         self.assertEqual((self.count("apply_slots"), self.count("queue_entries")), (1, before))
         self.consistent()
 
+    def test_canonical_and_ancestor_targets_share_one_slot_identity(self):
+        first = self.apply_lease("canonical-a")
+        second = self.apply_lease("canonical-b")
+        store.queue_apply_start(self.conn, self.present(first), ["Src/Caf\u00e9"], self.tick())
+        for target in ("src/cafe\u0301", "SRC", "src/caf\u00e9/child"):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    code_of(
+                        store.queue_apply_start,
+                        self.conn,
+                        self.present(second),
+                        [target],
+                        self.tick(),
+                    ),
+                    errors.ILLEGAL_TRANSITION,
+                )
+        self.assertEqual(
+            self.conn.execute("SELECT target FROM apply_slots").fetchone()[0],
+            "src/caf\u00e9",
+        )
+        self.consistent()
+
+    def test_apply_targets_refuse_ambiguous_path_syntax(self):
+        lease = self.apply_lease("ambiguous")
+        for target in ("a\\b", "C:/x", "c:x", "line\nfeed"):
+            with self.subTest(target=target):
+                self.assertEqual(
+                    code_of(
+                        store.queue_apply_start,
+                        self.conn,
+                        self.present(lease),
+                        [target],
+                        self.tick(),
+                    ),
+                    errors.CONFINEMENT,
+                )
+        self.assertEqual(
+            code_of(
+                store.queue_apply_start,
+                self.conn,
+                self.present(lease),
+                ["tree", "tree/child"],
+                self.tick(),
+            ),
+            errors.REJECTED,
+        )
+
     def test_every_way_a_lease_ends_drops_the_slots_first(self):
         for how in ("submit", "fail", "hold", "reclaim", "expire"):
             with self.subTest(how=how):

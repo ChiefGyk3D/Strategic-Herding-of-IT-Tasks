@@ -236,6 +236,33 @@ backend = "sqlite"
         self.assertEqual(self.ok("init"), {"initialized": True})
         self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
 
+    def test_explicit_sqlite_init_requires_sqlite_in_configuration(self):
+        code, _out, err = self.run_cli("init", "--backend", "sqlite")
+        self.assertEqual((code, err), (2, "shit: usage error\n"))
+        self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
+
+    def test_sqlite_init_refuses_existing_file_backend_state(self):
+        self.new_task()
+        (self.repo / "config.toml").write_text("""schema_version = 1
+[project]
+name = "example-project"
+[tracker]
+repository = "example-owner/example-repo"
+[review]
+destination = "reviewer"
+[storage]
+root = ".shit"
+[log]
+file = ".shit/events.jsonl"
+[local_model]
+context_tokens = 32768
+[store]
+backend = "sqlite"
+""")
+        code, _out, err = self.run_cli("init", "--backend", "sqlite")
+        self.assertEqual((code, err), (9, "shit: precondition missing\n"))
+        self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
+
     def test_model_cannot_approve_or_accept(self):
         self.new_task()
         code, _, err = self.run_cli(

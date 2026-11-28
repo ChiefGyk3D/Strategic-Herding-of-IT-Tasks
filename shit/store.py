@@ -20,6 +20,7 @@ import secrets
 import sqlite3
 import stat
 import sys
+import unicodedata
 from datetime import UTC, datetime, timedelta
 
 from . import dependencies, lifecycle, queue_records, records
@@ -2267,7 +2268,7 @@ def queue_reclaim(conn, task_id, actor, now, *, config=None, met=None, key=None)
 
 
 def _target_or_reject(target):
-    """A repository-relative path, no empty, `.` or `..` component, never under `.shit` (Q-SER-07)."""
+    """Return the canonical slot key for one repository-relative apply target."""
     if not isinstance(target, str) or not 1 <= len(target) <= MAX_TEXT:
         raise ShitError(REJECTED)
     try:
@@ -2275,9 +2276,14 @@ def _target_or_reject(target):
     except ContractError:
         raise ShitError(REJECTED) from None
     parts = target.split("/")
-    if target.startswith("/") or any(part in ("", ".", "..") for part in parts) or parts[0] == ".shit":
+    if (target.startswith("/") or "\\" in target or "\n" in target
+            or (len(target) >= 2 and target[0].isascii() and target[0].isalpha() and target[1] == ":")
+            or any(part in ("", ".", "..") for part in parts)):
         raise ShitError(CONFINEMENT)
-    return target
+    key = "/".join(unicodedata.normalize("NFC", part).casefold() for part in parts)
+    if key.split("/", 1)[0] == ".shit":
+        raise ShitError(CONFINEMENT)
+    return key
 
 
 def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, key=None):
@@ -2289,6 +2295,8 @@ def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, k
     wanted = sorted({_target_or_reject(target) for target in targets})
     if len(wanted) != len(targets):
         raise ShitError(REJECTED)
+    if any(child.startswith(parent + "/") for index, parent in enumerate(wanted) for child in wanted[index + 1:]):
+        raise ShitError(REJECTED)
     config, key = _options(now, config, key)
     with write_transaction(conn):
         if _keyed(conn, key, _task_of(presented), ("apply_started",)) is not None:
@@ -2297,8 +2305,10 @@ def queue_apply_start(conn, presented, targets, now, *, config=None, met=None, k
         queued, lease = _presented(conn, presented)
         if queued["state"] != "running" or lease["step"] != "apply" or queued["apply_phase"] is not None:
             raise ShitError(ILLEGAL_TRANSITION)
+        held_targets = [row[0] for row in conn.execute("SELECT target FROM apply_slots").fetchall()]
         for target in wanted:
-            if conn.execute("SELECT 1 FROM apply_slots WHERE target = ?", (target,)).fetchone() is not None:
+            if any(held == target or held.startswith(target + "/") or target.startswith(held + "/")
+                   for held in held_targets):
                 raise ShitError(ILLEGAL_TRANSITION)
         task_id = presented["task_id"]
         _append_entry(conn, _lease_fields(task_id, lease, "apply_started", "running"), now, key)
