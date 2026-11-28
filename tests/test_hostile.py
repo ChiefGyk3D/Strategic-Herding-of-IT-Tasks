@@ -765,7 +765,7 @@ class NetworkDenial(unittest.TestCase):
             with self.subTest(src=src):
                 self.assertTrue(process_launch_uses(src), src)
         good = ("import os\nos.path.join('a')", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
-                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import re\nre.compile('x')", "import hashlib")
+                "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nold = os.umask(0o77)\nos.readlink('/proc/self/fd/3')", "import re\nre.compile('x')", "import hashlib")
         for src in good:
             with self.subTest(src=src):
                 self.assertEqual(process_launch_uses(src), set(), src)
@@ -884,7 +884,8 @@ def process_launch_uses(source):
 OS_ALLOWED_ATTRS = frozenset({
     "O_APPEND", "O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK", "O_RDONLY", "O_RDWR",
     "O_WRONLY", "close", "dup", "environ", "fchmod", "fdopen", "fspath", "fstat", "fsync", "getcwd", "geteuid",
-    "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "rename", "sep", "stat", "unlink", "write",
+    "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "readlink", "rename", "sep", "stat",
+    "umask", "unlink", "write",
 })
 
 
