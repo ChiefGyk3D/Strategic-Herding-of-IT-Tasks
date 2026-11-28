@@ -270,7 +270,10 @@ def verify_bytes(data):
 def _open_private(project):
     """The export's descriptor and stat result below `.shit`, or None when it does not exist.
 
-    No symlink is followed; the file must be a regular, single-link file of this user whose mode is within 0600."""
+    No symlink is followed. The opened inode must be a regular file of this user whose mode is within 0600 and whose
+    link count is 0 or 1. Zero links is valid when atomic replacement unlinks the verified inode after it was opened;
+    two or more links are refused as a hard-link violation.
+    """
     try:
         fd = os.open(EXPORT_PATH, _READ_FLAGS, dir_fd=project._fd)
     except FileNotFoundError:
