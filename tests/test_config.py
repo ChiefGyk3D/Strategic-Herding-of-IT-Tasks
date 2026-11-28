@@ -287,13 +287,11 @@ class ConfigLimitsTests(unittest.TestCase):
 
 
 class ConfigStoreTests(unittest.TestCase):
-    def test_backend_defaults_to_files_and_accepts_only_named_backends(self):
-        self.assertEqual(config.parse(GOOD)["store"]["backend"], "files")
-        for backend in ("files", "sqlite"):
-            with self.subTest(backend=backend):
-                parsed = config.parse(GOOD + f'\n[store]\nbackend = "{backend}"\n')
-                self.assertEqual(parsed["store"]["backend"], backend)
-        for bad in ('"other"', "true", "1"):
+    def test_backend_defaults_to_sqlite_and_refuses_removed_file_protocol(self):
+        self.assertEqual(config.parse(GOOD)["store"]["backend"], "sqlite")
+        parsed = config.parse(GOOD + '\n[store]\nbackend = "sqlite"\n')
+        self.assertEqual(parsed["store"]["backend"], "sqlite")
+        for bad in ('"files"', '"other"', "true", "1"):
             with self.subTest(bad=bad):
                 self.assertEqual(
                     code_of(config.parse, GOOD + f"\n[store]\nbackend = {bad}\n"), 3
@@ -304,7 +302,7 @@ class ConfigStoreTests(unittest.TestCase):
 
         self.assertEqual(
             config.parse(GOOD)["store"],
-            {"backend": "files", "busy_timeout_ms": store.DEFAULT_BUSY_TIMEOUT_MS},
+            {"backend": "sqlite", "busy_timeout_ms": store.DEFAULT_BUSY_TIMEOUT_MS},
         )
         self.assertEqual(
             config.parse(GOOD + "\n[store]\nbusy_timeout_ms = 0\n")["store"][
@@ -332,7 +330,7 @@ class ConfigStoreTests(unittest.TestCase):
 
     def test_template_documents_the_store_wait_as_a_comment(self):
         text = (TEMPLATES / "config.toml").read_text(encoding="utf-8")
-        self.assertRegex(text, r'(?m)^# backend = "files"')
+        self.assertRegex(text, r'(?m)^# backend = "sqlite"')
         self.assertRegex(text, r"(?m)^# busy_timeout_ms = 60000")
 
 

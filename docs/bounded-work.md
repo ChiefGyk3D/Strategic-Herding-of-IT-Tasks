@@ -1,6 +1,6 @@
 # Bounded work
 
-Every scan and listing the file protocol runs has a ceiling, and a ceiling that trips fails closed with exit code 7 (`input_limit`). The work that was skipped is never reported as clean. This closes the M4 follow-up from issue 17 (tracked in issue 54). These bounds read directories and files, not the queue, so they stay valid when the SQLite store lands (issue 57).
+Every configured scan and confined directory listing has a ceiling, and a ceiling that trips fails closed with exit code 7 (`input_limit`). The skipped work is never reported as clean. These bounds apply to record bodies and repository files; queue state is read from SQLite.
 
 | Bound | Where | Value | On trip |
 |---|---|---|---|

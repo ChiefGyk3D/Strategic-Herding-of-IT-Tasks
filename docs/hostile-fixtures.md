@@ -9,7 +9,6 @@ Rows marked `none` have no risk-register row. They are gaps in `docs/threat-mode
 | ID | Fixture | Row | Expected exit | Test |
 |---|---|---|---|---|
 | H-01 | `duplicate-key-nested.json`, `duplicate-key-event.jsonl`: repeated key in a history entry and in an event | TM-02 | 3 | `Hostile.test_duplicate_keys` |
-| H-02 | `duplicate-key-nested.json` planted in the store and read through the CLI | TM-02 | 3 | `Hostile.test_duplicate_key_planted_on_disk` |
 | H-03 | `version-true.json`, `version-float.json`: version true and 1.0 | TM-03 | 3 | `Hostile.test_version_confusion` |
 | H-04 | `unknown-field-nested.json`: unknown key in a history entry | TM-13 | 3 | `Hostile.test_unknown_field_in_nested_object` |
 | H-05 | `depth-9.json`, a bracket bomb, an oversize record, a record file over the limit | TM-11 | 7 | `Hostile.test_depth_and_size_limits` |
@@ -22,22 +21,17 @@ Rows marked `none` have no risk-register row. They are gaps in `docs/threat-mode
 | H-09 | a model or the wrapper moves a reviewed task to approved | TM-10 | 10 | `Hostile.test_only_a_human_can_approve` |
 | H-09b | illegal moves, tested at the matrix and at the command | TM-12 | 4 | `Hostile.test_transition_matrix_alone` |
 | H-10 | an accepted decision recorded by a model or the wrapper | TM-10 | 10 | `Hostile.test_decision_by_non_human_actor` |
-| H-11 | a non-human accepted decision forged on disk with a chained event | TM-10 | 10 | `Hostile.test_forged_non_human_decision_cannot_close` |
 | H-12 | a passing review by the wrapper | TM-10 | 9 | `Hostile.test_non_human_review_cannot_unlock_close` |
 | H-13 | dot-dot, absolute, NUL, empty, dot and store-internal evidence paths | TM-04 | 5 | `Hostile.test_path_escape_in_evidence_path` |
 | H-13b | dot-dot that resolves inside the store, and outside it, on every store call | TM-04 | 5 | `Hostile.test_path_escape_in_store_paths` |
-| H-14 | symlinked evidence file, evidence directory, record, event log and store | TM-05 | 5 | `Hostile.test_symlinks` |
+| H-14 | symlinked evidence file, evidence directory, indexed body and store | TM-05 | 5 | `Hostile.test_symlinks` |
 | H-14b | a store subdirectory swapped for a symlink | TM-05 | 5 | `Hostile.test_symlinked_subdirectory_of_store` |
-| H-15 | hard-linked evidence, event log and record | TM-05 | 5 | `Hostile.test_hard_links` |
-| H-16 | a FIFO as evidence, record, chain file and lock file, with a 5 second alarm | TM-05 | 5 | `Hostile.test_fifos` |
+| H-15 | hard-linked evidence and indexed body | TM-05 | 5 | `Hostile.test_hard_links` |
+| H-16 | a FIFO as evidence or a record body, with a 5 second alarm | TM-05 | 5 | `Hostile.test_fifos` |
 | H-17 | a socket, a directory, and block and character device modes | TM-05 | 5 | `Hostile.test_sockets_and_directories_and_devices` |
-| H-18 | evidence over 16 MiB, a record over 64 KiB, an event line over 64 KiB, an over-long title | TM-11 | 7 or 3 | `Hostile.test_oversize_evidence_and_records` |
-| H-19 | a deeply nested or malformed `pending.json` | TM-14, TM-11 | 3 | `Hostile.test_planted_pending_record_bomb` |
-| H-19b | a `pending.json` whose chain entry does not follow the log | TM-14 | 3 | `Hostile.test_forged_pending_with_wrong_chain` |
-| H-20 | the chain file against an independent recomputation | TM-12 | 0 | `Hostile.test_chain_matches_independent_recomputation` |
-| H-21 | swapped, deleted, truncated, edited, duplicated and appended events; bad chain entries | TM-12 | 3 or 4 | `Hostile.test_reordered_deleted_edited_events` |
-| H-22 | blank line, missing newline, CRLF, forged duplicate id with a recomputed chain | TM-12 | 3 | `Hostile.test_log_shape_attacks` |
-| H-23 | a chained event whose record file does not exist | none | 9 | `Hostile.test_forged_event_without_record` |
+| H-18 | evidence over 16 MiB, an indexed body over 64 KiB, and an over-long title | TM-11 | 7 or 3 | `Hostile.test_oversize_evidence_and_records` |
+| H-20 | database event hashes against an independent recomputation | TM-12 | 0 | `Hostile.test_chain_matches_independent_recomputation` |
+| H-21 | a database event edited without updating its hash | TM-12 | 8 | `Hostile.test_reordered_deleted_edited_events` |
 | H-24 | evidence edited, deleted or replaced by a symlink after it was recorded | none | 3, 9 or 5 | `Hostile.test_tampered_evidence_file` |
 | H-25 | a record edited, copied under another id, or dropped in without an event | none | 3 or 9 | `Hostile.test_tampered_record_files` |
 | H-26 | evidence files named with bidi, newline, escape, zero-width or tab characters | TM-01 | 3 | `Hostile.test_hostile_file_names` |
@@ -59,7 +53,7 @@ Rows marked `none` have no risk-register row. They are gaps in `docs/threat-mode
 - TM-06 and TM-07 (subprocess argv and environment): no code on main launches a process. H-28 and H-29d show that shell syntax is data and that no module imports `subprocess`. The adapters issue owns the full tests.
 - TM-09 (fail-closed hooks): the check command is not on main.
 - Device nodes (TM-05): creating one needs privilege, so H-17 tests the type check against block and character device modes rather than a real node.
-- A local attacker who can rewrite both `events.jsonl` and `events.chain` consistently is accepted by design (stage one is not signed; see the threat model residual risks). H-22 shows the recomputed-chain case is still stopped by the per-event rules (duplicate id).
+- A local attacker who can rewrite the database and its audit export consistently is inside the same-user residual risk described in the threat model; the store is not a signature boundary.
 
 ## Store concurrency and crash harness
 

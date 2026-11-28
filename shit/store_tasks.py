@@ -1,8 +1,7 @@
 """Tasks, events and records on the database store, with the signatures of `task.py` and `commands.py` (issue 61).
 
-This is the adapter layer for the port from the file protocol: a caller that used `task.create_task`, `task.transition`
-or one of the `commands` functions finds the same name and arguments here and gets the same result and the same exit
-codes. The file protocol is left in place until the CLI and the queue move over (issue 63); nothing here touches it.
+This is the store adapter layer: a caller that used `task.create_task`, `task.transition` or one of the `commands`
+functions finds the same name and arguments here and gets the same result and the same exit codes.
 
 A record BODY is still a file under `.shit/`, written to its final name before the database transaction and compared
 with its digest in the records index after it. The index row, the event and (for a task) the state change are one
@@ -14,6 +13,8 @@ state, owner, history and times come from the database, and `get_task` joins the
 """
 
 import hashlib
+import os
+import stat
 
 from . import artifacts, audit_export, commands, records, store
 from . import task as task_mod
@@ -26,6 +27,7 @@ from .errors import (
     USAGE,
     ShitError,
 )
+from .project import bounded_names
 
 _TASK_DIR = "tasks"
 _MAX_BODY = records.MAX_RECORD_BYTES
@@ -52,8 +54,8 @@ def _body_path(kind, record_id):
 def _connect(project, create, busy_timeout_ms, *, write=False):
     """Open the store. A writer first makes the audit export current (or refuses a restored database, exit code 8);
     a reader refuses only a database that is provably not the one the export was made from (docs/audit-export.md)."""
-    if create:
-        store.init_store(project, busy_timeout_ms)  # a store that exists is verified and left alone
+    if create and not project.exists(store.DB_NAME):
+        store.init_store(project, busy_timeout_ms)
     conn = store.connect(project, busy_timeout_ms)
     try:
         if write:
@@ -104,23 +106,38 @@ def verify_bodies(project, conn, *, include_orphans=False):
     """Read-only: names of the problems between the records index and the body files.
 
     `body_missing` (no file under a recorded name), `body_unreadable` (a symlink, a second link or a special file there)
-    and `body_differs_from_index` (bytes that do not match the digest).
-    A file with no index row is not a problem: it is what a crash between the body and the transaction leaves."""
+    and `body_differs_from_index` (bytes that do not match the digest). With `include_orphans`, the bounded directory
+    scan also reports `body_orphan` and `body_unexpected_name`; it uses lstat before any body is opened."""
     found = set()
-    rows = store.list_records(conn)
+    rows = store.list_records(conn) if conn is not None else []
     if include_orphans:
         indexed = {(row["kind"], row["record_id"]) for row in rows}
         for kind in ("task", *commands.DIRS):
             try:
-                names = project.list_dir(_directory(kind))
+                fd = project._walk((_directory(kind),))
             except ShitError as exc:
                 if exc.code == PRECONDITION:
                     continue
                 raise
-            for name in names:
-                record_id = name[:-5] if name.endswith(".json") else ""
-                if records.SLUG.fullmatch(record_id) and (kind, record_id) not in indexed:
-                    found.add("body_orphan")
+            try:
+                for name in bounded_names(fd):
+                    try:
+                        entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    except OSError:
+                        found.add("body_unreadable")
+                        continue
+                    if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                        found.add("body_unreadable")
+                        continue
+                    if not name.endswith(".json"):
+                        continue  # workflow files (for example reports/<id>.md) can share these directories
+                    record_id = name[:-5]
+                    if not records.SLUG.fullmatch(record_id):
+                        found.add("body_unexpected_name")
+                    elif (kind, record_id) not in indexed:
+                        found.add("body_orphan")
+            finally:
+                os.close(fd)
     for row in rows:
         try:
             data = project.read(_body_path(row["kind"], row["record_id"]), limit=_MAX_BODY)

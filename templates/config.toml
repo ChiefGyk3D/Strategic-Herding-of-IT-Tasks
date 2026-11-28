@@ -65,8 +65,8 @@ context_tokens = 32768
 
 # Optional SQLite store settings (docs/store.md). Remove the leading "# " from the header and the key to set it.
 # [store]
-# Backend used by task, record and queue commands: "files" or "sqlite". Default: "files".
-# backend = "files"
+# Task, record and queue commands use SQLite. The removed "files" value is refused. Default: "sqlite".
+# backend = "sqlite"
 # How long a write waits for another process to release the store lock, in milliseconds, 0 to 600000.
 # 0 fails at once. A wait that runs out is exit code 13 ("store busy"), safe to retry. Default: 60000.
 # busy_timeout_ms = 60000

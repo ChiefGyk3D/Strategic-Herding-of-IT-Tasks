@@ -33,7 +33,7 @@ _MAX_TEXT = 500
 _MAX_ROLES = 16
 _MAX_LIMIT = 10_000_000
 _MODES = ("warn", "fail")
-_BACKENDS = ("files", backend_name.SQLITE)
+_BACKENDS = (backend_name.SQLITE,)
 
 # Event kinds the yardstick report (shit/yardstick.py) can weight, in docs/schemas.md event order.
 WEIGHT_KEYS = (
@@ -86,7 +86,7 @@ DEFAULTS = {
     "limits": {"on_exceed": "warn"},
     "yardstick": {name: 1 for name in WEIGHT_KEYS},
     "store": {
-        "backend": "files",
+        "backend": backend_name.SQLITE,
         "busy_timeout_ms": 60000,
     },  # store.py keeps the timeout default equal
 }

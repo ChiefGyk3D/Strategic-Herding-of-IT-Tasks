@@ -13,12 +13,18 @@ import os
 import sys
 from collections import Counter
 
-from . import commands, config
-from . import task as task_mod
+from . import commands, config, store, store_tasks
 from ._text import decode, read_bounded
 from .cli_tasks import _Parser
-from .errors import INTERNAL, MESSAGES, OK, USAGE, ContractError, ShitError
-from .log import EventLog
+from .errors import (
+    FAILED_CLOSED,
+    INTERNAL,
+    MESSAGES,
+    OK,
+    USAGE,
+    ContractError,
+    ShitError,
+)
 from .project import Project, discover_root
 
 MAX_ROWS = 100
@@ -30,27 +36,22 @@ def _counts(counter):
 
 
 def compute(project, weights=None):
-    """Return the yardstick report for an open project. Raises ShitError if the log fails verification."""
+    """Return the yardstick report for an open project. Raises ShitError if the store fails verification."""
     weights = dict(DEFAULT_WEIGHTS if weights is None else weights)
-    log = EventLog(project)
-
-    def run():
-        with project.locked():
-            task_mod._recover(project, log, "reader")
-            events = log.verify()
+    conn = store_tasks._connect(project, False, None)
+    try:
+        with store.read_snapshot(conn):
+            if (store.verify(conn, deep=True) or store.verify_tasks(conn)
+                    or store_tasks.verify_bodies(project, conn)):
+                raise ShitError(FAILED_CLOSED)
             outcomes, verdicts = Counter(), Counter()
-            first = {}  # (kind, record_id) -> first matching event, so each load is O(1), not a log scan
-            for event in events:
-                first.setdefault((event["event"], event.get("record_id")), event)
+            events = store.list_events(conn)
             for kind, tally, key in (("report", outcomes, "outcome"), ("review", verdicts, "verdict")):
                 for event in events:
                     if event["event"] == commands.EVENT[kind]:
-                        rid = event.get("record_id")  # a missing id is refused by _load with exit code 3
-                        match = first[(event["event"], rid)]
-                        tally[commands._load(project, [match], kind, rid)[key]] += 1
-            return events, outcomes, verdicts
-
-    events, outcomes, verdicts = task_mod._guarded(run)
+                        tally[store_tasks._load(project, conn, kind, event.get("record_id"))[key]] += 1
+    finally:
+        conn.close()
     by_kind = Counter(e["event"] for e in events)
     state, per_task = {}, {}
     for event in events:

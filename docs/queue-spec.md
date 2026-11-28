@@ -2,7 +2,9 @@
 
 **SELF-REVIEW:** This is an initial design self-review. A human peer review is still required before implementation (issues 17 and 18) or reliance on these rules.
 
-This document specifies the dependency graph, queue states, leases, atomic claims, apply serialization, retry and hold rules, crash recovery and parallelism metrics for the `shit` wrapper. It builds on `docs/lifecycle.md`, `docs/schemas.md`, `docs/exit-codes.md` and `docs/threat-model.md`. It is the normative statement of the intended behavior. The queue, leases and recovery are implemented in `shit/queue.py`, `shit/queue_records.py` and `shit/dependencies.py`; `docs/queue.md` records what was built, where it differs from this text and what is still open, and apply serialization (issue 18) is not built.
+SQLite transactions, tables, and the audit export provide the persistence and recovery mechanism described in `docs/store.md`. The removed multi-file protocol is not part of this specification.
+
+This document specifies the dependency graph, queue states, leases, atomic claims, apply serialization, retry and hold rules, crash recovery and parallelism metrics for the `shit` wrapper. It builds on `docs/lifecycle.md`, `docs/schemas.md`, `docs/exit-codes.md` and `docs/threat-model.md`. The queue and leases are implemented in `shit/store.py` and `shit/store_queue.py`; `queue_records.py` remains the pure validator and replay model.
 
 Rule IDs have the form `Q-<AREA>-<NN>`. Each rule is one testable statement. Hostile cases map to threat-model rows `TM-15` through `TM-24` in `docs/threat-model.md`. Words such as "must" are requirements on the implementation.
 
@@ -11,28 +13,27 @@ Rule IDs have the form `Q-<AREA>-<NN>`. Each rule is one testable statement. Hos
 ## Principles
 
 1. Only genuine input dependencies and conflicting application steps block work. Drafts and reviews never wait on apply-only dependencies.
-2. The queue is plain files under the confined `.shit` root. No network, daemon, database or clock service is needed or assumed.
-3. The wrapper is the only writer of queue state. A worker, human or machine, asks the wrapper to claim, start, renew, release or finish. Workers never write queue files.
+2. The queue is stored in the confined SQLite database. No network, daemon, or external clock service is needed or assumed.
+3. The wrapper is the only writer of queue state. A worker, human or machine, asks the wrapper to claim, start, renew, release or finish. Workers never write store rows directly.
 4. Any AI tool, script or human can be a worker. A worker is a label plus capability tags. Nothing in the queue names a model, vendor, account or host.
 5. Unknown or unverifiable queue state fails closed with exit code 8, as `docs/threat-model.md` requires for hooks.
 6. `QUEUE.md` is a generated view. It is never read as input.
 
-## Files
+## Stored state
 
-| Path under `.shit` | Content | Writer |
-|---|---|---|
-| `deps/<task-id>.json` | One `dependency-shard` record per dependent task (below). Present only while the task has edges. | wrapper, under lock |
-| `queue-anchor.json` | The entry count, chain tip and per-task generation high-water marks, advanced with every commit and checked on every load (Q-RES-02). | wrapper, under lock |
-| `queue.jsonl` | Append-only JSON Lines `queue-entry` records, hash-chained like the event log. | wrapper, under lock |
-| `leases/<task-id>.json` | One `lease` record. Present only while a lease is live or being reclaimed. | wrapper, under lock |
-| `apply/<sha256-of-target>.json` | One `apply-slot` record. Present only while an apply step holds that target. | wrapper, under lock |
-| `QUEUE.md` | Generated human-readable view. | wrapper, derived |
+| SQLite table | Content |
+|---|---|
+| `queue_entries` | Append-only, hash-chained queue entries. |
+| `edges` | Typed dependency edges. |
+| `leases` | One live lease per task. |
+| `apply_slots` | Canonical targets held by apply work. |
+| `tasks`, `task_history`, `events` | Lifecycle state and its audit chain. |
 
-All files follow the common rules in `docs/schemas.md` (UTF-8, duplicate-key rejection, unknown-key rejection, 65,536-byte limit, depth 8, `Z` timestamps, slugs). The new record types below start at `schema_version` 1. They do not change any existing record, so no existing schema version changes (see open question OQ-2 for the event log).
+The database schema enforces types and relationships; wrapper validators enforce record shape, text, time, graph, and queue-transition rules before writes. `QUEUE.md`, when produced, is a derived view only.
 
 ### dependency-shard record
 
-The graph is sharded per dependent task (owner decision on OQ-5, 2026-11-27). `schema` `dependency-shard`, `schema_version` 1, `task_id` (slug, the dependent; it must equal the file name), `needs`: array of objects with `needs_id` (slug, the prerequisite) and `type` (`draft`, `apply`, `review` or `decision`). Each edge lives in exactly one shard. A shard holds at most 200 `needs` (`MAX_NEEDS_PER_TASK`, far below the 65,536-byte record limit) and at most 2,000 tasks are queued or have shards (`MAX_TASKS`); a breach is exit code 7. A change to the graph writes every affected shard and one `graph_changed` queue entry that records the SHA-256 of each written shard (a deleted shard records 64 zeros), so the chain proves the graph. A shard file with no chain entry, a missing or edited shard, a record id that differs from its file name, an oversize shard, a leftover single-file `dependencies.json`, a cycle or a dangling edge makes every queue operation exit code 8.
+`dependencies.dump_shard` defines canonical bytes for the edges of one dependent task. The database does not write those bytes to a shard file; their digest is stored in each `graph_changed` queue entry as audit evidence. Each dependent has at most 200 needs and at most 2,000 dependent tasks may have edges; a breach is exit code 7. Cycles, self edges, dangling edges, and unauthorized graph changes are refused.
 
 ### queue-entry record
 
@@ -94,7 +95,7 @@ Rules:
 
 ## Queue states
 
-The queue state is stored in `queue.jsonl` and must agree with the task's lifecycle state. `shit check` verifies the agreement.
+The queue state is the latest applicable row in `queue_entries` and must agree with the task's lifecycle state. `shit check` verifies the agreement.
 
 | Queue state | Meaning | Lifecycle state | Lease |
 |---|---|---|---|
@@ -108,7 +109,7 @@ The queue state is stored in `queue.jsonl` and must agree with the task's lifecy
 | `failed` | An attempt failed; a human decides what next. | `failed` | none |
 | `done` | Complete. Terminal. | `closed` | none |
 
-- **Q-ST-01.** Every task has exactly one queue state at any time, equal to the `state_after` of its latest queue entry. Test: replay of `queue.jsonl` yields one state per task and `check` compares it to the lifecycle mapping above.
+- **Q-ST-01.** Every queued task has exactly one queue state at any time, equal to the `state_after` of its latest state-bearing queue entry. Test: replay of the database queue entries yields one state per task and `check` compares it to the lifecycle mapping above.
 - **Q-ST-02.** `hold-owner` and `hold-ci` both require `blocked_reason` and `blocking_item` on the task, as the lifecycle requires, and a `hold_kind` on the queue entry. Test: a hold entry without those fields is rejected with exit code 3.
 - **Q-ST-03.** Only transitions in the table below are legal. Every other pair, including repeating a state, is refused with exit code 4 without modifying the queue, leases or event log. Test: enumerate all 81 pairs; exactly the listed ones succeed in a suitable fixture.
 - **Q-ST-04.** A queue transition that implies a lifecycle transition performs both in one locked operation using the existing pending-record commit point, with the actor rules of `docs/lifecycle.md`. If the lifecycle transition is illegal, the queue transition is illegal. Test: inject a failure between the two; recovery leaves both or neither.
@@ -156,7 +157,7 @@ A worker claims a step of a task for a bounded time. The claim creates a lease. 
 - **Q-LEASE-05.** Expiry is applied lazily, under the lock, at the start of every queue operation (not by a background process). An expired lease on a `dispatched` task is removed and the task returns to `ready` with an `expired` entry. Test: advance a fake clock; the next operation reclaims.
 - **Q-LEASE-06.** An expired lease on a `running` task is removed, an `expired` entry is written, and the task moves to `failed` with actor `wrapper` and reason `lease expired`, because the lifecycle forbids `running` to `open`. A human reopens it (Q-RET-03). Test: expiry of a running lease ends in `failed`, never `ready`.
 - **Q-LEASE-07.** A lease expiry also releases every apply slot held under that lease (Q-SER-05). Test: expire a running apply step; the slot file is gone.
-- **Q-LEASE-08.** Clock safety: the wrapper keeps the newest timestamp it has recorded in `queue.jsonl`. If the current clock reads earlier than that timestamp, the wrapper does no expiry and no claim, and returns exit code 8 until the clock is no earlier. Test: set the fake clock back by one second; claim and expiry both refused with exit code 8.
+- **Q-LEASE-08.** Clock safety: the wrapper compares the clock with the newest database queue and event timestamps. If the current clock is earlier, it does no expiry and no claim, and returns exit code 8 until the clock is no earlier. Test: set the fake clock back by one second; claim and expiry both refuse with exit code 8.
 - **Q-LEASE-09.** Early expiry caused by a forward clock jump is safe because fencing (Q-LEASE-02) and apply slots (Q-SER-04) hold regardless of time. It may cause duplicate work but never a double apply. Test: jump the clock forward past the TTL while the worker is alive; the worker's next operation is refused, and a second claim does not produce two applies.
 - **Q-LEASE-10.** A lease file is trusted only if it matches the latest `claimed` or `renewed` queue entry for the task (same `lease_id` and `generation`). A lease file with no matching entry is an orphan and is handled by recovery (Q-REC-03). Test: hand-written lease file does not grant any operation.
 - **Q-LEASE-11.** Lease files and queue files are opened under the confinement rules of `docs/threat-model.md` (realpath containment, no symlink, no extra hard link, regular files only, restrictive mode). Violations return exit code 5.
@@ -204,14 +205,11 @@ If the file was not actually affected (for example the edit touched a different 
 
 ## Crash recovery
 
-- **Q-REC-01.** Every queue mutation uses the commit-point pattern of `shit/task.py`: validate, write `pending.json` (the commit point), apply lease, queue entry, chain entry and any lifecycle record idempotently, remove `pending.json`. Test: inject a crash after each stage and run `queue.recover`; the end state equals an uninterrupted run. A task-only `pending.json` is finished by the next entry point once the planner has proven the queue state; a `queue-pending.json` is never finished by an ordinary entry point, which refuses on sight (Q-REC-02), and only `queue.recover` applies it.
-- **Q-REC-02.** Recovery is one planner and one write path for both subsystems, and an ordinary entry point never runs it for a queue commit. Entry points refuse on sight: every locked entry point of the task, evidence, report, review, decision, yardstick and queue commands that finds `queue-pending.json` returns exit code 8 and writes nothing, whether the record is genuine or planted, so a record that is merely present is never applied by whichever command runs next. The named operation `queue.recover(project)` is the only one that applies a queue commit. A pending task commit (`pending.json`) is still finished by the next entry point, but only after the planner proved the whole queue state against the task image it would write. The planner only reads. For a pending queue commit it parses the record from its own bytes (a size-limit failure is a rejection, exit code 8), applies a torn tail virtually, and proves the anchor (count and tip at the pre-commit prefix or at this exact commit, and per-task generation marks equal to the replayed state at that point), the chain tail, every lease, lifecycle and shard effect against the replay of the verified prefix plus the entry, the lifecycle step against the task file and the verified event log (time order, legal transition), that the lease path is free or holds this commit's lease, that a lease to remove is absent or exactly the live lease the replay names, and that every append still to be made (queue, chain, nested event) fits under the size cap. The nested task record is proven completely: the event prefix and chain, the candidate as the legal next event with the expected id, and the pending task image as exactly what that event does to the task file. When no queue commit is pending, task and artifact writers and queue operations prove the whole queue state (chain, replay, anchor, graph, lifecycle agreement) and the event log before they commit; readers (`get_task`, `show`, yardstick) prove only when a pending task record forces a write. Writes start only after the planner passed, in this order: the task commit, the queue files' torn-tail rewrites, the store directories and removal of a leftover publication temp name, then the queue commit (lease, shards, queue and chain appends, anchor, removal of the pending record). A refusal returns exit code 8, writes nothing and keeps every pending record. The `lock` file is created by `init`; a read-only entry point never creates it, and a write-capable entry point creates a missing one (content-free) before the planner runs, which is the one documented write ahead of the proof. `shit check` runs the same read-only proof and reports the queue state and any pending record (exit code 8) without recovering. There is no automatic or API way to discard a pending record. The operator procedure for one that cannot be recovered: stop all writers; keep a copy of `queue-pending.json` (and `pending.json` if present) outside `.shit` as evidence; read the record and the files it names to see which steps of the interrupted operation had already been applied before the crash; remove or repair the cause the refusal points to, and only if the record itself is invalid or superseded move it out of `.shit`; then run `queue.recover` or any queue operation. What is lost by discarding a record: the operation it described is never applied. Effects the crashed process had already written before its crash (a lease file, a lifecycle step) are not undone; a lease file with no entry is removed as an orphan, and a lifecycle step with no queue entry makes the queue refuse (exit code 8) until a human reconciles the task. A same-user process can plant such a record at will, so it can block every entry point; and if the planted record is internally consistent (all hashes are public), `queue.recover` will apply it, so an operator inspects a record before running the named operation. This is inside the scope statement above: an operating-system identity boundary is the control, not this code. Orphan lease maintenance commits its `orphan_removed` entry, which names the SHA-256 of the file it saw, before deleting the file; a refused commit leaves the file, and a crash between the two does not append a second entry for the same file (a replacement file has another digest and is audited again). Not covered: a process that ignores the advisory lock can swap a file between a check and the write that follows it; a crash or OS error during the write phase is finished by the next `recover`; a coordinated rewrite of every store file is the unsigned-history residual; every queue operation verifies the event log more than once, which is not one snapshot. Tests: `PendingProof`, `RecoveryWrites` (a recording of every write against the planner's proof point, over every entry point and `shit check`).
-- **Q-REC-03.** After pending recovery the wrapper reconciles: (a) a lease file with no matching `claimed` or `renewed` entry is deleted and an `orphan_removed` entry is written; (b) a `claimed` entry whose lease file is missing is treated as expired; (c) a lease or apply slot belonging to a task in `waiting`, `ready`, `review`, a hold, `failed` or `done` is deleted; (d) an apply slot whose `lease_id` does not match a live lease is deleted. Test: construct each inconsistency; reconciliation fixes exactly it. Accepted limit: an `orphan_removed` entry is written only for a task that is in the queue; for any other task the file is removed and nothing is written, because an entry needs a queue state to carry.
-- **Q-REC-04.** A broken queue chain, an unparseable queue entry or a queue entry that contradicts the lifecycle mapping makes every queue operation return exit code 8. The wrapper never repairs history. Test: truncate a middle line; all operations return 8.
-- **Q-REC-05.** After a crash of a worker (not of the wrapper), nothing happens until the lease expires (Q-LEASE-05, Q-LEASE-06). A worker may release explicitly; a human may force expiry of a lease by recording the reclaim, which is treated as expiry. Test: forced reclaim writes the same entries as natural expiry.
-- **Q-REC-06.** `QUEUE.md` is regenerated from files after every successful mutation and by an explicit command. Deleting it changes no state and is not an error. Editing it changes no state. Test: delete and edit it; every query is unchanged.
-- **Q-RES-01.** A task id that has ever appeared in `queue.jsonl`, the event log or a task file is never accepted for a new task. A `done` task cannot transition. A new task needs a new id. Test: create a task with a closed task's id; refused with exit code 3.
-- **Q-RES-02.** Restoring an older copy of `.shit` over a newer one is detected by `queue-anchor.json`, an in-store consistency check: it records the entry count, the chain tip and each task's generation high-water mark, is advanced with every commit, and is compared with the queue files on every load. An older queue prefix, a missing anchor over a non-empty queue, or an anchor that disagrees with the queue is exit code 8. The anchor is not an external or monotonic reference: queue facts are not recorded in the event log, and anyone who restores the queue files, the chain, the shards and the anchor together (or deletes all of them) cannot be detected without signing, which the threat model lists under residual risks. Test: `TipAnchor`.
+- **Q-REC-01.** Every queue mutation and its lifecycle, lease, edge, slot, and audit-chain effects use one SQLite write transaction. A crash before commit leaves none of them; a successful commit contains all of them.
+- **Q-REC-02.** An ambiguous commit is reconciled by reopening the database and looking up the operation idempotency key. A retry with the same key and operation returns the committed result or writes the operation once.
+- **Q-REC-03.** Store verification refuses inconsistent queue, lease, apply-slot, lifecycle, or hash-chain state with exit code 8; it does not repair history.
+- **Q-REC-04.** A task id that has appeared in the database event or queue chains, or in an indexed task body, is never accepted for a new task. A done task cannot transition.
+- **Q-REC-05.** The audit export detects a database that is older than or divergent from the separately retained export. Restoring the database and export together remains outside this unsigned control.
 
 ## Event kinds in the queue log
 
@@ -241,7 +239,7 @@ All metrics are computed by replaying the verified queue chain (Q-REC-04) for a 
 Decided items carry the owner's decision date. OQ-10 is still open.
 
 - **OQ-1: lease refusal exit code. DECIDED 2026-11-27.** Exit code 12 with the name `lease_refused`, recorded in `docs/exit-codes.md`.
-- **OQ-2: event-log version. DECIDED 2026-11-27.** Queue facts stay in `queue.jsonl`; the event log stays at version 1, no migration.
+- **OQ-2: event-log version. DECIDED 2026-11-27.** Queue facts and events are separate database hash chains; the event record format stays at version 1.
 - **OQ-3: automatic retry. DECIDED in principle 2026-11-27.** A bounded wrapper-only automatic retry is allowed (a small configured limit, then a human decides). It needs a lifecycle amendment; the draft is in `docs/lifecycle.md` ("Proposed amendment", not in force) and awaits review. Until then no automatic retry (Q-RET-02) and an expired running lease ends in `failed` (Q-LEASE-06).
 - **OQ-4: by-hand `running`. DECIDED 2026-11-27.** The wrapper records open to running with actor `wrapper` when the worker asks to start, including a by-hand start. The lifecycle wording stands as built.
 - **OQ-5: graph size. DECIDED 2026-11-27.** Shard per task now; see "dependency-shard record".

@@ -8,9 +8,10 @@ import os
 import sqlite3
 import unittest
 
+from _helpers import BRIEF, CLEANUP, REPORT
 from test_audit_export import Flow, code_of
 
-from shit import audit_export, check, errors, store, store_check, store_queue
+from shit import audit_export, check, errors, records, store, store_check, store_queue
 
 
 def lines_with(lines, prefix):
@@ -52,12 +53,55 @@ class StoreCheckCase(Flow):
 
 
 class ReportTests(StoreCheckCase):
+    def workflow_files(self, task_id="a"):
+        for directory in ("briefs", "reports", "cleanup"):
+            (self.repo / ".shit" / directory).mkdir(exist_ok=True)
+        (self.repo / ".shit" / "briefs" / f"{task_id}.md").write_text(BRIEF)
+        (self.repo / ".shit" / "reports" / f"{task_id}.md").write_text(REPORT)
+        (self.repo / ".shit" / "cleanup" / f"{task_id}.md").write_text(CLEANUP)
+
     def test_a_project_without_a_store_has_no_store_section(self):
         code, lines = check.run_check(self.repo)
         self.assertEqual((code, lines), (0, ["check: ok (0 tasks)"]))
 
+    def test_an_unindexed_task_body_without_a_database_fails_closed(self):
+        body = {
+            "schema": "task", "schema_version": 1, "id": "t1", "title": "T", "summary": "S",
+            "state": "open", "owner": "human", "created_at": "2026-11-28T10:00:00Z",
+            "updated_at": "2026-11-28T10:00:00Z", "history": [],
+        }
+        (self.repo / ".shit" / "tasks" / "t1.json").write_bytes(records.dump_task(body))
+        code, lines = check.run_check(self.repo)
+        self.assertEqual(code, errors.FAILED_CLOSED)
+        self.assertIn("store: record body_orphan does not verify", lines)
+
+    def test_an_unexpected_body_name_fails_closed(self):
+        store.init_store(self.proj)
+        (self.repo / ".shit" / "tasks" / "weird name.json").write_text("{}")
+        code, lines = self.run_checked()
+        self.assertEqual(code, errors.FAILED_CLOSED)
+        self.assertIn("store: record body_unexpected_name does not verify", lines)
+
+    def test_a_special_body_entry_fails_closed_without_opening_it(self):
+        store.init_store(self.proj)
+        fifo = self.repo / ".shit" / "tasks" / "extra.json"
+        os.mkfifo(fifo)
+        code, lines = self.run_checked()
+        self.assertEqual(code, errors.FAILED_CLOSED)
+        self.assertIn("store: record body_unreadable does not verify", lines)
+
+    def test_removed_file_backend_state_is_refused_without_a_database(self):
+        (self.repo / ".shit" / "queue.jsonl").write_text("state")
+        code, lines = check.run_check(self.repo)
+        self.assertEqual(code, errors.PRECONDITION)
+        self.assertIn(
+            "store: found file-protocol state (queue.jsonl); file protocol was removed; start a new store",
+            lines,
+        )
+
     def test_a_consistent_store_reports_its_queue_and_its_export(self):
         self.flow()
+        self.workflow_files()
         code, lines = self.run_checked()
         self.assertEqual(code, 0, lines)
         self.assertEqual(lines_with(lines, "store: queue"), ["store: queue 2 tasks (ready 1, review 1)"])
@@ -97,6 +141,7 @@ class ReportTests(StoreCheckCase):
 
     def test_the_task_option_does_not_hide_the_store(self):
         self.flow()
+        self.workflow_files()
         code, lines = check.run_check(self.repo, task=None)
         self.assertEqual(code, 0)
         self.assertEqual(len(lines_with(lines, "store: queue")), 1)
@@ -119,7 +164,7 @@ class FailureTests(StoreCheckCase):
         code, lines = self.run_checked()
         self.assertEqual(code, errors.FAILED_CLOSED)
         self.assertIn("store: database is older than its audit export (restored or truncated)", lines)
-        self.assertEqual(lines[-1], "check: failed (2 tasks)")
+        self.assertEqual(lines[-1], "check: failed (1 task)")
 
     def test_a_lost_export_fails_the_check(self):
         self.export_path.unlink()

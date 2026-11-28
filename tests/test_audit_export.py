@@ -809,6 +809,15 @@ class LockTests(Flow):
 
 
 class ConcurrencyTests(Flow):
+    def test_a_writer_does_not_reopen_an_existing_store_through_the_creation_path(self):
+        self.task("seed")
+        # A concurrent SQLite close can replace a sidecar during the creation helper's redundant open.
+        # Interpose at that exact boundary: an existing-store writer must go straight to its one ordinary open.
+        with mock.patch.object(store, "init_store", side_effect=ShitError(errors.CONFINEMENT)):
+            store_tasks.create_task(self.proj, task_id="next", title="T", summary="S", owner="human",
+                                    actor="human", now=at(1000))
+        self.assertEqual(store_tasks.get_task(self.proj, "next")["id"], "next")
+
     def test_concurrent_writers_leave_an_export_that_is_current_and_verifies(self):
         self.task("seed")
         failures = []

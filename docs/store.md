@@ -14,18 +14,15 @@ backend = "sqlite"
 busy_timeout_ms = 60000
 ```
 
-`backend` accepts only `"files"` and `"sqlite"`; its default is `"files"`, so an existing project does not change storage without an explicit configuration edit. Command handlers resolve this setting once through `shit/backend.py`. The files selection binds the existing modules without changing their call path. The SQLite selection binds the compatible `store_tasks` and `store_queue` adapters and passes `busy_timeout_ms` to them.
+`backend` accepts only `"sqlite"` and defaults to it. The removed `"files"` value is a configuration error. Command handlers bind `store_tasks` and `store_queue`; there is no backend selection path.
 
 `shit init --backend sqlite` creates the database only when validated configuration already records `backend = "sqlite"`; an explicit option that disagrees with configuration is exit code 2. If any file-protocol-only artifact exists and no SQLite database exists, SQLite initialization is refused with exit code 9 instead of creating two active stores. That catalog covers the event and queue chains, dependency shards and the refused legacy dependency file, leases, pending commits, the queue anchor and the generated view. Body directories, the lock, the SQLite database and its audit export are classified separately because SQLite operations create or use them too; they are not evidence of file-protocol state. `shit check` uses the same file-only catalog to report mixed state beside a database. A `[store] backend = "sqlite"` configuration also makes plain `shit init` create it. The `check` and `audit` commands are registered in the same command-line parser as the task commands.
 
 ## Migration and rollback
 
-1. Stop writers and add `[store] backend = "sqlite"` to `config.toml`. Run `shit init --backend sqlite`.
-2. The backends share body directories but not their indexes, lifecycle or queue state. Creating the SQLite store does not import file-protocol tasks, records, queue or dependencies; populate or migrate the new backend separately before using it.
-3. Run `shit check` and require its store section to finish with `check: ok`. Run `shit audit verify --database` and require the export and database comparison to pass.
-4. Changing routing back to `backend = "files"` is not a data rollback. SQLite operations may have added bodies in the shared directories, while the file protocol has no matching events for them. Stop writers and use an explicit migration or restore that reconciles both the bodies and the selected backend's metadata.
+Phase 2 is complete: SQLite is the only backend. `shit init` and `shit check` refuse leftover file-protocol state when there is no database. There is no one-way import tool, so start a new store and retain the old state separately if needed.
 
-Phase 2 removes the file protocol and its tests only after the SQLite store receives the planned adversarial review. It is not part of this phase.
+The supported rollback is restoring a coordinated backup of `store.sqlite3` and the record-body directories. The tooling verifies a restored database and audit export, but does not create, select, or reconcile backups. Stop writers before restoring, then run `shit check` and `shit audit verify --database`.
 
 **Scope of the protection.** Like the queue, the store protects against crashes, races and mistakes of cooperating processes of the same operating-system user. A hostile process of that user can open the database directly and bypass every control here. The checks below catch accidents and a casual swap; they are not a boundary against that user.
 
@@ -147,7 +144,7 @@ Messages are the fixed text of `docs/exit-codes.md`. They never carry a path or 
 
 ## Tasks, events and the records index (issue 61)
 
-`store.py` holds, in a delimited section, the write helpers that replace the file protocol's multi-file commit for tasks and records. `shit/store_tasks.py` is the adapter: it has the names and arguments of `task.py` and `commands.py` (`create_task`, `new_task`, `get_task`, `transition`, `add_evidence`, `add_report`, `add_review`, `add_decision`, `show`, `close_task`) and returns the same values and exit codes. The file protocol is left in place until the CLI and the queue move over; nothing here reads or writes `events.jsonl`, `events.chain` or `pending.json`.
+`store.py` holds the task and record write helpers. `shit/store_tasks.py` supplies the task and record operations. Nothing reads or writes the removed `events.jsonl`, `events.chain`, or `pending.json` protocol.
 
 | Helper | One `write_transaction` writes, in this order |
 |---|---|
@@ -163,11 +160,11 @@ Every check and every read happens after `BEGIN IMMEDIATE`: the task exists, a c
 
 **Reads.** One statement can be read alone. An operation that reads several rows (`get_task` reads the row and the history) runs in `store.read_snapshot`, a deferred `BEGIN` that ends in `ROLLBACK`, so every read sees one commit. It is one of the functions that own their transaction in the lint.
 
-**Checks.** The tests call `store.verify(conn)` and `store.verify_tasks(conn)` after every operation. `verify_tasks` adds what `verify` leaves to the writers: `event_hash_wrong`, `event_invalid`, `task_differs_from_history` (state and time against the last history row, and the history chain from `open`), `history_differs_from_events`, `task_without_created_event`, `task_without_body_record`, `record_without_event`, `event_without_record`, `record_digest_differs_from_event`. `store_tasks.verify_bodies(project, conn)` reads the files: `body_missing`, `body_unreadable`, `body_differs_from_index`, and `body_orphan`.
+**Checks.** The tests call `store.verify(conn)` and `store.verify_tasks(conn)` after every operation. `verify_tasks` adds what `verify` leaves to the writers: `event_hash_wrong`, `event_invalid`, `task_differs_from_history` (state and time against the last history row, and the history chain from `open`), `history_differs_from_events`, `task_without_created_event`, `task_without_body_record`, `record_without_event`, `event_without_record`, `record_digest_differs_from_event`. `store_tasks.verify_bodies(project, conn)` reads indexed files and can perform a bounded, lstat-first directory scan: `body_missing`, `body_unreadable`, `body_differs_from_index`, `body_orphan`, and `body_unexpected_name`.
 
 **Lint.** The new functions are on the allowlist of `tests/test_store_lint.py` on purpose, each with `execute` only: the reads, `read_snapshot` (a transaction owner) and the three write helpers. A test proves each write helper holds exactly one `write_transaction` with all its writes inside, that the read helpers hold no write, and that being on the list does not allow a write outside a transaction, text-built SQL or a look-alike `read_snapshot`.
 
-**Not done here** (the queue and the graph are ported below): the queue is still files until the CLI moves over; `transition_task` now refuses a change the queue state does not allow (see "Queue operations"); the CLI switch and removal of the file protocol (the hash-chained export is built, see "Audit export"). A body file that no index row names is left in place; there is no sweep. `precheck` receives the task row, not the body (no title or summary).
+`transition_task` refuses a change the queue state does not allow. A body file that no index row names is left in place; there is no sweep. `precheck` receives the task row, not the body (no title or summary).
 
 ## Dependency graph (issue 62)
 
@@ -181,9 +178,9 @@ What the database does not do: the caps are enforced by the helpers only (a hand
 
 ## Queue operations (issue 61, C4)
 
-`store.queue_enqueue`, `queue_claim`, `queue_start`, `queue_renew`, `queue_release`, `queue_submit`, `queue_fail`, `queue_hold`, `queue_reopen`, `queue_complete`, `queue_reclaim`, `queue_apply_start`, `queue_apply_finish`, `queue_add_edges`, `queue_remove_edge` and `queue_maintain` are the database version of `shit/queue.py`, in a delimited section of `shit/store.py`. Each is ONE `write_transaction`. `shit/store_queue.py` is the adapter: the names and arguments of `queue.py` (`enqueue(project, task_id, actor, now=, config=)` and the rest), the same results and the same exit codes. The file queue is left in place until C7; nothing here reads or writes `queue.jsonl`, `queue.chain`, `leases/`, `deps/`, `queue-anchor.json` or `queue-pending.json` (there is no pending record: the transaction is the commit point).
+The queue helpers in `shit/store.py` each use one `write_transaction`; `shit/store_queue.py` is their project-level adapter. Nothing reads or writes the removed `queue.jsonl`, `queue.chain`, `leases/`, `deps/`, `queue-anchor.json`, or `queue-pending.json` protocol; the SQLite transaction is the commit point.
 
-**Same decisions as the file queue.** After BEGIN IMMEDIATE every operation does what `queue.py` does, in the same order, with the same codes: the clock check against the queue tip and the event tip (exit code 8), maintenance (below), the operation's own checks (the presented lease: exit code 12; a state the transition table forbids: 4; an unmet edge at submit: 9; and so on), then the writes. Every candidate entry is also run through `queue_records.replay` with the entries of its task before it is written (a refusal there is exit code 8, as in `queue._commit`), so the database never holds a log replay would refuse. `tests/test_store_queue_differential.py` applies seeded random operation sequences (wrong leases, stale generations, clock jumps back, extra request fields, hostile reasons, graph changes, milestones reached and withdrawn) to both implementations: after every operation the exit code and the lease returned must be equal, and after the same maintenance the two logs must be equal entry for entry and hash for hash. At the end the leases table, the queue states, the task lifecycle states and the `queue_records.replay` of the entries must agree, and `verify` and `verify_tasks` report nothing.
+**Queue behavior.** After BEGIN IMMEDIATE every operation checks the clock against the queue tip and the event tip (exit code 8), performs maintenance (below), applies its own checks (the presented lease: exit code 12; a state the transition table forbids: 4; an unmet edge at submit: 9; and so on), then writes. Every candidate entry is also run through `queue_records.replay` with the entries of its task before it is written, so the database never holds a log replay would refuse. `tests/test_store_queue.py` covers the low-level operations and invariants, `tests/test_store_queue_adapter.py` covers the project-level adapter and record-dependent rules, and `tests/test_store_queue_safety.py` covers transaction fault points and races.
 
 **Maintenance in the same transaction.** Every operation first expires every lease that is due (or has no row) and promotes every waiting task whose edges are met, as `queue._maintain` does, inside its own transaction. An expired `running` lease writes the `expired` entry and the `running` to `failed` lifecycle step; a `dispatched` one returns to `ready`. If the operation is then refused, the whole transaction rolls back, maintenance included (the file queue kept it): the next operation redoes it, so the log differs only by when the expiry was written, never by what it says. `queue_maintain` is the operation that applies maintenance alone. Whether an edge's milestone is reached (a success report, a pass review by a human, an accepted human decision) needs the record bodies, which are files: the caller passes `met(edge)`, and `store_queue.py` builds it from `store_tasks` (each body checked against its index digest). With no `met`, only an `apply` edge counts as met.
 
@@ -263,7 +260,7 @@ Test infrastructure for the queue operations above. It lives in `tests/` and cha
 - A kill by a timer lands near COMMIT often but not exactly there; the deterministic sweep covers the fault points between statements, and SQLite's own atomic commit covers the rest.
 - Workers and the checks use one database file on one local file system. Network and shared file systems are not covered.
 - The queue hash chain's digests are not recomputed (the harness cannot rebuild the stored line byte for byte); the events chain's digests are, by `verify_tasks`.
-- The model covers the operations with no dependency edges and no decisions or records; the differential test (`tests/test_store_queue_differential.py`) covers edges, records and exit-code parity with the file queue.
+- The model covers operations with no dependency edges and no decisions or records. Edge and record-dependent behavior is covered by `tests/test_store_queue.py`, `tests/test_store_queue_adapter.py`, and the concurrency harness; there is no claim of differential parity with the removed file queue.
 - A worker that sees exit code 8 (a stale clock reading against a newer entry, or an ambiguous commit) opens a new connection and goes on: with a shared logical clock a few operations are refused this way in every run, which is the designed fail-closed answer, not a finding.
 
 ## Audit export (issue 63, C6)

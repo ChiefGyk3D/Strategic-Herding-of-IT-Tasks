@@ -3,12 +3,13 @@
 import json
 import os
 import shutil
+import sqlite3
 import unittest
 from pathlib import Path
 
-from _helpers import BRIEF, CLEANUP, DECISION, REPORT, RepoCase, run_main
+from _helpers import BRIEF, CLEANUP, REPORT, RepoCase, run_main
 
-from shit import check
+from shit import check, store, store_check
 from shit.project import Project
 
 FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
@@ -39,12 +40,38 @@ class Check(RepoCase):
         self.new_task(state="open")
         self.assertEqual(self.check()[0], 0)
 
+    def test_one_snapshot_hides_a_commit_between_check_reads(self):
+        self.new_task(state="open")
+        real_hook = store_check._check_hook
+
+        def commit_after_statuses():
+            from shit import task as task_mod
+            store_check._check_hook = lambda: None
+            task_mod.transition(
+                self.proj, "t1", "running", "wrapper", "start",
+                now="2026-11-26T16:00:00Z",
+            )
+
+        store_check._check_hook = commit_after_statuses
+        try:
+            code, out, err = self.check()
+        finally:
+            store_check._check_hook = real_hook
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("store: snapshot events 1, queue 0", out)
+        self.assertNotIn("brief missing", out)
+
+        conn = store.connect(self.proj)
+        try:
+            self.assertEqual(store.get_task(conn, "t1")["state"], "running")
+        finally:
+            conn.close()
+
     def test_each_missing_element_fails(self):
         cases = [
             ("brief", "briefs/t1.md", "running", 9),
             ("review header", "reports/t1.md", "review", 9),
             ("cleanup report", "cleanup/t1.md", "review", 9),
-            ("human disposition", "decisions/t1.json", "approved", 9),
         ]
         for label, rel, state, want in cases:
             with self.subTest(label=label):
@@ -54,6 +81,14 @@ class Check(RepoCase):
                 self.reset_store()
                 self.assertEqual(code, want)
                 self.assertIn(label, out)
+
+    def test_approved_task_needs_a_store_backed_human_disposition(self):
+        self.new_task(state="review")
+        from shit import task as task_mod
+        task_mod.transition(self.proj, "t1", "approved", "human", "step", now="2026-11-26T16:00:00Z")
+        code, out, _ = self.check()
+        self.assertEqual(code, 9)
+        self.assertIn("human disposition", out)
 
     def test_brief_without_issue_fails(self):
         self.full_task()
@@ -77,28 +112,6 @@ class Check(RepoCase):
         self.put("cleanup/t1.md", "removed: scratch\n")
         self.assertEqual(self.check()[0], 3)
 
-    def test_disposition_must_be_human_and_decided(self):
-        for change in ('"actor": "human"', '"status": "accepted"'):
-            with self.subTest(change=change):
-                self.full_task()
-                bad = change.replace("human", "model").replace("accepted", "proposed")
-                self.put("decisions/t1.json", DECISION.replace(change, bad))
-                code = self.check()[0]
-                self.reset_store()
-                self.assertEqual(code, 3)
-
-    def test_disposition_for_another_task_is_not_accepted(self):
-        self.full_task()
-        self.put("decisions/t1.json", DECISION.replace('"task_id": "t1"', '"task_id": "other"'))
-        self.assertEqual(self.check()[0], 3)
-
-    def test_disposition_with_unknown_field_or_duplicate_key_is_rejected(self):
-        self.full_task()
-        self.put("decisions/t1.json", DECISION.replace('"id": "d1",', '"id": "d1", "extra": 1,'))
-        self.assertEqual(self.check()[0], 3)
-        self.put("decisions/t1.json", DECISION.replace('"id": "d1",', '"id": "d1", "id": "d2",'))
-        self.assertEqual(self.check()[0], 3)
-
     def test_task_selection(self):
         self.full_task("t1")
         self.new_task("t2", state="running")  # t2 has no brief
@@ -107,42 +120,13 @@ class Check(RepoCase):
         self.assertEqual(self.check("--task", "nope")[0], 9)
         self.assertEqual(self.check("--task", "../x")[0], 2)
 
-    def test_invalid_task_records(self):
-        for fixture, want in (("unknown-field.json", 3), ("duplicate-key.json", 3), ("unknown-version.json", 3),
-                              ("bad-transition.json", 4)):
-            with self.subTest(fixture=fixture):
-                shutil.copy(FIXTURES / "invalid" / fixture, self.store / "tasks" / "bad.json")
-                code, _out, _err = self.check()
-                self.assertEqual(code, want)
-                (self.store / "tasks" / "bad.json").unlink()
-
-    def test_hostile_task_files(self):
-        tasks = self.store / "tasks"
-        (tasks / "weird name.json").write_text("{}")
-        code, out, err = self.check()
-        self.assertEqual(code, 3)
-        self.assertNotIn("weird", out + err)
-        (tasks / "weird name.json").unlink()
-        (self.outside / "x.json").write_text("{}")
-        (tasks / "linked.json").symlink_to(self.outside / "x.json")
-        self.assertEqual(self.check()[0], 5)
-        (tasks / "linked.json").unlink()
-        os.mkfifo(tasks / "pipe.json")
-        self.assertEqual(self.check()[0], 5)
-        (tasks / "pipe.json").unlink()
-        (tasks / "big.json").write_bytes(b" " * 70000)
-        self.assertEqual(self.check()[0], 7)
-
     def test_tampered_event_log_fails(self):
         self.full_task()
-        log = self.store / "events.jsonl"
-        log.write_bytes(log.read_bytes().replace(b"task_created", b"task_created"[::-1], 1))
-        self.assertEqual(self.check()[0], 3)
-
-    def test_unfinished_commit_is_reported(self):
-        self.new_task()
-        (self.store / "pending.json").write_text("{}")
-        self.assertEqual(self.check()[0], 3)
+        raw = sqlite3.connect(self.store / store.DB_NAME, isolation_level=None)
+        self.addCleanup(raw.close)
+        raw.execute("DROP TRIGGER events_no_update")
+        raw.execute("UPDATE events SET message = 'Task record altered.' WHERE seq = 1")
+        self.assertEqual(self.check()[0], 8)
 
     def test_record_content_never_reaches_output(self):
         self.full_task()
@@ -285,21 +269,21 @@ class SizeCheck(RepoCase):
         self.config("\n[limits]\ninstruction_max_bytes = 1\non_exceed = \"fail\"\n")
         self.instruction("CLAUDE.md", 50)
         moved = self.base / "moved"
-        real_verify = check.EventLog.verify
+        real_statuses = store_check.task_statuses
 
-        def swap(log):
+        def swap(project):
             self.repo.rename(moved)
             self.repo.mkdir()
             (self.repo / "config.toml").write_text(
                 CONFIG + "\n[limits]\ninstruction_max_bytes = 1\non_exceed = \"fail\"\n", encoding="utf-8")
             (self.repo / "CLAUDE.md").write_text("x" * 50, encoding="utf-8")
-            return real_verify(log)
+            return real_statuses(project)
 
-        check.EventLog.verify = swap
+        store_check.task_statuses = swap
         try:
             code, out, _ = self.check()
         finally:
-            check.EventLog.verify = real_verify
+            store_check.task_statuses = real_statuses
         self.assertEqual(code, 5)
         self.assertIn("repository: root changed during check", out)
         self.assertNotIn("instruction file over size limit", out)

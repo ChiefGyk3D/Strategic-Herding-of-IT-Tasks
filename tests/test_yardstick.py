@@ -2,6 +2,7 @@
 
 import io
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +10,9 @@ from pathlib import Path
 from _bootstrap import make_git_dir
 from test_config import GOOD
 
-from shit import commands, config, yardstick
+from shit import commands, config, store, yardstick
 from shit import task as task_mod
 from shit.errors import ContractError, ShitError
-from shit.log import EventLog
 from shit.project import Project
 
 T = [f"2026-11-26T15:3{i}:00Z" for i in range(10)]
@@ -68,31 +68,30 @@ class Yardstick(unittest.TestCase):
 
     def test_record_event_without_record_id_is_refused_not_a_crash(self):
         self.seed()
-        log = EventLog(self.p)
-        event = task_mod._event(log, "t1", "wrapper", "report_recorded", "Report record added.", T[6])
-        del event["record_id"]
-        with self.p.locked():
-            log.append(event)
+        raw = sqlite3.connect(self.repo / ".shit" / store.DB_NAME, isolation_level=None)
+        self.addCleanup(raw.close)
+        raw.execute("DROP TRIGGER events_no_update")
+        raw.execute("UPDATE events SET record_id = NULL WHERE event = 'report_recorded'")
         with self.assertRaises(ShitError) as ctx:
             yardstick.compute(self.p)
-        self.assertEqual(ctx.exception.code, 3)
+        self.assertEqual(ctx.exception.code, 8)
 
     def test_loading_a_record_does_not_rescan_the_whole_log(self):
         self.seed()
         seen = []
-        real = commands._find_event
+        real = store.list_events
 
-        def spy(events, kind, rid):
-            seen.append(len(events))
-            return real(events, kind, rid)
+        def spy(conn):
+            seen.append(1)
+            return real(conn)
 
-        commands._find_event = spy
-        self.addCleanup(setattr, commands, "_find_event", real)
+        store.list_events = spy
+        self.addCleanup(setattr, store, "list_events", real)
         yardstick.compute(self.p)
-        self.assertTrue(seen)
-        self.assertEqual(max(seen), 1)
+        self.assertEqual(seen, [1])
 
     def test_empty_store(self):
+        store.init_store(self.p)
         out = yardstick.compute(self.p)
         self.assertEqual((out["tasks"]["total"], out["effort_points"]["value"]), (0, 0))
 
@@ -107,11 +106,40 @@ class Yardstick(unittest.TestCase):
 
     def test_tampered_log_is_refused(self):
         self.seed()
-        log = self.repo / ".shit" / "events.jsonl"
-        log.write_bytes(log.read_bytes().replace(b"task_created", b"command_failed", 1))
-        with self.assertRaises(Exception) as ctx:
+        raw = sqlite3.connect(self.repo / ".shit" / store.DB_NAME, isolation_level=None)
+        self.addCleanup(raw.close)
+        raw.execute("DROP TRIGGER events_no_update")
+        raw.execute("UPDATE events SET message = 'Task record altered.' WHERE seq = 1")
+        with self.assertRaises(ShitError) as ctx:
             yardstick.compute(self.p)
-        self.assertEqual(ctx.exception.code, 3)
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_tampered_task_body_is_refused(self):
+        self.seed()
+        (self.repo / ".shit" / "tasks" / "t1.json").write_bytes(b"{}")
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_tampered_evidence_body_is_refused(self):
+        commands.new_task(self.p, task_id="t1", title="T", summary="S", owner="human", actor="human", now=T[0])
+        evidence = self.repo / "proof.txt"
+        evidence.write_text("proof")
+        commands.add_evidence(self.p, task_id="t1", evidence_id="e1", path="proof.txt", description="d",
+                              actor="human", now=T[1])
+        (self.repo / ".shit" / "evidence" / "e1.json").write_bytes(b"{}")
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 8)
+
+    def test_tampered_decision_body_is_refused(self):
+        commands.new_task(self.p, task_id="t1", title="T", summary="S", owner="human", actor="human", now=T[0])
+        commands.add_decision(self.p, task_id="t1", decision_id="d1", status="accepted", question="Q",
+                              choice="C", rationale="R", actor="human", now=T[1])
+        (self.repo / ".shit" / "decisions" / "d1.json").write_bytes(b"{}")
+        with self.assertRaises(ShitError) as ctx:
+            yardstick.compute(self.p)
+        self.assertEqual(ctx.exception.code, 8)
 
     def test_cli_prints_json(self):
         self.seed()

@@ -834,6 +834,7 @@ def init_store(project, busy_timeout_ms=None, adopt_empty=False):
     _check_floor()
     _timeout(busy_timeout_ms)  # an invalid argument must fail before any file exists
     _check_directory(project)
+    _refuse_file_protocol_state(project)
     old = os.umask(stat.S_IRWXG | stat.S_IRWXO)
     created = None
     try:
@@ -875,8 +876,26 @@ def _remove_created(project, identity):
             continue
 
 
-def connect(project, busy_timeout_ms=None):
-    """Open the project's store. The one and only way to get a connection."""
+def _refuse_file_protocol_state(project):
+    """Refuse removed file-protocol artifacts before an ordinary store open."""
+    from . import (
+        file_backend_state,  # delayed: the artifact catalog names this module's database file
+    )
+
+    found = file_backend_state.present(project)
+    if found:
+        error = ShitError(PRECONDITION)
+        error.message = (
+            f"found file-protocol state ({', '.join(found)}); "
+            "file protocol was removed; start a new store"
+        )
+        raise error
+
+
+def connect(project, busy_timeout_ms=None, *, allow_file_protocol_state=False):
+    """Open the project's store. Ordinary opens refuse removed file-protocol state."""
+    if not allow_file_protocol_state:
+        _refuse_file_protocol_state(project)
     return _open(project, busy_timeout_ms, initialize=False)
 
 
