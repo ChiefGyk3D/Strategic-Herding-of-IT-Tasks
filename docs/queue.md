@@ -11,6 +11,7 @@
 | `shit/dependencies.py` | Shard validation and bytes, in-memory graph validation, cycle detection (iterative), missing-node detection, add (single and batch) and remove edge, readiness helpers. Pure functions. |
 | `shit/queue_records.py` | `queue-entry` and `lease` validation, the transition table, per-kind field rules, configuration ranges and `replay`, which rebuilds every task's queue state from the log and rejects impossible sequences. |
 | `shit/queue.py` | Storage and operations: `enqueue`, `add_edge`, `add_edges`, `remove_edge`, `claim`, `start`, `renew`, `release`, `submit`, `fail`, `hold`, `reopen`, `complete`, `reclaim`, `status`, `render_view`. |
+| `shit/store.py` (queue section), `shit/store_queue.py` | The same operations on the SQLite store (issue 61, C4): one write transaction each, the adapter with the names of `queue.py`. The file queue stays until C7. See `docs/store.md`, "Queue operations". |
 | `shit/project.py` | Two confined helpers: `list_dir` and `create_exclusive` (create-if-absent by temp file and hard link, never follows a symlink). |
 | `shit/task.py` | `_transition_locked` split out of `transition` so a queue commit can run a lifecycle step under the lock it already holds; `create_task` refuses an id that appears in the event log (Q-RES-01). |
 
