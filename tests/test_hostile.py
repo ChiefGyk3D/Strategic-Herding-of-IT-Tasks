@@ -764,7 +764,9 @@ class NetworkDenial(unittest.TestCase):
         for src in bad:
             with self.subTest(src=src):
                 self.assertTrue(process_launch_uses(src), src)
-        good = ("import os\nos.path.join('a')", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
+        good = ("import os\nos.path.join('a')", "import os\nos.path.realpath(os.fspath('a'))",
+                "import os\nx = os.path.isabs('a') and os.path.normpath('b')", "import os\nos.path.commonpath(['a'])",
+                "import os\nos.path.abspath('a')", "from os import fspath, sep", "import os\nos.open('x', os.O_RDONLY)", "x = getattr(exc, 'code', None)",
                 "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nold = os.umask(0o77)\nos.readlink('/proc/self/fd/3')", "import re\nre.compile('x')", "import hashlib")
         for src in good:
             with self.subTest(src=src):
@@ -784,14 +786,20 @@ class NetworkDenial(unittest.TestCase):
             "import os\ngetattr(os, 'sys' + 'tem')('id')", "import os\ngetattr(os, 'system')('id')",
             "import os\nos = None", "import os\nfor os in []:\n    pass", "import os\nx = os,\n",
             "import os\nmap(os.system, ['id'])", "import os\nsorted([1], key=os)", "import os\nos[0]",
-            "import os\nclass C:\n    m = os", "import os\nwith os as o:\n    pass",
+            "import os\nclass C:\n    m = os", "import os\nos.path.os.system('printf x')",
+            "import os\nos.path.sys.modules", "import os\nos.path.genericpath", "import os\nos.path.os.execv('/bin/true', [])",
+            "import os\nx = os.path", "import os\nos.path", "import os\nf = os.path.join", "import os\nos.path.join.__globals__",
+            "import os\nos.path.exists('x')", "import os\nos.path.__dict__", "import posixpath\nposixpath.os.system('id')",
+            "import genericpath\ngenericpath.os.system('id')", "import ntpath", "from posixpath import os",
+            "from os import path\npath.os.execv('/bin/true', ['true'])", "from os import path", "import os.path",
+            "import os\nmap(os.path.join, ['a'])", "import os\nos.path.join.__call__('a')", "import os\nwith os as o:\n    pass",
         )
         for src in bad:
             with self.subTest(src=src):
                 self.assertTrue(os_surface_findings(src), src)
         good = ("import os\nos.path.join('a')", "import os\nfd = os.open('x', os.O_RDONLY | os.O_NOFOLLOW)",
                 "import os\nflags = getattr(os, 'O_CLOEXEC', 0)", "import os\nos.close(3)\nos.fstat(3)",
-                "from os import path, sep", "import os\nx = os.environ.get('A')", "import re\nos2 = re.compile('x')",
+                "from os import sep", "import os\nx = os.environ.get('A')", "import re\nos2 = re.compile('x')",
                 "import os\nwith os.fdopen(3, 'rb') as fh:\n    fh.read()", "x = 1")
         for src in good:
             with self.subTest(src=src):
@@ -804,7 +812,14 @@ class NetworkDenial(unittest.TestCase):
         for path in (ROOT / "shit").rglob("*.py"):
             used |= {n.attr for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Attribute)
                      and isinstance(n.value, ast.Name) and n.value.id == "os"}
-        self.assertEqual(OS_ALLOWED_ATTRS - used - {"path"}, set(), "an allowlisted name the package does not use")
+        self.assertEqual(OS_ALLOWED_ATTRS - used, set(), "an allowlisted name the package does not use")
+        used_path = set()
+        for path in (ROOT / "shit").rglob("*.py"):
+            used_path |= {n.attr for n in ast.walk(ast.parse(path.read_text())) if isinstance(n, ast.Attribute)
+                          and isinstance(n.value, ast.Attribute) and n.value.attr == "path"
+                          and isinstance(n.value.value, ast.Name) and n.value.value.id == "os"}
+        self.assertEqual(OS_PATH_ALLOWED - used_path, set(), "an allowlisted path function the package does not use")
+        self.assertFalse(OS_PATH_ALLOWED & {"os", "sys", "genericpath", "stat", "__dict__"})
 
 
 def imported_roots(source):
@@ -888,6 +903,20 @@ OS_ALLOWED_ATTRS = frozenset({
     "umask", "unlink", "write",
 })
 
+# `os.path` is a module (it re-exports `os` and `sys`), so it is never a safe value itself: it may only be the base
+# of a call to one of these path functions, all used by the package and none able to reach another module.
+OS_PATH_ALLOWED = frozenset({"abspath", "commonpath", "isabs", "join", "normpath", "realpath"})
+# Modules that re-export `os` (posixpath.os, genericpath.os, ntpath.os): never imported inside the package.
+OS_REEXPORT_MODULES = {"posixpath", "genericpath", "ntpath", "macpath"}
+
+
+def _path_call_ok(path_attr, parent):
+    """`os.path` only as the base of a call to an allowlisted path function: os.path.join(...)."""
+    func = parent.get(path_attr)
+    call = parent.get(func)
+    return (isinstance(func, ast.Attribute) and func.value is path_attr and func.attr in OS_PATH_ALLOWED
+            and isinstance(call, ast.Call) and call.func is func)
+
 
 def os_surface_findings(source):
     """Conservative rule: `os`, `posix` and `nt` may appear only as `import os`, `from os import <allowed>`, or the
@@ -904,19 +933,26 @@ def os_surface_findings(source):
             for a in node.names:
                 if a.name.split(".")[0] in OS_MODULES and (a.name != "os" or a.asname):
                     found.add(f"import {a.name} as {a.asname}")
+                if a.name.split(".")[0] in OS_REEXPORT_MODULES:
+                    found.add(f"import {a.name}")
+        elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in OS_REEXPORT_MODULES:
+            found.add(f"from {node.module}")
         elif isinstance(node, ast.ImportFrom) and node.module and node.module.split(".")[0] in OS_MODULES:
             if node.module != "os":
                 found.add(f"from {node.module}")
-            found |= {f"from os import {a.name}" for a in node.names if a.name not in OS_ALLOWED_ATTRS or a.asname}
+            # `path` is a module object: `from os import path` is refused, only functions and constants come in
+            found |= {f"from os import {a.name}" for a in node.names
+                      if a.name not in OS_ALLOWED_ATTRS - {"path"} or a.asname}
         elif isinstance(node, ast.arg) and node.arg in OS_MODULES:
             found.add(f"parameter {node.arg}")
         elif isinstance(node, ast.Name) and node.id in OS_MODULES:
             up = parent.get(node)
-            attribute_ok = isinstance(up, ast.Attribute) and up.value is node and up.attr in OS_ALLOWED_ATTRS
+            attribute_ok = (isinstance(up, ast.Attribute) and up.value is node and up.attr in OS_ALLOWED_ATTRS
+                            and (up.attr != "path" or _path_call_ok(up, parent)))
             call_ok = (
                 isinstance(up, ast.Call) and isinstance(up.func, ast.Name) and up.func.id == "getattr"
                 and up.args and up.args[0] is node and len(up.args) >= 2 and not up.keywords
-                and isinstance(up.args[1], ast.Constant) and up.args[1].value in OS_ALLOWED_ATTRS
+                and isinstance(up.args[1], ast.Constant) and up.args[1].value in OS_ALLOWED_ATTRS - {"path"}
             )
             if not isinstance(node.ctx, ast.Load) or not (attribute_ok or call_ok):
                 found.add(f"{node.id} used as a value or with a disallowed attribute (line {node.lineno})")

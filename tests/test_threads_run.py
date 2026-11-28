@@ -22,6 +22,7 @@ import _bootstrap
 from _helpers import run_main
 
 from shit import threads
+from shit.errors import ShitError
 
 SCRIPT = _bootstrap.ROOT / "scripts" / "threads_run.py"
 REPO = "example-owner/example-repo"
@@ -535,9 +536,10 @@ class HardeningTests(Case):
 class PrivateEnvTests(Case):
     def go(self, *opts, plan=None, environ=None, **kw):
         self.tmp = self.dir / "tmproot"
-        self.tmp.mkdir(exist_ok=True)
+        self.tmp.mkdir(mode=0o700, exist_ok=True)
+        self.tmp.chmod(0o700)
         env = environ or self.environ()
-        return run_main(lambda a: launcher.main(a, environ=env, cwd=self.work, tmpdir=str(self.tmp), **kw),
+        return run_main(lambda a: launcher.main(a, environ=env, cwd=self.work, bases=[(str(self.tmp), "runtime")], **kw),
                         [*opts, plan or self.plan_file(kind="list")])
 
     def hostile_home(self, text="api_host: attacker.example\nhttp_unix_socket: /tmp/attacker.sock\n"):
@@ -682,6 +684,107 @@ class PrivateEnvTests(Case):
                 self.assertEqual(self.go("--allow-env", name)[0], 2)
 
 
+class TempBaseTests(Case):
+    """Where the private directory is made: a fixed ordered list, never the ambient TMPDIR, TMP or TEMP."""
+
+    def make(self, name, mode, parent=None):
+        path = (parent or self.dir) / name
+        path.mkdir(exist_ok=True)
+        path.chmod(mode)
+        return path
+
+    def test_ambient_temp_variables_are_never_used(self):
+        from unittest import mock
+
+        self.fake()
+        attacker = self.make("attacker-parent", 0o777)
+        env = {"TMPDIR": str(attacker), "TMP": str(attacker), "TEMP": str(attacker)}
+        with mock.patch.dict(os.environ, env):
+            code, _, _ = self.run_plan(self.plan_file(kind="list"))
+        self.assertEqual(code, 0)
+        self.assertEqual(list(attacker.iterdir()), [])
+        home = self.calls()[0]["vals"]["HOME"]
+        self.assertFalse(home.startswith(str(attacker)))
+        self.assertTrue(any(home.startswith(base) for base, _ in launcher.default_bases()), home)
+
+    def test_the_default_order_and_the_documented_names(self):
+        bases = launcher.default_bases()
+        self.assertEqual(bases[0], (f"/run/user/{os.geteuid()}", "runtime"))
+        self.assertEqual([k for _, k in bases[1:]], ["system", "system"])
+        self.assertEqual([p for p, _ in bases[1:]], ["/tmp", "/var/tmp"])
+        self.assertTrue(all(os.path.isabs(p) for p, _ in bases))
+
+    def test_each_hostile_value_is_not_usable(self):
+        from unittest import mock
+
+        open_world = self.make("open", 0o777)  # world writable, not sticky
+        own_sticky = self.make("sticky", 0o1777)  # sticky, but owned by this user, not root
+        loose = self.make("loose", 0o755)
+        link = self.dir / "link"
+        link.symlink_to(self.make("real", 0o700))
+        wide_parent = self.make("wide", 0o777)
+        under_wide = self.make("run", 0o700, parent=wide_parent)
+        (self.dir / "file").write_text("x")
+        cases = (
+            (str(open_world), "system"), (str(open_world), "runtime"), (str(own_sticky), "system"),
+            (str(own_sticky), "runtime"), (str(loose), "runtime"), (str(link), "runtime"), (str(link), "system"),
+            ("relative/dir", "runtime"), ("", "runtime"), (str(self.dir / "nonexistent"), "runtime"),
+            (str(under_wide), "runtime"), (str(self.dir / "file"), "runtime"), (str(self.dir / ".." / "x"), "runtime"),
+            (None, "runtime"),
+        )
+        for path, kind in cases:
+            with self.subTest(path=path, kind=kind):
+                self.assertFalse(launcher.usable_base(path, kind))
+        good = self.make("good", 0o700)
+        self.assertTrue(launcher.usable_base(str(good), "runtime"))
+        with mock.patch.object(launcher.os, "geteuid", return_value=os.geteuid() + 1):  # someone else's directory
+            self.assertFalse(launcher.usable_base(str(good), "runtime"))
+
+    def test_the_system_temp_directory_is_usable_only_when_root_owned_and_sticky(self):
+        st = os.lstat("/tmp")
+        expected = st.st_uid == 0 and bool(st.st_mode & 0o1000)
+        self.assertEqual(launcher.usable_base("/tmp", "system"), expected)
+        self.assertFalse(launcher.usable_base("/tmp", "runtime"))  # not owned by us with mode 0700
+
+    def test_the_first_usable_base_wins_and_fallbacks_are_used(self):
+        a = self.make("a", 0o700)
+        b = self.make("b", 0o700)
+        bad = self.make("bad", 0o755)
+        self.assertEqual(launcher.pick_base([(str(a), "runtime"), (str(b), "runtime")]), str(a))
+        self.assertEqual(launcher.pick_base([(str(bad), "runtime"), (str(b), "runtime")]), str(b))
+        self.assertEqual(launcher.pick_base([(str(self.dir / "none"), "runtime"), (str(bad), "runtime"),
+                                             (str(b), "runtime")]), str(b))
+        self.assertIsNone(launcher.pick_base([(str(bad), "runtime"), ("/nonexistent-shit55", "system")]))
+        self.assertIsNone(launcher.pick_base([]))
+
+    def test_when_no_base_is_safe_the_run_is_refused_with_no_call_and_nothing_created(self):
+        self.fake()
+        bad = self.make("bad", 0o777)
+        name = self.plan_file(kind="list")
+        code, out, _ = run_main(lambda a: launcher.main(a, environ=self.environ(), cwd=self.work,
+                                                        bases=[(str(bad), "runtime"), (str(bad), "system")]), [name])
+        self.assertEqual(code, 9)
+        self.assertIn("no safe directory", out)
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(list(bad.iterdir()), [])
+
+    def test_the_root_is_checked_after_creation(self):
+        from unittest import mock
+
+        base = self.make("base", 0o700)
+        root, fd = launcher.make_private_root(str(base))
+        try:
+            self.assertEqual(oct(os.stat(root).st_mode & 0o777), "0o700")
+            self.assertEqual(os.path.dirname(root), str(base))
+        finally:
+            os.close(fd)
+            shutil.rmtree(root)
+        with (mock.patch.object(launcher.os, "geteuid", return_value=os.geteuid() + 1),
+              self.assertRaises(ShitError)):  # refused, and the directory must not be left behind
+            launcher.make_private_root(str(base))
+        self.assertEqual(list(base.iterdir()), [])
+
+
 class BoundedReadTests(Case):
     def test_a_flood_on_stdout_or_stderr_is_cut_off_with_the_limit_code(self):
         for stream in ("out", "err"):
@@ -786,6 +889,24 @@ class GhPathTests(Case):
         self.assertFalse((self.dir / "evil").exists())
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.calls()[0]["me"], str(self.bin))
+
+    def test_a_program_or_directory_owned_by_another_user_is_refused_whatever_its_mode(self):
+        from unittest import mock
+
+        self.fake()
+        self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", self.gh())[0], 0)
+        with mock.patch.object(launcher.os, "geteuid", return_value=os.geteuid() + 1):  # now it is "someone else's"
+            self.assertEqual(self.run_plan(self.plan_file(kind="list"), "--gh", self.gh())[0], 5)
+            with self.assertRaises(ShitError):
+                launcher.open_gh(self.gh())
+
+    def test_a_root_owned_program_in_a_root_owned_chain_is_accepted(self):
+        candidate = "/usr/bin/env"
+        if not os.path.isfile(candidate) or os.path.islink(candidate) or os.lstat(candidate).st_uid != 0:
+            self.skipTest("no root-owned regular /usr/bin/env here")
+        path, fd = launcher.open_gh(candidate)
+        os.close(fd)
+        self.assertEqual(path, candidate)
 
     def test_bad_explicit_gh_is_refused_with_no_call(self):
         self.fake()

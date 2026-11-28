@@ -35,7 +35,7 @@ GITHUB_ENTERPRISE_TOKEN for any other host), and never the other pair. It never 
 
 Environment: `gh` gets only PATH, LANG, LC_ALL, TERM, TZ, USER, the applicable token pair, GH_PROMPT_DISABLED=1,
 GH_NO_UPDATE_NOTIFIER=1 and NO_COLOR=1, and a fresh private HOME, GH_CONFIG_DIR, XDG_*_HOME and TMPDIR: a new
-mode-0700 directory made for this run and removed afterwards. Your own HOME is never passed, so no `gh` configuration
+mode-0700 directory made for this run and removed afterwards (see below for where). Your own HOME is never passed, so no `gh` configuration
 of yours (hosts, `api_host`, `http_unix_socket`, aliases, pager, extensions, proxy) applies. The token then comes
 only from the token variable pair. Any other variable of yours is dropped, GH_HOST included.
 If you rely on `gh auth login`, `--gh-config-dir PATH` opts in one configuration directory: absolute, an existing
@@ -44,6 +44,10 @@ a root-owned sticky one (exit 5 otherwise, 2 if relative, 9 if missing). It is o
 GH_CONFIG_DIR is /proc/self/fd/N for that descriptor (the path itself where there is no /proc, with a race on the path);
 HOME stays private. Residual: a `config.yml` or `hosts.yml` in that directory can still redirect traffic or name a
 socket, so the trust boundary covers whoever can write there or replace it through a parent you did not check.
+Where: under your own /run/user/UID when it is yours and mode 0700, else under /tmp or /var/tmp when that is a root-owned
+sticky directory, with every ancestor owned by root or you and not group or other writable; TMPDIR, TMP and TEMP are
+never read. If none qualifies the launcher refuses (exit 9) before any call. The directory is created with mkdtemp,
+checked by descriptor, and removed on every exit.
 Proxy and certificate variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY, SSL_CERT_FILE, SSL_CERT_DIR,
 REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and similar) can send the token through a server of someone else's choosing, so the
 launcher refuses to start (exit 3, naming the variable) when one is set. `--allow-env NAME` (repeatable) opts one such
@@ -281,8 +285,8 @@ def configured_host(config_arg, base):
 
 
 def _safe_dir_chain(directory):
-    """Every directory from / to `directory` (links resolved) is not writable by group or others, unless it is a
-    root-owned sticky directory (such as /tmp). Raises the confinement error otherwise."""
+    """Every directory from / to `directory` (links resolved) is owned by root or you and is not writable by group or
+    others, unless it is a root-owned sticky directory (such as /tmp). Raises the confinement error otherwise."""
     path = os.path.realpath(directory)
     parts = [p for p in path.split(os.sep) if p]
     current = os.sep
@@ -292,6 +296,8 @@ def _safe_dir_chain(directory):
         if not stat.S_ISDIR(st.st_mode):
             raise ShitError(CONFINEMENT)
         if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+            raise ShitError(CONFINEMENT)
+        if st.st_uid not in (0, os.geteuid()):  # a directory another user owns, whatever its mode, is theirs to change
             raise ShitError(CONFINEMENT)
     return path
 
@@ -313,7 +319,7 @@ def open_gh(text):
         st = os.fstat(fd)
         same = (st.st_dev, st.st_ino) == (before.st_dev, before.st_ino)
         if (not same or not stat.S_ISREG(st.st_mode) or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or not os.access(text, os.X_OK)):
+                or st.st_uid not in (0, os.geteuid()) or not os.access(text, os.X_OK)):
             raise ShitError(CONFINEMENT)
     except BaseException:
         os.close(fd)
@@ -351,7 +357,62 @@ def open_config_dir(text):
     return text, fd
 
 
-def make_handler(popen, which, environ, cwd, tmpdir):
+def default_bases():
+    """The places the private directory may be made, best first. The ambient TMPDIR, TMP and TEMP are never read."""
+    return [(f"/run/user/{os.geteuid()}", "runtime"), ("/tmp", "system"), ("/var/tmp", "system")]
+
+
+def usable_base(path, kind):
+    """True if `path` is a safe parent for the private directory.
+
+    runtime: absolute, not a symlink, owned by you, mode exactly 0700, safe ancestors. system: absolute, not a
+    symlink, owned by root, sticky, safe ancestors (so only the owner of an entry can rename or remove it).
+    """
+    if not isinstance(path, str) or not os.path.isabs(path) or ".." in path.split(os.sep) or chr(0) in path:
+        return False
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode):  # lstat: a symlink is not a directory here
+            return False
+        if kind == "runtime":
+            ok = st.st_uid == os.geteuid() and stat.S_IMODE(st.st_mode) == 0o700
+        else:
+            ok = st.st_uid == 0 and bool(st.st_mode & stat.S_ISVTX)
+        if ok:
+            _safe_dir_chain(os.path.dirname(path))
+        return ok
+    except (OSError, ShitError):
+        return False
+
+
+def pick_base(bases):
+    """The first usable base, or None."""
+    for path, kind in bases:
+        if usable_base(path, kind):
+            return path
+    return None
+
+
+def make_private_root(base):
+    """A new directory under `base`, mode 0700, checked after creation through a descriptor. Returns (path, fd)."""
+    root = tempfile.mkdtemp(prefix="shit-threads-", dir=base)
+    fd = None
+    try:
+        before = os.lstat(root)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        st = os.fstat(fd)
+        if ((st.st_dev, st.st_ino) != (before.st_dev, before.st_ino) or not stat.S_ISDIR(st.st_mode)
+                or st.st_uid != os.geteuid() or stat.S_IMODE(st.st_mode) != 0o700):
+            raise ShitError(CONFINEMENT)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+    return root, fd
+
+
+def make_handler(popen, which, environ, cwd, bases):
     def handler(args):
         base = Path(cwd) if cwd is not None else Path.cwd()
         allow = tuple(args.allow_env or ())
@@ -384,9 +445,17 @@ def make_handler(popen, which, environ, cwd, tmpdir):
             proc = os.path.isdir("/proc/self/fd")
             if config_dir is not None and proc:
                 config_dir = f"/proc/self/fd/{cfd}"
-            with tempfile.TemporaryDirectory(prefix="shit-threads-", dir=tmpdir) as root:
+            base = pick_base(bases if bases is not None else default_bases())
+            if base is None:
+                return PRECONDITION, [("refused: no safe directory for the private environment (need your 0700 "
+                                       "/run/user/UID, or a root-owned sticky /tmp or /var/tmp); TMPDIR is never used")]
+            root, root_fd = make_private_root(base)
+            fds.append(root_fd)
+            try:
                 env = child_env(environ, host, allow, private_env(root, config_dir))
                 return execute(plan, Gh(path, popen, env, fd if proc else None, [cfd] if config_dir and proc else ()))
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
         finally:
             for open_fd in fds:
                 os.close(open_fd)
@@ -394,7 +463,7 @@ def make_handler(popen, which, environ, cwd, tmpdir):
     return handler
 
 
-def build(popen, which, environ, cwd, tmpdir=None):
+def build(popen, which, environ, cwd, bases=None):
     parser = _cli.SafeParser(prog="threads_run")
     parser.add_argument("--config", default=None, help="configuration file whose [tracker] host is trusted "
                         "(default: none, so github.com)")
@@ -404,14 +473,14 @@ def build(popen, which, environ, cwd, tmpdir=None):
     parser.add_argument("--allow-env", action="append", type=allow_name, default=None, metavar="NAME",
                         help="pass one proxy, certificate or gh settings variable (repeatable; never a token)")
     parser.add_argument("plan", help="plan file from `shit threads`, below the working directory")
-    parser.set_defaults(func=make_handler(popen, which, environ, cwd, tmpdir))
+    parser.set_defaults(func=make_handler(popen, which, environ, cwd, bases))
     return parser
 
 
-def main(argv=None, popen=subprocess.Popen, which=shutil.which, environ=None, cwd=None, tmpdir=None):
+def main(argv=None, popen=subprocess.Popen, which=shutil.which, environ=None, cwd=None, bases=None):
     environ = os.environ if environ is None else environ
     args = sys.argv[1:] if argv is None else argv
-    return _cli.run(lambda: build(popen, which, environ, cwd, tmpdir), args)
+    return _cli.run(lambda: build(popen, which, environ, cwd, bases), args)
 
 
 if __name__ == "__main__":
