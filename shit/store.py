@@ -2378,3 +2378,105 @@ def queue_remove_edge(conn, task_id, needs_id, kind, actor, now, *, config=None,
         conn.execute("DELETE FROM edges WHERE task_id = ? AND needs_id = ? AND type = ?", edge)
         proof = _shard_proof(conn, (task_id,))
         _append_entry(conn, {"task_id": task_id, "actor": actor, "kind": "graph_changed", "shards": proof}, now, key)
+
+
+# == C6: reads for the hash-chained audit export (issue 63, epic 57; docs/audit-export.md) ==================
+#
+# Reads only. The export file is written by `shit/audit_export.py` from what these functions return; the database
+# stays the authority. `audit_chains` rebuilds the exact line each chain hash was computed over, so the export lets
+# an offline reader recompute every hash. The queue's key order is not a column of the table: it is the order in
+# which each operation builds its entry, written down here per kind. An entry whose rebuilt line does not hash to the
+# stored value is refused with exit code 8 (a new kind or a changed field order shows up there, not silently).
+
+AUDIT_CHAINS = ("events", "queue")
+_LINE_HEAD = ("schema", "schema_version", "id", "timestamp", "message")
+_LINE_LEASE = ("task_id", "actor", "kind", "state_after", "lease_id", "generation")
+_LINE_ORDER = {
+    "enqueued": ("task_id", "actor", "kind", "state_after"),
+    "ready": ("task_id", "actor", "kind", "state_after"),
+    "claimed": (*_LINE_LEASE, "worker", "worker_kind", "step", "expires_at"),
+    "started": (*_LINE_LEASE, "worker", "step", "attempt"),
+    "renewed": (*_LINE_LEASE, "worker", "step", "expires_at"),
+    "released": _LINE_LEASE,
+    "expired": ("task_id", "actor", "kind", "lease_id", "generation", "state_after"),
+    "apply_started": _LINE_LEASE,
+    "apply_finished": _LINE_LEASE,
+    "submitted": _LINE_LEASE,
+    "failed": _LINE_LEASE,
+    "held": (*_LINE_LEASE, "hold_kind"),
+    "reopened": ("task_id", "actor", "kind", "state_after"),
+    "done": ("task_id", "actor", "kind", "state_after"),
+    "graph_changed": ("task_id", "actor", "kind", "shards"),
+}
+
+
+def _queue_line(entry):
+    """The line of one queue entry as the writer built it: the head keys, then the kind's fields in its order."""
+    order = _LINE_ORDER.get(entry.get("kind"))
+    if order is None:
+        raise ShitError(FAILED_CLOSED)
+    line = {name: entry[name] for name in _LINE_HEAD if name in entry}
+    for name in order:
+        if name in entry:
+            line[name] = entry[name]
+    if set(line) != set(entry):  # a column the kind's order does not name
+        raise ShitError(FAILED_CLOSED)
+    try:
+        return queue_records.dump_entry(line)
+    except ShitError:
+        raise ShitError(FAILED_CLOSED) from None
+
+
+def _event_line(row):
+    try:
+        return records.dump_event(_event_dict(row))
+    except ShitError:
+        raise ShitError(FAILED_CLOSED) from None
+
+
+def audit_tips(conn):
+    """{chain: (sequence number, hash)} of the last row of each chain; (0, GENESIS) for an empty one."""
+    events, queue = _tip(conn), _queue_tip(conn)
+    return {"events": (events[0], events[1]), "queue": (queue[0], queue[1])}
+
+
+def audit_hash_at(conn, chain, seq):
+    """The hash stored at `seq` of `chain` ("events" or "queue"), or None when the chain has no such row."""
+    if type(seq) is not int or seq < 1:
+        raise ShitError(USAGE)
+    if chain == "events":
+        row = conn.execute("SELECT hash FROM events WHERE seq = ?", (seq,)).fetchone()
+    elif chain == "queue":
+        row = conn.execute("SELECT hash FROM queue_entries WHERE seq = ?", (seq,)).fetchone()
+    else:
+        raise ShitError(USAGE)
+    return None if row is None else row[0]
+
+
+def audit_chains(conn):
+    """({chain: [(seq, hash, line bytes)]}) for both chains, oldest first, each verified while it is read.
+
+    Refuses with exit code 8 a row that is not the next sequence number, whose `prev_hash` is not the previous hash,
+    or whose stored hash is not `chain_hash(prev_hash, line)`. Call it inside `read_snapshot` (or a write transaction)
+    so both chains come from one commit."""
+    out = {}
+    names = ("seq", *_ENTRY_COLUMNS, "shards", "prev_hash", "hash")
+    sources = (
+        ("events", [(row[0], row[1], row[2], _event_line(row[3:])) for row in conn.execute(
+            "SELECT seq, prev_hash, hash, id, task_id, timestamp, actor, event, message, record_id, from_state, "
+            "to_state, exit_code FROM events ORDER BY seq").fetchall()]),
+        ("queue", [(row[0], row[-2], row[-1], _queue_line(_entry_from_row(names[1:-2], row[1:-2]))) for row in
+                   conn.execute(
+                       "SELECT seq, id, task_id, timestamp, actor, kind, state_after, lease_id, generation, worker, "
+                       "worker_kind, step, hold_kind, not_before, attempt, expires_at, orphan_sha256, message, "
+                       "shards, prev_hash, hash FROM queue_entries ORDER BY seq").fetchall()]),
+    )
+    for chain, rows in sources:
+        previous, items = GENESIS, []
+        for seq, prev_hash, digest, line in rows:
+            if seq != len(items) + 1 or prev_hash != previous or chain_hash(prev_hash, line) != digest:
+                raise ShitError(FAILED_CLOSED)
+            items.append((seq, digest, line))
+            previous = digest
+        out[chain] = items
+    return out

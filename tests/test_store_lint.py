@@ -71,6 +71,8 @@ ALLOWED_METHODS = {
     "_append_entry": {"execute"}, "_lifecycle_step": {"execute"}, "_insert_lease": {"execute"},
     "_renew_lease_row": {"execute"}, "_drop_lease": {"execute"}, "_take_slot": {"execute"},
     "_release_slots": {"execute"},
+    # audit export (issue 63, C6): reads only.
+    "audit_hash_at": {"execute"}, "audit_chains": {"execute"},
 }
 # Functions that write without opening a transaction. Each may run only inside `with write_transaction(...)` or inside
 # another of them (checked at every call site), and each refuses at run time when the connection is not in one. Being
@@ -918,6 +920,74 @@ class QueueOperationLintTests(unittest.TestCase):
         for node in ast.walk(top["_keyed"]):
             if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "execute":
                 self.assertIn("?", _text(node.args[0]))  # the key travels as a parameter
+
+
+C6_READS = ("audit_tips", "audit_hash_at", "audit_chains", "_event_line", "_queue_line")
+
+
+class AuditExportLintTests(unittest.TestCase):
+    """Issue 63, C6: the export reads are on the allowlist one by one, and nothing about them is a write."""
+
+    def test_the_audit_reads_run_literal_selects_and_nothing_else(self):
+        top = top_level((ROOT / STORE).read_text(encoding="utf-8"))
+        statements = {}
+        for name in C6_READS:
+            self.assertIn(name, top)
+            for node in ast.walk(top[name]):
+                if isinstance(node, ast.Call) and getattr(node.func, "attr", "") in EXECUTORS:
+                    statements.setdefault(name, []).append(_text(node.args[0]))
+                if isinstance(node, ast.Call) and getattr(node.func, "id", "") in IN_TRANSACTION | {"write_transaction"}:
+                    self.fail(name + " calls a writer")
+        # Something was collected: the two lookups and the two chain reads, each a literal SELECT.
+        self.assertEqual(sorted(statements), ["audit_chains", "audit_hash_at"])
+        self.assertEqual(len(statements["audit_hash_at"]), 2)
+        self.assertEqual(len(statements["audit_chains"]), 2)
+        for name, found in statements.items():
+            for statement in found:
+                self.assertIsNotNone(statement, name)
+                self.assertTrue(is_read_only(statement), (name, statement))
+                self.assertTrue(statement.upper().startswith("SELECT"), (name, statement))
+
+    def test_the_chain_name_never_reaches_sql_text(self):
+        top = top_level((ROOT / STORE).read_text(encoding="utf-8"))
+        self.assertEqual(sql_findings((ROOT / STORE).read_text(encoding="utf-8"), STORE, BUILDERS), [])
+        for node in ast.walk(top["audit_hash_at"]):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "execute":
+                self.assertIn("?", _text(node.args[0]))  # the sequence number is a parameter
+
+    def test_the_allowlist_entries_are_exact(self):
+        self.assertEqual(ALLOWED_METHODS["audit_hash_at"], {"execute"})
+        self.assertEqual(ALLOWED_METHODS["audit_chains"], {"execute"})
+        for name in ("audit_tips", "_event_line", "_queue_line"):
+            self.assertNotIn(name, ALLOWED_METHODS)  # they run no statement of their own
+
+    def test_no_module_outside_the_store_touches_the_database_for_the_export(self):
+        sources = dict(package_sources())
+        for rel in ("shit/audit_export.py", "shit/audit.py", "shit/store_check.py"):
+            self.assertIn(rel, sources)
+            self.assertEqual(access_findings(sources[rel], rel), [], rel)
+            self.assertEqual(sql_findings(sources[rel], rel), [], rel)
+
+    def test_a_write_in_an_audit_read_is_a_finding(self):
+        for name in ("audit_hash_at", "audit_chains"):
+            for statement in ("INSERT INTO events (seq) VALUES (?)", "DELETE FROM queue_entries", "UPDATE events SET hash = ?"):
+                with self.subTest(name=name, statement=statement):
+                    bare = "def " + name + '(conn):\n    conn.execute("' + statement + '", row)'
+                    self.assertTrue(access_findings(bare, STORE))
+
+    def test_an_unlisted_audit_function_may_not_execute(self):
+        source = 'def audit_all(conn):\n    return conn.execute("SELECT * FROM events").fetchall()'
+        found = {kind for _, kind in access_findings(source, STORE)}
+        self.assertIn("database method in a function not on the list", found)
+
+    def test_text_built_sql_is_caught_in_an_audit_read(self):
+        sources = (
+            'def audit_hash_at(conn, chain, seq):\n    return conn.execute("SELECT hash FROM " + chain + " WHERE seq = ?", (seq,))',
+            'def audit_chains(conn, table):\n    return conn.execute(f"SELECT * FROM {table}")',
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE) + sql_findings(source, STORE, BUILDERS), source)
 
 
 if __name__ == "__main__":

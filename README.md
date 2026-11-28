@@ -14,7 +14,7 @@ Four roles (implementer, reviewer, researcher, planner) and six packs (review-pr
 
 The dependency graph, durable queue and per-task leases are implemented in `shit/dependencies.py`, `shit/queue.py` and `shit/queue_records.py`. The design is [docs/queue-spec.md](docs/queue-spec.md); what is built, what is deferred and what still needs a human decision is in [docs/queue.md](docs/queue.md).
 
-The SQLite store that will replace the file queue is being built in steps; its foundation (confined connection, schema, fingerprint, error mapping) is `shit/store.py`, described in [docs/store.md](docs/store.md).
+The SQLite store that will replace the file queue is being built in steps; its foundation (confined connection, schema, fingerprint, error mapping) is `shit/store.py`, described in [docs/store.md](docs/store.md). Its hash-chained audit export, the offline verifier (`shit audit verify`) and the queue section of `shit check` are described in [docs/audit-export.md](docs/audit-export.md).
 
 Bounded work (directory width, byte budget, scan and lock-hold deadlines) is described in [docs/bounded-work.md](docs/bounded-work.md).
 
