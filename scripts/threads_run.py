@@ -29,12 +29,12 @@ root-owned sticky directory such as /tmp. The file is opened once, checked throu
 
 Host and credential: the host comes only from an explicit `--config PATH` (`[tracker] host`), else github.com; no
 file is read by default and the plan never chooses it. A plan whose host is not null and differs is refused before any
-call (exit 3). Every call carries `--hostname HOST`. The launcher reads the token variables from your environment and
-passes the pair that applies to that host to `gh` (GH_TOKEN and GITHUB_TOKEN for github.com, GH_ENTERPRISE_TOKEN and
-GITHUB_ENTERPRISE_TOKEN for any other host), and never the other pair. It never prints or logs their values.
+call (exit 3). Every call carries `--hostname HOST`. The launcher reads the sign-in variables from your environment
+and passes the pair that applies to that host to `gh` (the names are the constants TOKENS_DOTCOM for github.com and
+TOKENS_OTHER for any other host, below), and never the other pair. It never prints or logs their values.
 
-Environment: `gh` gets only PATH, LANG, LC_ALL, TERM, TZ, USER, the applicable token pair, GH_PROMPT_DISABLED=1,
-GH_NO_UPDATE_NOTIFIER=1 and NO_COLOR=1, and a fresh private HOME, GH_CONFIG_DIR, XDG_*_HOME and TMPDIR: a new
+Environment: `gh` gets only the names in ENV_ALLOW, the applicable sign-in pair, the fixed flags in ENV_FORCE, and a
+fresh private HOME, GH_CONFIG_DIR, XDG_*_HOME and TMPDIR: a new
 mode-0700 directory made for this run and removed afterwards (see below for where). Your own HOME is never passed, so no `gh` configuration
 of yours (hosts, `api_host`, `http_unix_socket`, aliases, pager, extensions, proxy) applies. The token then comes
 only from the token variable pair. Any other variable of yours is dropped, GH_HOST included.
@@ -48,10 +48,9 @@ Where: under your own /run/user/UID when it is yours and mode 0700, else under /
 sticky directory, with every ancestor owned by root or you and not group or other writable; TMPDIR, TMP and TEMP are
 never read. If none qualifies the launcher refuses (exit 9) before any call. The directory is created with mkdtemp,
 checked by descriptor, and removed on every exit.
-Proxy and certificate variables (HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY, SSL_CERT_FILE, SSL_CERT_DIR,
-REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE and similar) can send the token through a server of someone else's choosing, so the
-launcher refuses to start (exit 3, naming the variable) when one is set. `--allow-env NAME` (repeatable) opts one such
-name in and passes exactly that variable; it accepts only names on the fixed list in OPT_IN, never a token name.
+The proxy and certificate variables listed in RISKY can send the sign-in through a server of someone else's choosing,
+so the launcher refuses to start (exit 3, naming the variable) when one is set. `--allow-env NAME` (repeatable) opts
+one such name in and passes exactly that variable; it accepts only names on the fixed list OPT_IN, never a sign-in name.
 
 Exit codes (docs/exit-codes.md): 0 done; 2 usage; 3 plan rejected or a risky variable set; 5 plan or `gh` path
 outside confinement or not a regular file; 7 limit; 8 GitHub did not answer as required or a write failed; 9 plan
