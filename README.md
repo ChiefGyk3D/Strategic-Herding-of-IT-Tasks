@@ -12,6 +12,8 @@ Four roles (implementer, reviewer, researcher, planner) and six packs (review-pr
 
 Local models are optional helpers for text-in, text-out work. See [docs/local-models.md](docs/local-models.md) for Ollama and LM Studio setup, measured hardware guidance, and the current integration status.
 
+The code-built [untrusted model-path registry](docs/untrusted-model-paths.md) records every package function that can send untrusted text to a model and requires no tools, writes or secrets for each row.
+
 ## Queue (stage 3, in progress)
 
 SQLite is the only task, record, dependency, queue, and lease backend. The implementation is in `shit/store.py`, `shit/store_tasks.py`, and `shit/store_queue.py`; record bodies remain files by design. The queue rules are in [docs/queue-spec.md](docs/queue-spec.md), with implementation notes in [docs/queue.md](docs/queue.md).
