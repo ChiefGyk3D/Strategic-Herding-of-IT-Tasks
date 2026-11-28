@@ -5,6 +5,7 @@ plain `sqlite3` connection opened by the test itself, which is allowed outside `
 """
 
 import hashlib
+import json
 import os
 import random
 import re
@@ -19,7 +20,7 @@ from unittest import mock
 
 from _bootstrap import ROOT, make_git_dir
 
-from shit import errors, lifecycle, queue_records, store
+from shit import errors, lifecycle, queue_records, records, store
 from shit.errors import ShitError
 from shit.project import Project
 
@@ -211,6 +212,14 @@ class ConfinementTests(Base):
         os.symlink(other, wal)
         self.assertEqual(code_of(store.connect, self.proj), errors.CONFINEMENT)
 
+    def test_symlinked_rollback_journal_is_refused(self):
+        self.init_store()
+        other = self.base / "other-journal"
+        other.write_bytes(b"")
+        os.chmod(other, stat.S_IRUSR | stat.S_IWUSR)
+        os.symlink(other, str(self.db) + "-journal")
+        self.assertEqual(code_of(store.connect, self.proj), errors.CONFINEMENT)
+
     def test_non_regular_database_is_refused(self):
         self.init_store()
         os.unlink(self.db)
@@ -293,7 +302,7 @@ class ConfinementTests(Base):
         path = str(self.db)
         for suffix in ("-wal", "-shm"):
             with self.subTest(sidecar=suffix):
-                snapshot = {s: store._lstat(path + s, required=False) for s in ("-wal", "-shm")}
+                snapshot = {s: store._lstat(path + s, required=False) for s in store._SIDECARS}
                 self.assertIsNotNone(snapshot[suffix])
                 os.rename(path + suffix, path + suffix + ".away")
                 try:
@@ -303,7 +312,7 @@ class ConfinementTests(Base):
                     self.assertEqual(caught.exception.code, errors.CONFINEMENT)
                 finally:
                     os.rename(path + suffix + ".away", path + suffix)
-        none = {"-wal": None, "-shm": None}
+        none = dict.fromkeys(store._SIDECARS)
         os.rename(path + "-wal", path + "-wal.away")
         try:
             store._verify_sidecars(path, none, True)  # absent before and after: fine
@@ -404,7 +413,7 @@ class SchemaTests(Base):
                 "VALUES ('e1', 'alpha', ?, 'human', 'task_created', 'created', ?, ?)", (NOW, H64, "1" * 64))
             conn.execute(
                 "INSERT INTO queue_entries (id, task_id, timestamp, actor, kind, state_after, prev_hash, hash) "
-                "VALUES ('q1', 'alpha', ?, 'human', 'enqueued', 'waiting', ?, ?)", (NOW, H64, "2" * 64))
+                "VALUES ('queue-0001', 'alpha', ?, 'human', 'enqueued', 'waiting', ?, ?)", (NOW, H64, "2" * 64))
         attempts = (
             "UPDATE events SET message = 'x'", "DELETE FROM events",
             "UPDATE queue_entries SET message = 'x'", "DELETE FROM queue_entries",
@@ -472,7 +481,8 @@ class RowFixture(Base):
 
     def put(self, kind, state, actor="wrapper", task="alpha", **cols):
         n = self.tick()
-        row = {"id": f"queue-{n:04d}", "task_id": task, "timestamp": self.stamp(), "actor": actor, "kind": kind,
+        position = self.conn.execute("SELECT count(*) FROM queue_entries").fetchone()[0] + 1
+        row = {"id": f"queue-{position:04d}", "task_id": task, "timestamp": self.stamp(), "actor": actor, "kind": kind,
                "state_after": state, "prev_hash": self.tip("queue_entries"),
                "hash": hashlib.sha256(str(n).encode()).hexdigest(), **cols}
         self.insert("queue_entries", row)
@@ -676,7 +686,7 @@ class TransitionTests(RowFixture):
         self.assertRefused(self.put_code("ready", "ready"), errors.REJECTED, errors.ILLEGAL_TRANSITION)  # never enqueued
         self.put("enqueued", "waiting", actor="human")
         self.assertEqual(self.put_code("enqueued", "waiting", actor="human"), errors.REJECTED)
-        self.put("graph_changed", None, task="beta", shards='[{"task_id":"beta"}]')  # no queue state needed
+        self.put("graph_changed", None, task="beta", shards='[{"task_id":"beta","sha256":"' + "1" * 64 + '"}]')  # no queue state needed
 
     def test_claim_generation_goes_up_by_exactly_one(self):
         self.reach("dispatched")
@@ -783,10 +793,11 @@ class LeaseConsistencyTests(RowFixture):
         claim_expiry = self.conn.execute("SELECT expires_at FROM queue_entries WHERE kind = 'claimed'").fetchone()[0]
         expiry = datetime.strptime(claim_expiry, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
         base = self.tip("queue_entries")
+        position = self.conn.execute("SELECT count(*) FROM queue_entries").fetchone()[0] + 1
         with store.write_transaction(self.conn):
             for number in range(queue_records.MAX_RENEWALS + 1):
                 expiry += timedelta(seconds=1)
-                row = {"id": f"queue-{number + 10:04d}", "task_id": "alpha", "timestamp": self.stamp(number),
+                row = {"id": f"queue-{position + number:04d}", "task_id": "alpha", "timestamp": self.stamp(number),
                        "actor": "wrapper", "kind": "renewed", "state_after": "running", "lease_id": self.LEASE,
                        "generation": 1, "worker": "worker-one", "step": "draft",
                        "expires_at": expiry.strftime("%Y-%m-%dT%H:%M:%SZ"), "prev_hash": base,
@@ -882,9 +893,10 @@ class LeaseConsistencyTests(RowFixture):
         self.reach("running")
         self.insert("leases", self.lease_row_for(self.lease_cols()))
         self.put("renewed", "running", **self.renew_cols(1800))
+        logged = self.conn.execute("SELECT expires_at FROM queue_entries WHERE kind = 'renewed'").fetchone()[0]
         self.assertEqual(self.update_lease(self.stamp(1000), 1), errors.LEASE_REFUSED)  # shorter than the log
         self.assertEqual(self.update_lease(self.stamp(1800 + 90000), 1), errors.LEASE_REFUSED)  # beyond a day
-        self.assertIsNone(self.update_lease(self.stamp(1800), 1))
+        self.assertIsNone(self.update_lease(logged, 1))
 
     def test_a_started_entry_must_match_an_existing_lease_row(self):
         self.reach("dispatched")
@@ -965,6 +977,456 @@ class ReplayDifferentialTests(RowFixture):
             queue_records.replay(entry_dicts(self.conn))  # raises ShitError(3) if the log is not replayable
         self.assertGreaterEqual(len(accepted_kinds), 9, accepted_kinds)
         self.assertGreater(self.conn.execute("SELECT count(*) FROM queue_entries").fetchone()[0], 15)
+
+
+class IntegrityTests(RowFixture):
+    """Review round 3: REPLACE, sequence numbers, NULs, lifecycle authority on events, shards, timestamp parity."""
+
+    def run_sql(self, sql, params=()):
+        def run():
+            with store.write_transaction(self.conn):
+                self.conn.execute(sql, params)
+        return code_of(run)
+
+    def event_row(self, **overrides):
+        n = self.tick()
+        return {"id": f"event-{n:04d}", "task_id": "alpha", "timestamp": self.stamp(), "actor": "human",
+                "event": "task_created", "message": "created", "prev_hash": self.tip("events"),
+                "hash": hashlib.sha256(str(n).encode()).hexdigest(), **overrides}
+
+    def test_recursive_triggers_are_on(self):
+        self.assertEqual(self.conn.execute("PRAGMA recursive_triggers").fetchone()[0], 1)
+
+    def test_insert_or_replace_cannot_rewrite_or_delete_protected_rows(self):
+        self.insert("events", self.event_row())
+        self.put("enqueued", "waiting", actor="human")
+        self.insert("task_history", {"task_id": "alpha", "from_state": "open", "to_state": "running",
+                                     "actor": "wrapper", "at": NOW, "reason": "x"})
+        tables = ("events", "queue_entries", "task_history", "tasks")
+        before = {t: self.conn.execute("SELECT * FROM " + t).fetchall() for t in tables}
+        shards = '[{"task_id":"alpha","sha256":"' + "1" * 64 + '"}]'
+        events_sql = ("INSERT OR REPLACE INTO events (seq, id, task_id, timestamp, actor, event, message, prev_hash, "
+                      "hash) VALUES (1, 'event-9999', 'alpha', ?, 'human', 'task_created', 'changed', ?, ?)")
+        history_sql = ("INSERT OR REPLACE INTO task_history (id, task_id, from_state, to_state, actor, at, reason) "
+                       "VALUES (1, 'alpha', 'open', 'running', 'wrapper', ?, 'changed')")
+        queue_sql = ("INSERT OR REPLACE INTO queue_entries (seq, id, task_id, timestamp, actor, kind, shards, "
+                     "prev_hash, hash) VALUES (1, 'queue-0001', 'alpha', ?, 'human', 'graph_changed', ?, ?, ?)")
+        tasks_sql = ("INSERT OR REPLACE INTO tasks (id, state, owner, created_at, updated_at) "
+                     "VALUES ('alpha', 'closed', 'human', ?, ?)")
+        replace_sql = ("REPLACE INTO events (seq, id, task_id, timestamp, actor, event, message, prev_hash, hash) "
+                       "VALUES (1, 'event-9998', 'alpha', ?, 'human', 'task_created', 'again', ?, ?)")
+        attempts = (
+            (events_sql, (self.stamp(), H64, "7" * 64)),
+            (history_sql, (NOW,)),
+            (queue_sql, (self.stamp(), shards, H64, "8" * 64)),
+            (tasks_sql, (NOW, NOW)),
+            (replace_sql, (self.stamp(), H64, "6" * 64)),
+        )
+        for sql, params in attempts:
+            with self.subTest(sql=sql[:40]):
+                self.assertEqual(self.run_sql(sql, params), errors.FAILED_CLOSED)
+        after = {t: self.conn.execute("SELECT * FROM " + t).fetchall() for t in before}
+        self.assertEqual(after, before)
+
+    def test_sequence_numbers_are_previous_plus_one_however_supplied(self):
+        self.insert("events", self.event_row())
+        for seq in (0, -1, 1, 3, 100):
+            with self.subTest(table="events", seq=seq):
+                code = code_of(self.insert, "events", {**self.event_row(), "seq": seq})
+                self.assertIn(code, (errors.FAILED_CLOSED, errors.REJECTED))  # a taken number is a key clash
+        self.insert("events", {**self.event_row(), "seq": 2})
+        self.put("enqueued", "waiting", actor="human")
+        for seq in (0, -3, 1, 3, 50):
+            with self.subTest(table="queue_entries", seq=seq):
+                row = {"id": f"queue-{seq:04d}", "task_id": "alpha", "timestamp": self.stamp(5), "actor": "wrapper",
+                       "kind": "ready", "state_after": "ready", "prev_hash": self.tip("queue_entries"),
+                       "hash": "5" * 64, "seq": seq}
+                code = code_of(self.insert, "queue_entries", row)
+                # Everything but the number is valid, so only the sequence rule (or the key, for a taken number) refuses.
+                self.assertEqual(code, errors.REJECTED if seq == 1 else errors.FAILED_CLOSED)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM queue_entries").fetchone()[0], 1)
+
+    def test_the_first_row_must_be_number_one(self):
+        self.assertEqual(code_of(self.insert, "events", {**self.event_row(), "seq": 2}), errors.FAILED_CLOSED)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM events").fetchone()[0], 0)
+
+    def test_queue_ids_follow_the_sequence(self):
+        self.put("enqueued", "waiting", actor="human")
+        self.assertEqual(self.put_code("ready", "ready", id="attacker-chosen"), errors.REJECTED)
+
+    def test_embedded_nul_bytes_are_refused_everywhere_text_is_checked(self):
+        nul = chr(0)
+        cases = (
+            ("tasks", {"id": "gamma" + nul + "../../x", "state": "open", "owner": "human", "created_at": NOW,
+                       "updated_at": NOW}),
+            ("tasks", {"id": "d" + nul + "a" * 5000, "state": "open", "owner": "human", "created_at": NOW,
+                       "updated_at": NOW}),
+            ("tasks", {"id": "delta", "state": "open", "owner": "human", "created_at": NOW + nul + "x",
+                       "updated_at": NOW}),
+            ("tasks", {"id": "epsilon", "state": "blocked", "owner": "human", "created_at": NOW, "updated_at": NOW,
+                       "blocked_reason": "ok" + nul + "x" * 600, "blocking_item": "y"}),
+            ("events", self.event_row(message="ok" + nul + "x" * 1000)),
+            ("events", self.event_row(hash="1" * 64 + nul + "not-hex")),
+            ("events", self.event_row(id="event-x" + nul + "y")),
+            ("meta", {"key": "k" + nul + "x", "value": "v"}),
+            ("meta", {"key": "kk", "value": "v" + nul + "x"}),
+        )
+        for table, row in cases:
+            with self.subTest(table=table, row=str(row)[:70]):
+                self.assertEqual(code_of(self.insert, table, row), errors.REJECTED)
+
+    def test_events_obey_the_lifecycle_actor_table_like_history_does(self):
+        for frm in lifecycle.STATES:
+            for to in lifecycle.STATES:
+                for actor in lifecycle.ACTORS:
+                    with self.subTest(frm=frm, to=to, actor=actor):
+                        python_ok = code_of(lifecycle.check_transition, frm, to, actor) is None
+                        sql_ok = code_of(self.insert, "events", self.event_row(
+                            event="state_transition", from_state=frm, to_state=to, actor=actor)) is None
+                        self.assertEqual(sql_ok, python_ok)
+
+    def test_exit_code_vocabulary_is_one_set(self):
+        for code in range(16):
+            with self.subTest(code=code):
+                event = {"schema": "event-log", "schema_version": 1, "id": "event-0001", "task_id": "alpha",
+                         "timestamp": NOW, "actor": "wrapper", "event": "command_failed", "message": "failed",
+                         "exit_code": code}
+                python_ok = code_of(records.validate_event, event) is None
+                sql_ok = code_of(self.insert, "events", self.event_row(event="command_failed", exit_code=code)) is None
+                self.assertEqual(sql_ok, python_ok)
+                self.assertEqual(python_ok, code in errors.STABLE_EXIT_CODES)
+        self.assertIn(12, errors.STABLE_EXIT_CODES)
+        self.assertIn(13, errors.STABLE_EXIT_CODES)
+
+    def test_timestamps_agree_with_the_python_validators(self):
+        stamps = ("0000-01-01T00:00:00Z", "0001-01-01T00:00:00Z", "2026-11-27T24:00:00Z", "2026-11-27T24:59:59Z",
+                  "2026-11-27T23:59:59Z", "2026-11-27T00:00:00Z", "2024-02-29T12:00:00Z", "2026-02-29T12:00:00Z",
+                  "9999-12-31T23:59:59Z", "2026-04-31T00:00:00Z", "2026-11-27T12:60:00Z", "2026-11-27T12:00:60Z",
+                  "2026-00-10T00:00:00Z", "2026-11-00T00:00:00Z")
+        for number, stamp in enumerate(stamps):
+            with self.subTest(stamp=stamp):
+                try:
+                    queue_records._parse(stamp)
+                    python_ok = True
+                except ValueError:
+                    python_ok = False
+                row = {"id": f"alpha-{number}", "state": "open", "owner": "human", "created_at": stamp,
+                       "updated_at": "9999-12-31T23:59:59Z"}
+                self.assertEqual(code_of(self.insert, "tasks", row) is None, python_ok)
+
+    def shards(self, *pairs):
+        return json.dumps([{"task_id": task, "sha256": digest} for task, digest in pairs], separators=(",", ":"))
+
+    def test_graph_shards_must_be_a_sorted_list_of_task_and_digest(self):
+        digest = "1" * 64
+        good = self.shards(("alpha", digest), ("beta", digest))
+        bad = {
+            "not json": "x", "object": '{"task_id":"alpha"}', "empty": "[]",
+            "missing digest": '[{"task_id":"alpha"}]',
+            "extra key": '[{"task_id":"alpha","sha256":"' + digest + '","more":1}]',
+            "digest not hex": self.shards(("alpha", "z" * 64)), "digest short": self.shards(("alpha", "1" * 63)),
+            "unsorted": self.shards(("beta", digest), ("alpha", digest)),
+            "duplicate": self.shards(("alpha", digest), ("alpha", digest)),
+            "first is not the entry's task": self.shards(("beta", digest)),
+            "task id not a slug": self.shards(("Alpha", digest)),
+            "non-object element": '["alpha"]',
+        }
+        for label, text in bad.items():
+            with self.subTest(label):
+                self.assertEqual(self.put_code("graph_changed", None, shards=text), errors.REJECTED)
+        self.put("graph_changed", None, shards=good)
+        many = self.shards(*[(f"t{i:03d}", digest) for i in range(33)])
+        self.assertEqual(self.put_code("graph_changed", None, task="t000", shards=many), errors.REJECTED)
+
+
+class VerifyTests(RowFixture):
+    """`store.verify` names every cross-statement divergence the triggers cannot see."""
+
+    def lease_row_for(self, cols):
+        return LeaseConsistencyTests.lease_row_for(self, cols)
+
+    def test_a_consistent_store_has_no_findings(self):
+        self.assertEqual(store.verify(self.conn, deep=True), [])
+        self.reach("dispatched")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.assertEqual(store.verify(self.conn), [])  # dispatched work is an open task
+
+    def test_claim_without_a_lease_row(self):
+        self.reach("dispatched")
+        self.assertIn("claim_without_lease", store.verify(self.conn))
+
+    def test_lease_row_without_a_live_claim(self):
+        self.reach("dispatched")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.put("released", "ready", lease_id=self.LEASE, generation=1)
+        self.assertIn("lease_without_live_claim", store.verify(self.conn))
+
+    def test_lease_row_that_differs_from_the_claim(self):
+        self.reach("dispatched")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.conn.close()
+        raw = sqlite3.connect(self.db, isolation_level=None)  # a writer that bypassed the triggers
+        self.addCleanup(raw.close)
+        raw.execute("DROP TRIGGER leases_fixed_fields")
+        raw.execute("UPDATE leases SET worker = 'someone-else'")
+        self.assertEqual(store.verify(raw), ["lease_differs_from_claim"])
+
+    def test_row_first_renewal_without_its_entry(self):
+        self.reach("running")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        later = self.stamp(1500)
+        with store.write_transaction(self.conn):
+            self.conn.execute("UPDATE leases SET expires_at = ?, renewals = 1", (later,))
+        self.assertIn("lease_expiry_differs_from_log", store.verify(self.conn))
+
+    def test_entry_first_renewal_without_its_row_update(self):
+        self.reach("running")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.put("renewed", "running", **self.renew_cols(1800))
+        self.assertIn("lease_expiry_differs_from_log", store.verify(self.conn))
+
+    def test_slot_without_a_live_apply_lease(self):
+        self.put("enqueued", "waiting", actor="human")
+        self.put("ready", "ready")
+        self.put("claimed", "dispatched", **{**self.lease_cols(), "step": "apply"})
+        self.put("started", "running", **{**self.started_cols(), "step": "apply"})
+        self.insert("leases", self.lease_row_for({**self.lease_cols(), "step": "apply"}))
+        self.insert("apply_slots", {"target": "docs/a.md", "task_id": "alpha", "lease_id": self.LEASE,
+                                    "generation": 1, "acquired_at": self.stamp()})
+        self.assertNotIn("slot_without_live_apply_lease", store.verify(self.conn))
+        self.put("submitted", "review", lease_id=self.LEASE, generation=1)
+        self.assertIn("slot_without_live_apply_lease", store.verify(self.conn))
+
+    def test_task_state_that_differs_from_the_queue(self):
+        self.reach("running")  # the task row still says open
+        self.assertIn("task_state_differs_from_queue", store.verify(self.conn))
+
+    def test_chain_and_sequence_breaks_are_found_when_the_guards_are_gone(self):
+        self.put("enqueued", "waiting", actor="human")
+        self.put("ready", "ready")
+        self.conn.close()
+        raw = sqlite3.connect(self.db, isolation_level=None)
+        self.addCleanup(raw.close)
+        for name in ("queue_entries_no_update", "queue_entries_chain", "queue_entries_seq", "queue_entries_id"):
+            raw.execute("DROP TRIGGER " + name)
+        raw.execute("UPDATE queue_entries SET prev_hash = ? WHERE seq = 2", ("9" * 64,))
+        self.assertEqual(store.verify(raw), ["queue_chain_broken"])
+
+    def test_deep_check_runs_integrity_check(self):
+        self.assertEqual(store.verify(self.conn, deep=True), [])
+
+
+class WriteOrderTests(RowFixture):
+    """Review round 3: the statement-level rules that remain for lease rows, slots and renewals."""
+
+    def lease_row_for(self, cols):
+        return LeaseConsistencyTests.lease_row_for(self, cols)
+
+    def update_lease(self, expires, renewals):
+        return LeaseConsistencyTests.update_lease(self, expires, renewals)
+
+    def test_a_new_lease_row_starts_with_zero_renewals(self):
+        self.reach("dispatched")
+        row = self.lease_row_for(self.lease_cols())
+        self.assertEqual(code_of(self.insert, "leases", {**row, "renewals": 1000}), errors.LEASE_REFUSED)
+        self.insert("leases", row)
+
+    def test_a_delayed_lease_row_for_an_ended_claim_is_refused(self):
+        self.reach("dispatched")
+        row = self.lease_row_for(self.lease_cols())
+        self.put("released", "ready", lease_id=self.LEASE, generation=1)
+        self.assertEqual(code_of(self.insert, "leases", row), errors.LEASE_REFUSED)
+
+    def test_a_slot_cannot_be_taken_on_an_ended_claim(self):
+        self.put("enqueued", "waiting", actor="human")
+        self.put("ready", "ready")
+        self.put("claimed", "dispatched", **{**self.lease_cols(), "step": "apply"})
+        self.insert("leases", self.lease_row_for({**self.lease_cols(), "step": "apply"}))
+        self.put("released", "ready", lease_id=self.LEASE, generation=1)  # the row was not deleted yet
+        slot = {"target": "docs/a.md", "task_id": "alpha", "lease_id": self.LEASE, "generation": 1,
+                "acquired_at": self.stamp()}
+        self.assertEqual(code_of(self.insert, "apply_slots", slot), errors.LEASE_REFUSED)
+
+    def test_done_and_reopen_need_the_lease_row_gone(self):
+        self.reach("dispatched")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        self.put("started", "running", **self.started_cols())
+        self.put("submitted", "review", lease_id=self.LEASE, generation=1)
+        self.assertEqual(self.put_code("done", "done"), errors.ILLEGAL_TRANSITION)  # stale row still there
+        with store.write_transaction(self.conn):
+            self.conn.execute("DELETE FROM leases")
+        self.put("done", "done")
+
+    def test_only_one_row_first_renewal_may_be_outstanding_and_entries_must_match_it(self):
+        self.reach("running")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        base = self.clock
+
+        def at(seconds):
+            return (base + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self.assertIsNone(self.update_lease(at(1800), 1))  # row first
+        self.assertEqual(self.update_lease(at(2700), 2), errors.LEASE_REFUSED)  # a second one before the entry
+        wrong = {**self.renew_cols(0), "expires_at": at(1900)}
+        self.assertEqual(self.put_code("renewed", "running", **wrong), errors.LEASE_REFUSED)  # not the row's expiry
+        self.put("renewed", "running", **{**self.renew_cols(0), "expires_at": at(1800)})
+        self.assertEqual(store.verify(self.conn).count("lease_expiry_differs_from_log"), 0)
+
+    def test_entry_first_renewal_pins_the_exact_row_update(self):
+        self.reach("running")
+        self.insert("leases", self.lease_row_for(self.lease_cols()))
+        base = self.clock
+
+        def at(seconds):
+            return (base + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        self.put("renewed", "running", **{**self.renew_cols(0), "expires_at": at(1800)})
+        self.assertEqual(self.update_lease(at(1900), 1), errors.LEASE_REFUSED)  # not the logged expiry
+        self.assertEqual(self.update_lease(at(1800), 2), errors.LEASE_REFUSED)  # not the logged count
+        self.assertIsNone(self.update_lease(at(1800), 1))
+
+
+class WriteTransactionEdgeTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.init_store()
+
+    def test_unreadable_connection_state_after_a_commit_error_is_ambiguous_and_leaves_no_cause(self):
+        real = store.connect(self.proj, busy_timeout_ms=200)
+
+        class Closing(FaultyConnection):
+            @property
+            def in_transaction(self):
+                if self.closed:
+                    raise sqlite3.ProgrammingError("Cannot operate on a closed database.")
+                return self.real.in_transaction
+
+            def execute(self, sql, *args):
+                if sql == "COMMIT":
+                    self.closed = True
+                    self.real.close()
+                    raise io_error()
+                return self.real.execute(sql, *args)
+
+        proxy = Closing(real)
+        with self.assertRaises(store.AmbiguousCommit) as caught, store.write_transaction(proxy):
+            pass
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_an_interrupt_during_rollback_abandons_the_connection(self):
+        real = store.connect(self.proj, busy_timeout_ms=200)
+
+        class Interrupting(FaultyConnection):
+            def execute(self, sql, *args):
+                if sql == "ROLLBACK":
+                    raise KeyboardInterrupt
+                return self.real.execute(sql, *args)
+
+        proxy = Interrupting(real)
+        with self.assertRaises(ShitError) as caught, store.write_transaction(proxy):
+            raise busy_error()
+        self.assertEqual(caught.exception.code, errors.FAILED_CLOSED)
+        self.assertTrue(proxy.closed)
+
+
+class InitTests(Base):
+    def test_an_existing_empty_file_is_refused_unless_adoption_is_explicit(self):
+        os.close(os.open(self.db, os.O_CREAT | os.O_WRONLY, stat.S_IRUSR | stat.S_IWUSR))
+        self.assertEqual(code_of(store.init_store, self.proj), errors.FAILED_CLOSED)
+        self.assertEqual(self.db.stat().st_size, 0)  # nothing was written into it
+        store.init_store(self.proj, adopt_empty=True)
+        store.connect(self.proj).close()
+
+    def test_adoption_never_touches_a_file_that_already_has_content(self):
+        self.db.write_bytes(b"not a database" * 100)
+        os.chmod(self.db, stat.S_IRUSR | stat.S_IWUSR)
+        self.assertEqual(code_of(store.init_store, self.proj, adopt_empty=True), errors.FAILED_CLOSED)
+        self.assertEqual(self.db.read_bytes(), b"not a database" * 100)
+
+    def test_a_failure_in_the_middle_of_the_schema_leaves_an_empty_database(self):
+        broken = [*store.schema_statements()[:12], "CREATE TABLE (broken"]
+        with mock.patch.object(store, "schema_statements", lambda: broken):
+            self.assertIsNotNone(code_of(store.init_store, self.proj))
+        raw = sqlite3.connect(self.db, isolation_level=None)
+        self.addCleanup(raw.close)
+        self.assertEqual(raw.execute("SELECT count(*) FROM sqlite_master").fetchone()[0], 0)
+        self.assertEqual(raw.execute("PRAGMA user_version").fetchone()[0], 0)
+        raw.close()
+        store.init_store(self.proj, adopt_empty=True)  # recoverable
+
+    def test_a_replaced_store_directory_is_refused(self):
+        store.init_store(self.proj)
+        shit_dir = self.db.parent
+        os.rename(shit_dir, self.base / "moved-away")
+        os.mkdir(shit_dir, stat.S_IRWXU)
+        self.assertEqual(code_of(store.connect, self.proj), errors.CONFINEMENT)
+        self.assertEqual(code_of(store.init_store, self.proj), errors.CONFINEMENT)
+
+
+class ReplayAgreementTests(RowFixture):
+    """The database and `queue_records.replay` must agree on accepted and on rejected candidates (real ids, graph rows)."""
+
+    KINDS = ReplayDifferentialTests.KINDS
+
+    def dicts(self):
+        cursor = self.conn.execute("SELECT * FROM queue_entries ORDER BY seq")
+        names = [d[0] for d in cursor.description]
+        out = []
+        for row in cursor.fetchall():
+            entry = {"schema": "queue-entry", "schema_version": 1}
+            for name, value in zip(names, row, strict=True):
+                if value is not None and name not in ("seq", "prev_hash", "hash"):
+                    entry[name] = json.loads(value) if name == "shards" else value
+            out.append(queue_records.validate_entry(entry))
+        return out
+
+    def shards_text(self, rng):
+        ids = sorted(rng.sample(["alpha", "beta", "gamma", "delta"], rng.choice((1, 2))))
+        if rng.random() < 0.2:
+            ids = ids[::-1]
+        return json.dumps([{"task_id": i, "sha256": "1" * 64} for i in ids])
+
+    def test_candidates_are_judged_the_same_by_the_database_and_by_replay(self):
+        rng = random.Random(61)
+        helper = ReplayDifferentialTests
+        last, disagreements, accepted, rejected = {}, [], 0, 0
+        for _ in range(300):
+            kind, state, actor, cols = helper.candidate(self, rng, "alpha", last)
+            if rng.random() < 0.08:
+                kind, state, actor, cols = "graph_changed", None, "wrapper", {"shards": self.shards_text(rng)}
+            position = self.conn.execute("SELECT count(*) FROM queue_entries").fetchone()[0] + 1
+            candidate = {"schema": "queue-entry", "schema_version": 1, "id": f"queue-{position:04d}",
+                         "task_id": "alpha", "timestamp": self.stamp(1), "actor": actor, "kind": kind, **cols}
+            if state is not None:
+                candidate["state_after"] = state
+            if "shards" in candidate:
+                candidate["shards"] = json.loads(candidate["shards"])
+            try:
+                queue_records.replay([*self.dicts(), queue_records.validate_entry(dict(candidate))])
+                replay_ok = True
+            except ShitError:
+                replay_ok = False
+            try:
+                self.put(kind, state, actor=actor, **cols)
+                db_ok = True
+            except ShitError:
+                db_ok = False
+            if db_ok != replay_ok:
+                disagreements.append(("database" if db_ok else "replay", "accepted the other rejected", kind, state))
+            if db_ok:
+                accepted += 1
+                if kind == "claimed":
+                    last = {**last, "lease": cols["lease_id"], "generation": cols["generation"],
+                            "worker": cols["worker"], "step": cols["step"]}
+                if kind == "started":
+                    last["attempts"] = cols["attempt"]
+            else:
+                rejected += 1
+                self.clock += timedelta(seconds=rng.choice((0, 30, 300)))
+        self.assertGreater(accepted, 10)
+        self.assertGreater(rejected, 100)
+        self.assertEqual(disagreements, [])
 
 
 class LeaseSlotTests(RowFixture):
@@ -1049,7 +1511,7 @@ class GuardBuilderTests(unittest.TestCase):
                           "NEW.a = \\1"):
             with self.subTest(condition=condition), self.assertRaises(ValueError):
                 store._guard("ok_name", "BEFORE INSERT", "tasks", condition, "E7")
-        for args in (("bad name", "BEFORE INSERT", "tasks", None, "E7"), ("ok", "AFTER INSERT", "tasks", None, "E7"),
+        for args in (("bad name", "BEFORE INSERT", "tasks", None, "E7"), ("ok", "INSTEAD OF INSERT", "tasks", None, "E7"),
                      ("ok", "BEFORE INSERT", "ta;sks", None, "E7"), ("ok", "BEFORE INSERT", "tasks", None, "E99")):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 store._guard(*args)
@@ -1095,8 +1557,12 @@ class FingerprintTests(Base):
         self.tamper("CREATE TABLE extra (a TEXT)")
         self.assertEqual(code_of(store.connect, self.proj), errors.FAILED_CLOSED)
 
-    def test_added_view_and_index_are_refused(self):
+    def test_added_view_is_refused(self):
         self.tamper("CREATE VIEW extra_view AS SELECT 1")
+        self.assertEqual(code_of(store.connect, self.proj), errors.FAILED_CLOSED)
+
+    def test_added_index_is_refused(self):
+        self.tamper("CREATE INDEX extra_index ON tasks (state)")
         self.assertEqual(code_of(store.connect, self.proj), errors.FAILED_CLOSED)
 
     def test_altered_table_is_refused(self):
@@ -1264,11 +1730,10 @@ class TransactionTests(Base):
         second = store.connect(self.proj, busy_timeout_ms=0)
         self.addCleanup(second.close)
         with store.write_transaction(self.conn):
-            try:
+            with self.assertRaises(ShitError) as caught:
                 store.write_transaction(second).__enter__()
-            except ShitError as exc:
-                self.assertEqual(str(exc), errors.MESSAGES[errors.BUSY])
-                self.assertNotIn(str(self.base), str(exc))
+            self.assertEqual(str(caught.exception), errors.MESSAGES[errors.BUSY])
+            self.assertNotIn(str(self.base), str(caught.exception))
 
 
 def busy_error():

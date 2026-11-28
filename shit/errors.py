@@ -34,6 +34,10 @@ LEASE_REFUSED = 12
 BUSY = 13
 
 
+# Every stable exit code of docs/exit-codes.md except 0 (ok). The event log, the store and the tests read this one set.
+STABLE_EXIT_CODES = tuple(range(1, 14))
+
+
 class ShitError(Exception):
     """An error that maps to one stable exit code. It never carries raw paths, content or OS text."""
 

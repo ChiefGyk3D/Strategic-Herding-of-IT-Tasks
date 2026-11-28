@@ -28,6 +28,7 @@ from .errors import (
     LEASE_REFUSED,
     PRECONDITION,
     REJECTED,
+    STABLE_EXIT_CODES,
     USAGE,
     ShitError,
 )
@@ -77,6 +78,9 @@ TOKEN_EXIT = {
     "E17": REJECTED,  # started entry whose attempt is not the previous one plus one
     "E18": LEASE_REFUSED,  # renewal outside its window, or worker, step or lease row that disagree
     "E19": ILLEGAL_TRANSITION,  # apply marker for a non-apply claim, repeated, or out of order
+    "E20": FAILED_CLOSED,  # events or queue entries: sequence number is not the previous one plus one
+    "E21": REJECTED,  # queue entry whose id is not `queue-` and its sequence number
+    "E22": REJECTED,  # graph_changed entry whose shards are not a sorted list of task id and digest objects
 }
 _TOKEN = re.compile(r"E[0-9]{1,3}")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,39}")
@@ -139,8 +143,8 @@ _LAST_CLAIM = ("(SELECT q.seq FROM queue_entries q WHERE q.task_id = NEW.task_id
                "ORDER BY q.seq DESC LIMIT 1)")
 # Trigger conditions are written in this code only; this is the whole alphabet they may use (no quote
 # escapes, semicolons, comments or double quotes).
-_CONDITION = re.compile(r"[A-Za-z0-9_ ,()'<>=.*|+%-]*")
-_EVENTS = ("BEFORE INSERT", "BEFORE UPDATE", "BEFORE DELETE")
+_CONDITION = re.compile(r"[A-Za-z0-9_ ,()'<>=.*|+%$^{}\[\]-]*")
+_EVENTS = ("BEFORE INSERT", "BEFORE UPDATE", "BEFORE DELETE", "AFTER INSERT")
 
 
 def _literal_list(values):
@@ -157,29 +161,36 @@ def _name(column):
     return column
 
 
+def _no_nul(column):
+    """No embedded NUL byte: length(), GLOB and friends stop at one, so every text check needs this first."""
+    return "instr(CAST(" + _name(column) + " AS BLOB), X'00') = 0"
+
+
 def _slug_check(column):
-    _name(column)
-    return (column + " GLOB '[a-z0-9]*' AND " + column + " NOT GLOB '*[^a-z0-9-]*' AND length(" + column
-            + ") <= 64")
+    return (_no_nul(column) + " AND " + column + " GLOB '[a-z0-9]*' AND " + column + " NOT GLOB '*[^a-z0-9-]*' AND length("
+            + column + ") <= 64")
 
 
 def _hex_check(column, length):
     if type(length) is not int:
         raise ValueError("bad argument")
-    return ("length(" + _name(column) + ") = " + str(length) + " AND " + column + " NOT GLOB '*[^0-9a-f]*'")
+    return (_no_nul(column) + " AND length(" + column + ") = " + str(length) + " AND " + column
+            + " NOT GLOB '*[^0-9a-f]*'")
 
 
 def _stamp_check(column):
     """Fixed-width UTC stamp that is also a real calendar time (9999-99-99 is refused)."""
     _name(column)
     # coalesce: strftime answers NULL for an impossible date, and a CHECK that evaluates to NULL passes.
-    return (column + " GLOB '" + _STAMP_GLOB + "' AND coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', " + column + ") = "
-            + column + ", 0)")
+    # Year 0000 and hour 24 are refused to match the Python validators (SQLite accepts both).
+    return (_no_nul(column) + " AND " + column + " GLOB '" + _STAMP_GLOB + "' AND coalesce(strftime('%Y-%m-%dT%H:%M:%SZ', "
+            + column + ") = " + column + ", 0) AND substr(" + column + ", 1, 4) >= '0001' AND substr(" + column
+            + ", 12, 2) <= '23'")
 
 
 def _text_check(column, maximum):
     _name(column)
-    return "length(" + column + ") BETWEEN 1 AND " + str(int(maximum))
+    return _no_nul(column) + " AND length(" + column + ") BETWEEN 1 AND " + str(int(maximum))
 
 
 def _seconds(column):
@@ -289,7 +300,7 @@ def _lease_consistency_guards():
                "NEW.kind = 'apply_finished' AND (NOT " + _since_claim("apply_started") + " OR "
                + _since_claim("apply_finished") + ")", "E19"),
         _guard("queue_entries_no_lease_to_reopen", "BEFORE INSERT", entries,
-               "NEW.kind IN ('reopened', 'done') AND " + _PREV_STATE + " IN ('dispatched', 'running')", "E8"),
+               "NEW.kind IN ('reopened', 'done') AND (" + _PREV_STATE + " IN ('dispatched', 'running') OR " + row + ")", "E8"),
         _guard("queue_entries_claim_needs_no_lease_row", "BEFORE INSERT", entries,
                "NEW.kind = 'claimed' AND " + row, "E10"),
         _guard("queue_entries_claim_after_not_before", "BEFORE INSERT", entries,
@@ -298,9 +309,38 @@ def _lease_consistency_guards():
                "E10"),
         _guard("queue_entries_renewal_matches_lease_row", "BEFORE INSERT", entries,
                "NEW.kind = 'renewed' AND " + row + " AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.task_id = "
-               "NEW.task_id AND l.expires_at IN (NEW.expires_at, " + _LAST_EXPIRY + ") AND l.renewals IN ("
-               + _RENEWED_SO_FAR + ", " + _RENEWED_SO_FAR + " + 1))", "E18"),
+               "NEW.task_id AND ((l.expires_at = NEW.expires_at AND l.renewals = " + _RENEWED_SO_FAR + " + 1) OR "
+               "(l.expires_at = " + _LAST_EXPIRY + " AND l.renewals = " + _RENEWED_SO_FAR + ")))", "E18"),
     ]
+
+
+def _seq_guard(table):
+    """A new row's sequence number is the previous maximum plus one (the first is 1), however it was supplied."""
+    condition = ("NEW.seq IS NOT coalesce((SELECT max(s.seq) FROM " + _name(table) + " s WHERE s.seq <> NEW.seq), 0) + 1")
+    return _guard(table + "_seq", "AFTER INSERT", table, condition, "E20")
+
+
+_SHARD_FIELDS_BAD = (
+    "(SELECT count(*) FROM json_each(j.value)) <> 2 "
+    "OR json_type(j.value, '$.task_id') IS NOT 'text' OR json_type(j.value, '$.sha256') IS NOT 'text' "
+    "OR length(json_extract(j.value, '$.sha256')) <> 64 OR json_extract(j.value, '$.sha256') GLOB '*[^0-9a-f]*' "
+    "OR json_extract(j.value, '$.task_id') NOT GLOB '[a-z0-9]*' OR json_extract(j.value, '$.task_id') GLOB '*[^a-z0-9-]*' "
+    "OR length(json_extract(j.value, '$.task_id')) > 64")
+# Element checks only run on objects (json_extract on a bare string raises), so every use is inside a CASE.
+_SHARD_BAD = "j.type IS NOT 'object' OR CASE WHEN j.type = 'object' THEN (" + _SHARD_FIELDS_BAD + ") ELSE 1 END"
+_SHARD_ORDER_BAD = ("EXISTS (SELECT 1 FROM json_each(NEW.shards) a JOIN json_each(NEW.shards) b ON b.key = a.key + 1 "
+                    "WHERE json_extract(b.value, '$.task_id') <= json_extract(a.value, '$.task_id')) "
+                    "OR json_extract(NEW.shards, '$[0].task_id') IS NOT NEW.task_id")
+
+
+def _shards_guard():
+    """graph_changed shards: a sorted array of at most 32 {task_id, sha256} objects whose first task is the entry's."""
+    condition = ("NEW.kind = 'graph_changed' AND (NOT json_valid(NEW.shards) OR json_type(NEW.shards) IS NOT 'array' "
+                 "OR json_array_length(NEW.shards) NOT BETWEEN 1 AND " + str(queue_records.MAX_SHARDS_PER_ENTRY)
+                 + " OR EXISTS (SELECT 1 FROM json_each(NEW.shards) j WHERE " + _SHARD_BAD + ") OR "
+                 "CASE WHEN EXISTS (SELECT 1 FROM json_each(NEW.shards) j WHERE j.type IS NOT 'object') THEN 1 "
+                 "ELSE (" + _SHARD_ORDER_BAD + ") END)")
+    return _guard("queue_entries_shards", "BEFORE INSERT", "queue_entries", condition, "E22")
 
 
 def _queue_guards():
@@ -341,6 +381,12 @@ def _queue_guards():
     return guards + _lease_consistency_guards()
 
 
+def _prev_state_of(task):
+    """The latest queue state of `task` (an expression such as NEW.task_id)."""
+    return ("(SELECT q.state_after FROM queue_entries q WHERE q.task_id = " + task
+            + " AND q.state_after IS NOT NULL ORDER BY q.seq DESC LIMIT 1)")
+
+
 def _lease_guards():
     claim = ("(SELECT q.seq FROM queue_entries q WHERE q.task_id = NEW.task_id AND q.kind = 'claimed' "
              "ORDER BY q.seq DESC LIMIT 1)")
@@ -349,7 +395,8 @@ def _lease_guards():
                "NOT EXISTS (SELECT 1 FROM queue_entries q WHERE q.seq = " + claim
                + " AND q.lease_id = NEW.lease_id AND q.generation = NEW.generation AND q.step = NEW.step "
                "AND q.worker = NEW.worker AND q.worker_kind = NEW.worker_kind AND q.expires_at = NEW.expires_at "
-               "AND q.timestamp = NEW.claimed_at)", "E13"),
+               "AND q.timestamp = NEW.claimed_at) OR NEW.renewals <> 0 OR coalesce(" + _prev_state_of("NEW.task_id")
+               + " NOT IN ('dispatched', 'running'), 1)", "E13"),
         _guard("leases_fixed_fields", "BEFORE UPDATE", "leases",
                "NEW.task_id IS NOT OLD.task_id OR NEW.lease_id IS NOT OLD.lease_id OR NEW.generation IS NOT "
                "OLD.generation OR NEW.step IS NOT OLD.step OR NEW.worker IS NOT OLD.worker OR NEW.worker_kind IS NOT "
@@ -357,12 +404,15 @@ def _lease_guards():
                "NEW.renewals <> OLD.renewals + 1 OR " + _sec("NEW.expires_at") + " - " + _sec("OLD.expires_at")
                + " > " + str(queue_records.MAX_TTL) + " OR NEW.expires_at < coalesce((SELECT x.expires_at FROM "
                "queue_entries x WHERE x.task_id = NEW.task_id AND x.kind IN ('claimed', 'renewed') "
-               "ORDER BY x.seq DESC LIMIT 1), '')", "E14"),
+               "ORDER BY x.seq DESC LIMIT 1), '') OR NOT ((NEW.expires_at = " + _LAST_EXPIRY + " AND NEW.renewals = "
+               + _RENEWED_SO_FAR + ") OR (OLD.expires_at = " + _LAST_EXPIRY + " AND OLD.renewals = " + _RENEWED_SO_FAR
+               + " AND NEW.renewals = " + _RENEWED_SO_FAR + " + 1))", "E14"),
         _guard("leases_slots_first", "BEFORE DELETE", "leases",
                "EXISTS (SELECT 1 FROM apply_slots s WHERE s.task_id = OLD.task_id)", "E15"),
         _guard("apply_slots_match_lease", "BEFORE INSERT", "apply_slots",
                "NOT EXISTS (SELECT 1 FROM leases l WHERE l.task_id = NEW.task_id AND l.lease_id = NEW.lease_id "
-               "AND l.generation = NEW.generation AND l.step = 'apply')", "E16"),
+               "AND l.generation = NEW.generation AND l.step = 'apply') OR coalesce(" + _prev_state_of("NEW.task_id")
+               + " NOT IN ('dispatched', 'running'), 1)", "E16"),
         _guard("apply_slots_no_update", "BEFORE UPDATE", "apply_slots", None, "E16"),
     ]
 
@@ -385,15 +435,15 @@ def schema_statements():
     ttl = str(queue_records.MAX_TTL)
     return list(_flatten([
         "CREATE TABLE meta (key TEXT NOT NULL PRIMARY KEY CHECK (" + _slug_check("key") + "), "
-        "value TEXT NOT NULL) STRICT, WITHOUT ROWID",
+        "value TEXT NOT NULL CHECK (" + _no_nul("value") + ")) STRICT, WITHOUT ROWID",
 
         "CREATE TABLE tasks (id TEXT NOT NULL PRIMARY KEY CHECK (" + _slug_check("id") + "), "
         "state TEXT NOT NULL CHECK (state IN (" + states + ")), "
         "owner TEXT NOT NULL CHECK (owner IN (" + actors + ")), "
         "created_at TEXT NOT NULL CHECK (" + _stamp_check("created_at") + "), "
         "updated_at TEXT NOT NULL CHECK (" + _stamp_check("updated_at") + " AND updated_at >= created_at), "
-        "blocked_reason TEXT CHECK (blocked_reason IS NULL OR length(blocked_reason) BETWEEN 1 AND 500), "
-        "blocking_item TEXT CHECK (blocking_item IS NULL OR length(blocking_item) BETWEEN 1 AND 500), "
+        "blocked_reason TEXT CHECK (blocked_reason IS NULL OR (" + _text_check("blocked_reason", 500) + ")), "
+        "blocking_item TEXT CHECK (blocking_item IS NULL OR (" + _text_check("blocking_item", 500) + ")), "
         "CHECK ((state = 'blocked') = (blocked_reason IS NOT NULL AND blocking_item IS NOT NULL)), "
         "CHECK (state = 'blocked' OR (blocked_reason IS NULL AND blocking_item IS NULL))) STRICT",
 
@@ -416,12 +466,13 @@ def schema_statements():
         "record_id TEXT CHECK (record_id IS NULL OR (" + _slug_check("record_id") + ")), "
         "from_state TEXT CHECK (from_state IS NULL OR from_state IN (" + states + ")), "
         "to_state TEXT CHECK (to_state IS NULL OR to_state IN (" + states + ")), "
-        "exit_code INTEGER CHECK (exit_code IS NULL OR exit_code BETWEEN 1 AND 255), "
+        "exit_code INTEGER CHECK (exit_code IS NULL OR exit_code BETWEEN 1 AND " + str(max(STABLE_EXIT_CODES)) + "), "
         "prev_hash TEXT NOT NULL CHECK (" + _hex_check("prev_hash", 64) + "), "
         "hash TEXT NOT NULL UNIQUE CHECK (" + _hex_check("hash", 64) + "), "
         "CHECK ((event = 'state_transition') = (from_state IS NOT NULL AND to_state IS NOT NULL)), "
         "CHECK (event = 'state_transition' OR (from_state IS NULL AND to_state IS NULL)), "
-        "CHECK ((event = 'command_failed') = (exit_code IS NOT NULL))) STRICT",
+        "CHECK ((event = 'command_failed') = (exit_code IS NOT NULL)), "
+        "CHECK (event <> 'state_transition' OR (" + legal + "))) STRICT",
 
         "CREATE TABLE records (kind TEXT NOT NULL CHECK (kind IN (" + record_kinds + ")), "
         "record_id TEXT NOT NULL CHECK (" + _slug_check("record_id") + "), "
@@ -449,7 +500,8 @@ def schema_statements():
         "expires_at TEXT CHECK (expires_at IS NULL OR (" + _stamp_check("expires_at") + ")), "
         "orphan_sha256 TEXT CHECK (orphan_sha256 IS NULL OR (" + _hex_check("orphan_sha256", 64) + ")), "
         "message TEXT CHECK (message IS NULL OR (" + _text_check("message", MAX_TEXT) + ")), "
-        "shards TEXT CHECK (shards IS NULL OR length(shards) BETWEEN 1 AND " + str(MAX_RECORD_BYTES) + "), "
+        "shards TEXT CHECK (shards IS NULL OR (" + _no_nul("shards") + " AND length(shards) BETWEEN 1 AND "
+        + str(MAX_RECORD_BYTES) + ")), "
         "prev_hash TEXT NOT NULL CHECK (" + _hex_check("prev_hash", 64) + "), "
         "hash TEXT NOT NULL UNIQUE CHECK (" + _hex_check("hash", 64) + "), "
         "CHECK (" + _kind_rules() + "), "
@@ -475,7 +527,7 @@ def schema_statements():
         "type TEXT NOT NULL CHECK (type IN (" + dep_types + ")), "
         "PRIMARY KEY (task_id, needs_id), CHECK (task_id <> needs_id)) STRICT, WITHOUT ROWID",
 
-        "CREATE TABLE apply_slots (target TEXT NOT NULL PRIMARY KEY CHECK (length(target) BETWEEN 1 AND 500), "
+        "CREATE TABLE apply_slots (target TEXT NOT NULL PRIMARY KEY CHECK (" + _text_check("target", 500) + "), "
         "task_id TEXT NOT NULL REFERENCES tasks (id), "
         "lease_id TEXT NOT NULL CHECK (" + _hex_check("lease_id", 32) + "), "
         "generation INTEGER NOT NULL CHECK (generation >= 1), "
@@ -487,6 +539,11 @@ def schema_statements():
         _guard("tasks_no_delete", "BEFORE DELETE", "tasks", None, "E7"),
         _chain_guard("events"),
         _chain_guard("queue_entries"),
+        _seq_guard("events"),
+        _seq_guard("queue_entries"),
+        _guard("queue_entries_id", "AFTER INSERT", "queue_entries",
+               "NEW.id <> 'queue-' || printf('%04d', NEW.seq)", "E21"),
+        _shards_guard(),
         _queue_guards(),
         _lease_guards(),
 
@@ -526,7 +583,7 @@ def fingerprint(conn):
 # The reviewed fingerprint of schema version 1, written out so that the value checked at open does not depend on the
 # builders above. A change to the DDL changes the generated value; `tests/test_store.py` fails until this literal is
 # updated on purpose, in the same change and with the schema review.
-PINNED_FINGERPRINT = "f3e50f596b501193939e6962570d3027dace358b5da1979429dcbbf2f40206e0"
+PINNED_FINGERPRINT = "921add402caa4084ef47fccaa6bf2d33a6ae8fb127512e4922b5590a93e32284"
 
 
 @functools.lru_cache(maxsize=1)
@@ -586,6 +643,13 @@ def _check_directory(project):
     if (not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid()
             or stat.S_IMODE(st.st_mode) & ~_PRIVATE_DIR):
         raise ShitError(CONFINEMENT)
+    # The descriptor and the path SQLite opens must still be the same directory.
+    try:
+        named = os.lstat(project._root)
+    except OSError as exc:
+        raise _os_error(exc) from None
+    if (named.st_dev, named.st_ino) != (st.st_dev, st.st_ino):
+        raise ShitError(CONFINEMENT)
 
 
 def _opened_identities(path):
@@ -630,7 +694,7 @@ class _SidecarMoved(Exception):
     """A -wal or -shm file changed identity while the database was being opened (retried once)."""
 
 
-_SIDECARS = ("-wal", "-shm")
+_SIDECARS = ("-wal", "-shm", "-journal")
 
 
 def _verify_sidecars(path, snapshot, final):
@@ -672,6 +736,7 @@ def _open_once(project, timeout, initialize, final):
         _verify_opened(path, before)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA trusted_schema = OFF")
+        conn.execute("PRAGMA recursive_triggers = ON")  # so that INSERT OR REPLACE fires the delete triggers
         if hasattr(conn, "setconfig") and hasattr(sqlite3, "SQLITE_DBCONFIG_DEFENSIVE"):
             conn.setconfig(sqlite3.SQLITE_DBCONFIG_DEFENSIVE, True)
         if initialize:
@@ -683,6 +748,7 @@ def _open_once(project, timeout, initialize, final):
         if fingerprint(conn) != PINNED_FINGERPRINT:
             raise ShitError(FAILED_CLOSED)
         _verify_sidecars(path, snapshot, final)
+        _check_directory(project)
         return conn
     except BaseException as exc:
         if conn is not None:
@@ -707,11 +773,12 @@ def _check_header(conn):
 
 
 def _check_settings(conn, timeout):
-    expected = (("PRAGMA foreign_keys", 1), ("PRAGMA synchronous", 2), ("PRAGMA trusted_schema", 0),
-                ("PRAGMA busy_timeout", timeout))
-    for sql, value in expected:
-        if conn.execute(sql).fetchone()[0] != value:
-            raise ShitError(FAILED_CLOSED)
+    # Unrolled on purpose: every statement is a literal the lint can see.
+    values = (conn.execute("PRAGMA foreign_keys").fetchone()[0], conn.execute("PRAGMA synchronous").fetchone()[0],
+              conn.execute("PRAGMA trusted_schema").fetchone()[0], conn.execute("PRAGMA busy_timeout").fetchone()[0],
+              conn.execute("PRAGMA recursive_triggers").fetchone()[0])
+    if values != (1, 2, 0, timeout, 1):
+        raise ShitError(FAILED_CLOSED)
 
 
 def _install_schema(conn):
@@ -731,8 +798,12 @@ def _install_schema(conn):
         raise
 
 
-def init_store(project, busy_timeout_ms=None):
+def init_store(project, busy_timeout_ms=None, adopt_empty=False):
     """Create the database as a 0600 file (umask 077) and its schema, once. Safe to call again.
+
+    A store that already exists is verified, never rewritten. A file this call did not create is refused unless it
+    is a complete store; `adopt_empty=True` is the explicit recovery for a crash between creating the file and
+    installing the schema (only a brand-new empty database is then initialized, anything else still refuses).
 
     The umask is process-wide while this runs; call it from a single-threaded setup step.
     """
@@ -752,7 +823,7 @@ def init_store(project, busy_timeout_ms=None):
                 os.fchmod(fd, DB_MODE)
             finally:
                 os.close(fd)
-        _open(project, busy_timeout_ms, initialize=True).close()
+        _open(project, busy_timeout_ms, initialize=fd is not None or adopt_empty).close()
     finally:
         os.umask(old)
 
@@ -778,20 +849,40 @@ def _abandon(conn):
         conn.close()
 
 
+def _in_transaction(conn):
+    """True or False, or None when the connection cannot say (closed, broken)."""
+    try:
+        return bool(conn.in_transaction)
+    except (sqlite3.Error, ValueError):
+        return None
+
+
+def _give_up(conn):
+    """Close a connection that cannot be trusted and raise the fail-closed error."""
+    _abandon(conn)
+    raise ShitError(FAILED_CLOSED) from None
+
+
 def _fail_transaction(conn, exc):
     """Roll back after `exc` and raise the mapped error; close the connection if the rollback cannot be trusted."""
     try:
-        if conn.in_transaction:
+        if _in_transaction(conn):
             conn.execute("ROLLBACK")
-        clean = not conn.in_transaction
-    except sqlite3.Error:
-        clean = False
+        clean = _in_transaction(conn) is False
+    except BaseException:  # an interrupt or error during cleanup: the state is unknown, so give up the connection
+        _give_up(conn)  # always raises
+        raise
     if not clean:
-        _abandon(conn)
-        raise ShitError(FAILED_CLOSED) from None
+        _give_up(conn)
     if isinstance(exc, sqlite3.Error):
         raise map_error(exc) from None
     raise exc
+
+
+def _end_ambiguous(conn):
+    """The commit's outcome is unknown: close the connection and raise AmbiguousCommit with no chained cause."""
+    _abandon(conn)
+    raise AmbiguousCommit() from None
 
 
 @contextlib.contextmanager
@@ -801,8 +892,8 @@ def write_transaction(conn):
     - A failed rollback, or a connection still in a transaction after it, closes the connection and raises exit 8.
     - If COMMIT itself raises while the connection is still in its transaction, the commit did not happen: it is
       rolled back and the error mapped (a busy store is exit 13).
-    - If COMMIT raises and the connection is no longer in a transaction, the outcome is unknown (the write may have
-      landed). The connection is closed and `AmbiguousCommit` (exit 8) is raised.
+    - If COMMIT raises and the connection is no longer in a transaction, or cannot say, the outcome is unknown (the
+      write may have landed). The connection is closed and `AmbiguousCommit` (exit 8) is raised.
     """
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -816,7 +907,74 @@ def write_transaction(conn):
     try:
         conn.execute("COMMIT")
     except BaseException as exc:
-        if conn.in_transaction:
+        if _in_transaction(conn) is True:
             _fail_transaction(conn, exc)  # the commit did not happen
-        _abandon(conn)
-        raise AmbiguousCommit() from exc
+        _end_ambiguous(conn)  # always raises
+        raise
+
+
+# -- consistency check --------------------------------------------------------
+
+_LIVE = ("dispatched", "running")
+
+
+def verify(conn, deep=False):
+    """Read-only: the names of the cross-table invariants this database does not hold (empty when consistent).
+
+    The triggers check each statement. Some invariants span several statements of one transaction (a claim entry and
+    its lease row, an apply slot and the lease it hangs on), so a crash, a writer that commits halfway or a hand edit
+    can leave a state no single statement would have produced. The write helpers of the queue run this in their tests
+    after every operation (docs/store.md, "Invariants across statements"). `deep=True` adds `PRAGMA
+    integrity_check`, which reads every page.
+    """
+    found = set()
+    live = conn.execute(
+        "SELECT q.task_id, q.state_after FROM queue_entries q WHERE q.seq = (SELECT max(m.seq) FROM queue_entries m "
+        "WHERE m.task_id = q.task_id AND m.state_after IS NOT NULL)").fetchall()
+    states = dict(live)
+    leases = {row[0]: row for row in conn.execute(
+        "SELECT task_id, lease_id, generation, step, worker, worker_kind, claimed_at, expires_at, renewals "
+        "FROM leases").fetchall()}
+    for task, state in states.items():
+        if state in _LIVE and task not in leases:
+            found.add("claim_without_lease")
+    for task in leases:
+        if states.get(task) not in _LIVE:
+            found.add("lease_without_live_claim")
+    for task, lease in leases.items():
+        claim = conn.execute(
+            "SELECT lease_id, generation, step, worker, worker_kind, timestamp FROM queue_entries WHERE task_id = ? "
+            "AND kind = 'claimed' ORDER BY seq DESC LIMIT 1", (task,)).fetchone()
+        if claim is None or tuple(claim) != (lease[1], lease[2], lease[3], lease[4], lease[5], lease[6]):
+            found.add("lease_differs_from_claim")
+            continue
+        last = conn.execute(
+            "SELECT expires_at, (SELECT count(*) FROM queue_entries r WHERE r.task_id = x.task_id AND r.kind = "
+            "'renewed' AND r.seq > (SELECT max(c.seq) FROM queue_entries c WHERE c.task_id = x.task_id AND c.kind = "
+            "'claimed')) FROM queue_entries x WHERE x.task_id = ? AND x.kind IN ('claimed', 'renewed') "
+            "ORDER BY x.seq DESC LIMIT 1", (task,)).fetchone()
+        if last is None or (last[0], last[1]) != (lease[7], lease[8]):
+            found.add("lease_expiry_differs_from_log")
+    for task, lease_id, generation in conn.execute("SELECT task_id, lease_id, generation FROM apply_slots").fetchall():
+        lease = leases.get(task)
+        if lease is None or (lease[1], lease[2], lease[3]) != (lease_id, generation, "apply") or states.get(task) not in _LIVE:
+            found.add("slot_without_live_apply_lease")
+    for task, state, queue_state in conn.execute(
+            "SELECT t.id, t.state, q.state_after FROM tasks t JOIN queue_entries q ON q.task_id = t.id WHERE q.seq = "
+            "(SELECT max(m.seq) FROM queue_entries m WHERE m.task_id = t.id AND m.state_after IS NOT NULL)").fetchall():
+        if state not in queue_records.LIFECYCLE.get(queue_state, ()):
+            found.add("task_state_differs_from_queue")
+    for name, rows in (
+            ("events_chain_broken", conn.execute("SELECT seq, prev_hash, hash, timestamp FROM events ORDER BY seq")),
+            ("queue_chain_broken", conn.execute("SELECT seq, prev_hash, hash, timestamp FROM queue_entries ORDER BY seq"))):
+        previous_hash, previous_stamp, expected = GENESIS, "", 1
+        for seq, prev_hash, digest, stamp in rows.fetchall():
+            if seq != expected or prev_hash != previous_hash or stamp < previous_stamp:
+                found.add(name)
+                break
+            previous_hash, previous_stamp, expected = digest, stamp, expected + 1
+    if conn.execute("PRAGMA foreign_key_check").fetchall():
+        found.add("foreign_key_violation")
+    if deep and conn.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        found.add("integrity_check_failed")
+    return sorted(found)

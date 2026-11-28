@@ -20,7 +20,24 @@ from _bootstrap import ROOT
 
 SQL_START = re.compile(r"\s*(select|insert|update|delete|create|drop|alter|pragma|begin|commit|rollback|with"
                        r"|replace|vacuum|attach|detach|savepoint|release)\b", re.IGNORECASE)
-READ_ONLY = re.compile(r"\s*(select\b|pragma\s+[a-z_]+\s*(\(\s*[a-z_]*\s*\))?\s*$)", re.IGNORECASE)
+# Read-only statements are SELECT and these exact PRAGMA reads (no value, no argument list).
+READ_PRAGMAS = {"application_id", "user_version", "foreign_keys", "synchronous", "trusted_schema", "busy_timeout",
+                "recursive_triggers", "foreign_key_check", "integrity_check"}
+PRAGMA_READ = re.compile(r"\s*pragma\s+([a-z_]+)\s*$", re.IGNORECASE)
+SELECT_ONLY = re.compile(r"\s*select\b", re.IGNORECASE)
+# Modules that open a path around the checks, names that run text as code, and attributes that reach any attribute.
+FORBIDDEN_IMPORTS = {"builtins", "importlib", "operator", "ctypes", "inspect", "sqlite3", "_sqlite3"}
+FORBIDDEN_NAMES = {"eval", "exec", "compile", "globals", "locals", "vars", "__import__", "__builtins__", "breakpoint"}
+FORBIDDEN_DUNDERS = {"__getattribute__", "__getattr__", "__dict__", "__class__", "__import__", "__builtins__",
+                     "__globals__", "__subclasses__", "__mro__", "__bases__", "__code__", "__self__", "__func__",
+                     "__setattr__", "__delattr__", "__reduce__", "__reduce_ex__", "__call__"}
+
+
+def is_read_only(sql):
+    match = PRAGMA_READ.match(sql)
+    if match:
+        return match.group(1).lower() in READ_PRAGMAS
+    return bool(SELECT_ONLY.match(sql))
 EXECUTORS = {"execute", "executemany", "executescript"}
 # Connection and cursor methods that reach the database. Outside the store none may be called.
 DB_METHODS = EXECUTORS | {"cursor", "backup", "iterdump", "create_function", "create_aggregate", "create_collation",
@@ -33,7 +50,7 @@ STORE = "shit/store.py"
 ALLOWED_METHODS = {
     "_open_once": {"execute", "setconfig"}, "_install_schema": {"execute"}, "_check_header": {"execute"},
     "_check_settings": {"execute"}, "fingerprint": {"execute"}, "expected_fingerprint": {"execute"},
-    "write_transaction": {"execute"}, "_fail_transaction": {"execute"},
+    "write_transaction": {"execute"}, "_fail_transaction": {"execute"}, "verify": {"execute"},
 }
 ALLOWED_REFLECTION = {("_open_once", "setconfig")}
 CONNECTORS = {"_open_once", "expected_fingerprint"}
@@ -43,7 +60,8 @@ BUILDERS = {(STORE, name) for name in (
     "_slug_check", "_hex_check", "_text_check", "_seconds", "_pair_rows", "_kind_rules")}
 # Functions of the store that run their own BEGIN IMMEDIATE / pragmas / scratch in-memory database.
 TXN_OWNERS = {"_open_once", "_install_schema", "write_transaction", "_fail_transaction", "expected_fingerprint"}
-NAMED_SQL_VARIABLES = {("_install_schema", "sql"), ("expected_fingerprint", "sql"), ("_check_settings", "sql")}
+# A variable may be passed to execute only as the loop variable over `schema_statements()` in these two functions.
+SCHEMA_CONSUMERS = {"_install_schema", "expected_fingerprint"}
 
 
 def _leaves(node):
@@ -142,6 +160,19 @@ def _is_call_func(node):
     return isinstance(parent, ast.Call) and parent.func is node
 
 
+def _is_schema_loop_variable(arg, function):
+    """`arg` is a Name that is the target of an enclosing `for ... in schema_statements()` in a schema consumer."""
+    if not isinstance(arg, ast.Name) or function not in SCHEMA_CONSUMERS:
+        return False
+    node = arg
+    while node is not None:
+        node = getattr(node, "parent", None)
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name) and node.target.id == arg.id:
+            call = node.iter
+            return isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "schema_statements"
+    return False
+
+
 def _reflection_findings(node, function, inside):
     """getattr, hasattr, setattr, delattr, attrgetter and methodcaller reaching a database method by name."""
     func = node.func
@@ -170,6 +201,26 @@ def access_findings(source, rel, allowed=None):
         function = _enclosing_function(node)
         if isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
             found.append((node.lineno, "from-import of sqlite3"))
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            modules = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ""]
+            for module in modules:
+                root = module.split(".")[0]
+                if root in FORBIDDEN_IMPORTS and not (inside and isinstance(node, ast.Import) and root == "sqlite3"):
+                    found.append((node.lineno, "import of " + root))
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+            found.append((node.lineno, "name that runs text as code or reaches builtins"))
+        if isinstance(node, ast.Name) and node.id == "sqlite3" and not inside:
+            found.append((node.lineno, "sqlite3 outside the store"))
+        if isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_DUNDERS:
+            found.append((node.lineno, "attribute that reaches any attribute"))
+        if isinstance(node, ast.Attribute) and node.attr == "sqlite3" and not inside:
+            found.append((node.lineno, "the store's sqlite3 module reached from outside"))
+        if inside and isinstance(node, ast.Name) and node.id == "schema_statements" and function is not None \
+                and function != "schema_statements":
+            if function not in SCHEMA_CONSUMERS:
+                found.append((node.lineno, "schema statements used outside the two schema consumers"))
+            elif not _is_call_func(node):
+                found.append((node.lineno, "schema statements referenced without a direct call"))
         if isinstance(node, ast.ImportFrom) and any(a.name in DB_METHODS for a in node.names):
             found.append((node.lineno, "import of a database method"))
         if isinstance(node, ast.Call):
@@ -202,10 +253,10 @@ def access_findings(source, rel, allowed=None):
         arg = call.args[0]
         literal = _text(arg)
         if literal is None:
-            if not (isinstance(arg, ast.Name) and (function, arg.id) in NAMED_SQL_VARIABLES):
+            if not _is_schema_loop_variable(arg, function):
                 found.append((node.lineno, "executor argument is not a literal"))
             continue
-        if not READ_ONLY.match(literal) and function not in TXN_OWNERS and not _in_write_transaction(node):
+        if not is_read_only(literal) and function not in TXN_OWNERS and not _in_write_transaction(node):
             found.append((node.lineno, "statement that changes state outside write_transaction"))
     return found
 
@@ -232,7 +283,7 @@ class PackageTests(unittest.TestCase):
         defined = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
         for rel, name in BUILDERS:
             self.assertIn(name, defined)
-        for name in TXN_OWNERS | {fn for fn, _ in NAMED_SQL_VARIABLES}:
+        for name in TXN_OWNERS | SCHEMA_CONSUMERS:
             self.assertIn(name, defined)
 
     def test_only_the_store_imports_sqlite_and_nobody_imports_dynamically(self):
@@ -352,13 +403,63 @@ class BiteTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertTrue(access_findings(source, STORE), source)
 
+    def test_round_three_bypasses_are_caught(self):
+        outside = (
+            "from . import store\nc = store.sqlite3.connect(path)",
+            "import sqlite3",
+            "from builtins import __import__ as load\ndb = load('sql' + 'ite3')",
+            "from builtins import getattr as pick\nrun = pick(conn, 'execute')",
+            "run = conn.__getattribute__('exec' + 'ute')",
+            "import importlib",
+            "import operator",
+            "from operator import attrgetter as grab",
+            "eval(text)",
+            "exec(text)",
+            "x = vars(conn)",
+            "y = conn.__dict__",
+            "z = type(conn).__mro__",
+        )
+        for source in outside:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, "shit/other.py"), source)
+
+    def test_function_form_pragmas_are_not_read_only(self):
+        for sql in ("PRAGMA foreign_keys(OFF)", "PRAGMA writable_schema(ON)", "PRAGMA foreign_keys = OFF",
+                    "PRAGMA user_version = 9", "PRAGMA journal_mode", "PRAGMA writable_schema", "pragma wal_checkpoint",
+                    "DELETE FROM tasks", "WITH x AS (SELECT 1) DELETE FROM tasks"):
+            with self.subTest(sql=sql):
+                self.assertFalse(is_read_only(sql), sql)
+        for sql in ("SELECT 1", "select count(*) from tasks", "PRAGMA user_version", "pragma foreign_key_check"):
+            with self.subTest(sql=sql):
+                self.assertTrue(is_read_only(sql), sql)
+        source = 'def fingerprint(conn):\n    return conn.execute("PRAGMA foreign_keys(OFF)")'
+        self.assertTrue(access_findings(source, STORE))
+
+    def test_a_variable_is_only_allowed_as_the_schema_loop_variable(self):
+        bad = (
+            "def _install_schema(conn, rows):\n    for sql in rows:\n        conn.execute(sql)",
+            "def _install_schema(conn):\n    sql = make()\n    conn.execute(sql)",
+            "def _install_schema(conn):\n    for other in schema_statements():\n        conn.execute(sql)",
+            "def verify(conn):\n    for sql in schema_statements():\n        conn.execute(sql)",
+            "def _install_schema(conn):\n    run = schema_statements\n    for sql in run():\n        conn.execute(sql)",
+        )
+        for source in bad:
+            with self.subTest(source=source):
+                self.assertTrue(access_findings(source, STORE), source)
+
+    def test_install_schema_keeps_its_own_transaction(self):
+        tree = ast.parse((ROOT / STORE).read_text(encoding="utf-8"))
+        function = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_install_schema")
+        literals = {n.value for n in ast.walk(function) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+        self.assertTrue({"BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"} <= literals)
+
     def test_inside_the_store_allowed_shapes_pass(self):
         good = (
             'def f(conn):\n    return conn.execute("SELECT count(*) FROM tasks").fetchone()',
             'def f(conn):\n    return conn.execute("PRAGMA user_version").fetchone()',
             'def f(conn):\n    with write_transaction(conn):\n        conn.execute("INSERT INTO tasks VALUES (?)", row)',
             'def f(conn):\n    with store.write_transaction(conn) as c:\n        c.execute("DELETE FROM edges")',
-            'def _install_schema(conn):\n    for sql in statements():\n        conn.execute(sql)',
+            'def _install_schema(conn):\n    for sql in schema_statements():\n        conn.execute(sql)',
             'def _open_once(conn):\n    conn.execute("PRAGMA foreign_keys = ON")',
         )
         for source in good:
