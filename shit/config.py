@@ -22,6 +22,8 @@ MAX_BYTES = 8192
 
 _SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9._-]{1,100}")
+# Host name of the code host (for example a self-hosted GitHub Enterprise), no scheme, no port, no path.
+_HOST = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?){0,8}")
 _LOG = re.compile(r"\.shit/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+){0,3}")
 _CONTEXT_WINDOWS = (32768, 65536)
 _MAX_TEXT = 500
@@ -35,13 +37,13 @@ WEIGHT_KEYS = ("task_created", "state_transition", "brief_recorded", "report_rec
 _MAX_WEIGHT = 1000
 
 # table -> {key: kind}. Kinds: "int1" exact schema version, "text" bounded string, "slug" lowercase slug,
-# "repo" owner/repo reference, "log" path under .shit, "root" the fixed storage root, "bool", "window"
+# "repo" owner/repo reference, "host" code host name, "log" path under .shit, "root" the fixed storage root, "bool", "window"
 # context size in tokens, "slugs" list of slugs, "weight" integer 0 to 1000, "limit" positive int up to 10 million,
 # "mode" warn or fail. The top level has only schema_version.
 SCHEMA = {
     "": {"schema_version": "int1"},
     "project": {"name": "slug"},
-    "tracker": {"repository": "repo"},
+    "tracker": {"repository": "repo", "host": "host"},
     "roles": {"names": "slugs"},
     "review": {"destination": "text"},
     "storage": {"root": "root"},
@@ -120,6 +122,8 @@ def _check_value(kind, value):
         raise rejected("name must be a lowercase slug")
     if kind == "repo" and not _REPO.fullmatch(value):
         raise rejected("tracker: repository must be owner/repo")
+    if kind == "host" and (not _HOST.fullmatch(value) or len(value) > 253):
+        raise rejected("tracker: host must be a host name")
     if kind == "root" and value != ".shit":
         raise rejected("storage: root must be .shit")
     if kind == "log" and (not _LOG.fullmatch(value) or ".." in value.split("/")):

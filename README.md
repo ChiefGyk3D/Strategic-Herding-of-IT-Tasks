@@ -14,6 +14,10 @@ Four roles (implementer, reviewer, researcher, planner) and six packs (review-pr
 
 The dependency graph, durable queue and per-task leases are implemented in `shit/dependencies.py`, `shit/queue.py` and `shit/queue_records.py`. The design is [docs/queue-spec.md](docs/queue-spec.md); what is built, what is deferred and what still needs a human decision is in [docs/queue.md](docs/queue.md).
 
+## Review threads
+
+`shit threads` lists the unresolved review threads of a pull request and applies replies and resolutions from a strict dispositions file, for any repository and pull request, through the GitHub CLI. See [docs/threads.md](docs/threads.md).
+
 ## Contributing
 
 Open an issue describing the change before sending a pull request, and link that issue from the pull request. Every change goes through a pull request; the `CI green` check must pass. Report security problems privately as described in [SECURITY.md](SECURITY.md).
