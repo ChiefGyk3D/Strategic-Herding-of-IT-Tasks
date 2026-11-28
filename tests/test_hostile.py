@@ -807,7 +807,7 @@ def process_launch_uses(source):
 # The only `os` attributes the package uses, computed from the tree and reviewed: file-descriptor and path
 # primitives, none of which starts a process. Anything else on `os`, or `os` used as a value, is a finding.
 OS_ALLOWED_ATTRS = frozenset({
-    "O_APPEND", "O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK", "O_RDONLY", "O_RDWR",
+    "O_APPEND", "O_CLOEXEC", "O_CREAT", "O_DIRECTORY", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK", "O_PATH", "O_RDONLY", "O_RDWR",
     "O_WRONLY", "close", "dup", "environ", "fchmod", "fdopen", "fspath", "fstat", "fsync", "getcwd", "geteuid",
     "getuid", "link", "listdir", "lstat", "mkdir", "open", "path", "read", "readlink", "rename", "scandir", "sep", "stat",
     "umask", "unlink", "write",
