@@ -3,6 +3,7 @@
 from .errors import ILLEGAL_TRANSITION, ShitError
 
 STATES = ("open", "running", "review", "approved", "closed", "blocked", "failed")
+STARTING_STATES = frozenset({"open"})
 ACTORS = ("human", "wrapper", "model")
 
 HW = frozenset({"human", "wrapper"})

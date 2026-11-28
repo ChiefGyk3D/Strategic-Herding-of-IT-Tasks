@@ -28,7 +28,7 @@ import os
 import re
 import stat
 
-from . import queue_records, records, store
+from . import lifecycle, queue_records, records, store
 from .errors import (
     CONFINEMENT,
     FAILED_CLOSED,
@@ -162,6 +162,23 @@ def _verify_lifecycle_effects(events, entries):
         raise _fail()
 
 
+def _verify_queue_starts(events, entries):
+    """Each task's first stateful queue entry must begin while its lifecycle is in an initial state."""
+    first = {}
+    for entry in entries:
+        if entry["kind"] != "graph_changed":
+            first.setdefault(entry["task_id"], entry["timestamp"])
+    states = {}
+    for event in events:
+        task_id = event["task_id"]
+        if event["event"] == "task_created":
+            states[task_id] = "open"
+        elif event["event"] == "state_transition" and event["timestamp"] <= first.get(task_id, ""):
+            states[task_id] = event["to_state"]
+    if any(states.get(task_id) not in lifecycle.STARTING_STATES for task_id in first):
+        raise _fail()
+
+
 def verify_bytes(data):
     """Verify an export from its bytes alone. Returns `Verified`; any failure is exit code 8 (7 when over the limit).
 
@@ -207,12 +224,12 @@ def verify_bytes(data):
             for event in events
             if event["event"] == "task_created"
         }
-        if any(
-            entry.get("task_id") is not None
-            and (entry["task_id"] not in created or created[entry["task_id"]] > entry["timestamp"])
-            for entry in entries
-        ):
-            raise _fail()
+        for entry in entries:
+            task_ids = ([item["task_id"] for item in entry["shards"]]
+                        if entry["kind"] == "graph_changed" else [entry["task_id"]])
+            if any(task_id not in created or created[task_id] > entry["timestamp"] for task_id in task_ids):
+                raise _fail()
+        _verify_queue_starts(events, entries)
         _verify_lifecycle_effects(events, entries)
         found = Footer(Tip(len(event_lines), previous["E"]), Tip(len(queue_lines), previous["Q"]), footer.body_sha256)
         if found != footer:
