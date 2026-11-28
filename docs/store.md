@@ -116,7 +116,7 @@ Messages are the fixed text of `docs/exit-codes.md`. They never carry a path or 
 
 ## Residual risks
 
-- A complete older or replaced database that has the right schema, application id and version opens normally, and its hash chains roll back with it consistently, so a whole-store restore is undetectable. The fingerprint authenticates the shape of the schema, not the identity or freshness of the data. This is the same whole-store restore limit as the file queue (`docs/threat-model.md`). A later mitigation is to keep the tip of the exported audit chain outside the database and compare it at open; that is not built.
+- A complete older or replaced database that has the right schema, application id and version opens normally, and its hash chains roll back with it consistently. The fingerprint authenticates the shape of the schema, not the identity or freshness of the data. This is the same whole-store restore limit as the file queue (`docs/threat-model.md`). **Mitigated by the audit export** (issue 63, `docs/audit-export.md`): the adapters keep the tip of each hash chain in a separate file after each commit and refuse, with exit code 8, a database that is older than that export or whose chain differs from it, before a write extends it (`shit check` reports the same). A restore of the database together with the export, or of the whole `.shit/` directory, is still not detected, and `store.connect` itself does not compare (a caller that bypasses the adapters is not protected).
 - A damaged database page that the open-time reads do not touch is not found at open (see step 5 above).
 - A process of the same user can open the file with any SQLite client and bypass every control above, including the triggers (it can also drop and recreate them; the next open of the store then refuses on the fingerprint).
 - `PRAGMA journal_mode=WAL` writes the database header outside an explicit transaction, because SQLite does not allow the switch inside one. It runs only after the header checks pass.
@@ -144,7 +144,7 @@ Every check and every read happens after `BEGIN IMMEDIATE`: the task exists, a c
 
 **Lint.** The new functions are on the allowlist of `tests/test_store_lint.py` on purpose, each with `execute` only: the reads, `read_snapshot` (a transaction owner) and the three write helpers. A test proves each write helper holds exactly one `write_transaction` with all its writes inside, that the read helpers hold no write, and that being on the list does not allow a write outside a transaction, text-built SQL or a look-alike `read_snapshot`.
 
-**Not done here** (the queue and the graph are ported below): the queue is still files until the CLI moves over; `transition_task` now refuses a change the queue state does not allow (see "Queue operations"); the hash-chained export, the CLI switch, and removal of the file protocol. A body file that no index row names is left in place; there is no sweep. `precheck` receives the task row, not the body (no title or summary).
+**Not done here** (the queue and the graph are ported below): the queue is still files until the CLI moves over; `transition_task` now refuses a change the queue state does not allow (see "Queue operations"); the CLI switch and removal of the file protocol (the hash-chained export is built, see "Audit export"). A body file that no index row names is left in place; there is no sweep. `precheck` receives the task row, not the body (no title or summary).
 
 ## Dependency graph (issue 62)
 
@@ -188,6 +188,10 @@ The order is the one of "Invariants across statements": the entry before the lea
 
 **Not done here.** `dispatch_failed` and its backoff (Q-RET-04, Q-RET-05; `queue.py` writes none either), an unleased `fail` or `hold` by a human (the table allows it; `queue.py` has none), capability tags and capacity (Q-CLAIM-04 second half, Q-CLAIM-06), `base_sha256` (OQ-7, issue 18), the `QUEUE.md` view, parallelism metrics, `orphan_removed` (a database has no stray lease file), the CLI switch and removal of the file queue (C7). The apply targets are checked as repository-relative paths (no empty, `.` or `..` component, not under `.shit`: exit code 5 as Q-SER-07) but not resolved against the working tree; the adapter or the dispatcher of issue 18 does that. A key is looked up by scanning the log for its message (no index): the log is small; an index is a later schema change.
 
+## Audit export (issue 63, C6)
+
+`shit/audit_export.py` writes `.shit/audit-export.txt`, a deterministic text copy of both hash chains (every line the hash was computed over, the chain hashes and the tips), atomically with mode 0600, after each adapter write commits. The adapters make it current before they write, refuse a restored database and refuse to write without an export; `shit audit verify` checks an export offline; `shit check` reports the queue and the comparison read-only. The store side is a delimited section at the end of `shit/store.py` ("C6"): `audit_tips`, `audit_hash_at` and `audit_chains` are reads only, on the lint allowlist one by one (`tests/test_store_lint.py`, `AuditExportLintTests`), and `audit_chains` rebuilds each line and recomputes its hash, so an entry that cannot be reproduced stops the export with exit code 8. Format, states, crash behavior and limits: `docs/audit-export.md`.
+
 ## Not built yet
 
-The hash-chained export, the CLI switch, and removal of the file queue.
+The CLI switch and removal of the file queue (C7).

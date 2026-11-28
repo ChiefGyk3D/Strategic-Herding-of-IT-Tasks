@@ -15,7 +15,7 @@ state, owner, history and times come from the database, and `get_task` joins the
 
 import hashlib
 
-from . import artifacts, commands, records, store
+from . import artifacts, audit_export, commands, records, store
 from . import task as task_mod
 from .errors import (
     CONFINEMENT,
@@ -49,10 +49,21 @@ def _body_path(kind, record_id):
     return f"{_directory(kind)}/{record_id}.json"
 
 
-def _connect(project, create, busy_timeout_ms):
+def _connect(project, create, busy_timeout_ms, *, write=False):
+    """Open the store. A writer first makes the audit export current (or refuses a restored database, exit code 8);
+    a reader refuses only a database that is provably not the one the export was made from (docs/audit-export.md)."""
     if create:
         store.init_store(project, busy_timeout_ms)  # a store that exists is verified and left alone
-    return store.connect(project, busy_timeout_ms)
+    conn = store.connect(project, busy_timeout_ms)
+    try:
+        if write:
+            audit_export.sync(project, conn)
+        else:
+            audit_export.guard(project, conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def _digest(data):
@@ -155,7 +166,7 @@ def create_task(project, *, task_id, title, summary, owner, actor, now=None, bus
     data = records.dump_task(record)
 
     def run():
-        conn = _connect(project, True, busy_timeout_ms)
+        conn = _connect(project, True, busy_timeout_ms, write=True)
         try:
             if store.get_task(conn, task_id) is not None:
                 raise ShitError(USAGE)
@@ -164,6 +175,7 @@ def create_task(project, *, task_id, title, summary, owner, actor, now=None, bus
             sha256, size = _digest(existing)
             _fault("body-published")
             store.create_task(conn, image, actor, sha256, size)
+            audit_export.after_commit(project, conn)
             _fault("committed")
             _check_published(project, conn, "task", task_id)
             return image
@@ -201,10 +213,11 @@ def transition(project, task_id, to, actor, reason, *, now=None, blocked_reason=
     _body_path("task", task_id)
 
     def run():
-        conn = _connect(project, False, busy_timeout_ms)
+        conn = _connect(project, False, busy_timeout_ms, write=True)
         try:
             store.transition_task(conn, task_id, to, actor, reason, now, blocked_reason=blocked_reason,
                                   blocking_item=blocking_item, precheck=precheck)
+            audit_export.after_commit(project, conn)
             return _assemble(project, conn, task_id)
         finally:
             conn.close()
@@ -252,7 +265,7 @@ def _add(project, kind, record, check, busy_timeout_ms):
     _body_path(kind, record_id)
 
     def run():
-        conn = _connect(project, False, busy_timeout_ms)
+        conn = _connect(project, False, busy_timeout_ms, write=True)
         try:
             task = store.get_task(conn, task_id)
             if task is None:
@@ -271,6 +284,7 @@ def _add(project, kind, record, check, busy_timeout_ms):
             sha256, size = _digest(existing)
             _fault("body-published")
             store.add_record(conn, kind, current, sha256, size, check=lambda row: check(conn, row, current))
+            audit_export.after_commit(project, conn)
             _fault("committed")
             _check_published(project, conn, kind, record_id)
             return current
@@ -363,10 +377,11 @@ def close_task(project, task_id, actor, reason, *, now=None, busy_timeout_ms=Non
     _body_path("task", task_id)
 
     def run():
-        conn = _connect(project, False, busy_timeout_ms)
+        conn = _connect(project, False, busy_timeout_ms, write=True)
         try:
             store.transition_task(conn, task_id, "closed", actor, reason, now,
                                   precheck=lambda row: _check_closable(project, conn, task_id))
+            audit_export.after_commit(project, conn)
             return _assemble(project, conn, task_id)
         finally:
             conn.close()
