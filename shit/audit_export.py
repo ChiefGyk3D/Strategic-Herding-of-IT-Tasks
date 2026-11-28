@@ -207,11 +207,11 @@ def read_footer(project):
         return None
     fd, st = opened
     try:
-        tail = os.pread(fd, FOOTER_WINDOW, max(0, st.st_size - FOOTER_WINDOW))
+        with os.fdopen(fd, "rb") as handle:  # closes the descriptor
+            handle.seek(max(0, st.st_size - FOOTER_WINDOW))
+            tail = handle.read(FOOTER_WINDOW)
     except OSError:
         raise _fail() from None
-    finally:
-        os.close(fd)
     if not tail.endswith(b"\n"):
         raise _fail()
     return _parse_footer(tail[:-1].rsplit(b"\n", 1)[-1])
@@ -243,7 +243,7 @@ def read_export(project):
 
 def read_file(path):
     """Read an export copy from any path (offline use). A regular file, no symlink, at most `MAX_EXPORT_BYTES`."""
-    if not isinstance(path, (str, os.PathLike)) or "\x00" in os.fspath(path):
+    if not isinstance(path, str) or "\x00" in path:
         raise ShitError(USAGE)
     try:
         fd = os.open(path, _READ_FLAGS)
