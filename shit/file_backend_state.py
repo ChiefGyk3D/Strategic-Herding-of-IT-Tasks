@@ -1,35 +1,35 @@
-"""The bounded catalog of paths the file persistence protocol creates below `.shit`."""
+"""Bounded catalogs of backend artifacts below `.shit`."""
 
-from . import commands, log, queue, task
+from . import audit_export, commands, log, queue, store, task
 from .errors import PRECONDITION, ShitError
 from .project import LOCK_NAME, SUBDIRS
 
-FILE_BACKEND_ARTIFACTS = (
-    LOCK_NAME,
-    *SUBDIRS,
+FILE_ONLY_ARTIFACTS = (
     log.LOG_PATH,
     log.CHAIN_PATH,
     task.PENDING,
-    *commands.DIRS.values(),
     queue.QUEUE,
     queue.CHAIN,
     queue.DEPS,
+    queue.LEGACY_GRAPH,
     queue.PENDING,
     queue.ANCHOR,
     queue.VIEW,
     queue.LEASES,
 )
+SHARED_ARTIFACTS = (LOCK_NAME, *SUBDIRS, *commands.DIRS.values())
+SQLITE_ONLY_ARTIFACTS = (store.DB_NAME, audit_export.EXPORT_PATH)
 
-_SKELETON = {LOCK_NAME, *SUBDIRS}
-_DIRECTORIES = {*SUBDIRS, *commands.DIRS.values(), queue.DEPS, queue.LEASES}
+# Compatibility for callers that display or test the file-state catalog.
+FILE_BACKEND_ARTIFACTS = FILE_ONLY_ARTIFACTS
+
+_DIRECTORIES = {queue.DEPS, queue.LEASES}
 
 
-def present(project, *, include_bodies=True):
-    """Artifact names carrying file-backend state; the empty init skeleton is not state."""
+def present(project):
+    """File-protocol-only artifact names; artifacts used by another backend are not file state."""
     found = []
-    for name in FILE_BACKEND_ARTIFACTS:
-        if not include_bodies and name in {*SUBDIRS, *commands.DIRS.values()}:
-            continue
+    for name in FILE_ONLY_ARTIFACTS:
         if name in _DIRECTORIES:
             try:
                 populated = bool(project.list_dir(name))
@@ -39,6 +39,6 @@ def present(project, *, include_bodies=True):
                 raise
             if populated:
                 found.append(name)
-        elif name not in _SKELETON and project.exists(name):
+        elif project.exists(name):
             found.append(name)
     return found
