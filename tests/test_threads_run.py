@@ -900,6 +900,19 @@ class GhPathTests(Case):
             with self.assertRaises(ShitError):
                 launcher.open_gh(self.gh())
 
+    def test_the_directory_chain_and_the_file_are_each_checked_for_owner(self):
+        from unittest import mock
+
+        self.fake()
+        chain_dir = self.bin
+        launcher._safe_dir_chain(str(chain_dir))  # ours, mode 0755: fine
+        with mock.patch.object(launcher.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaises(ShitError):  # a directory owned by another non-root user, even at mode 0755
+                launcher._safe_dir_chain(str(chain_dir))
+            with (mock.patch.object(launcher, "_safe_dir_chain", return_value=str(chain_dir)),
+                  self.assertRaises(ShitError)):  # the chain is waved through: the program's own owner is checked
+                launcher.open_gh(self.gh())
+
     def test_a_root_owned_program_in_a_root_owned_chain_is_accepted(self):
         candidate = "/usr/bin/env"
         if not os.path.isfile(candidate) or os.path.islink(candidate) or os.lstat(candidate).st_uid != 0:
