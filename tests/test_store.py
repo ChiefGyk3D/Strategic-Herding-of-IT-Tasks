@@ -267,63 +267,75 @@ class ConfinementTests(Base):
         os.chmod(self.db.parent, stat.S_IRWXU)
         store.connect(self.proj).close()
 
-    def swap_sidecar_on_open(self, suffix, times):
-        """Open a second connection while a first holds the sidecars; replace `suffix` inside the open call."""
+    def test_sidecars_may_disappear_or_appear_between_lstat_and_open(self):
+        self.init_store()
         holder = store.connect(self.proj)
         self.addCleanup(holder.close)
-        real_connect = sqlite3.connect
-        calls = []
-
-        def swapping_connect(*args, **kwargs):
-            if len(calls) < times:
-                other = self.base / ("replacement" + suffix)
-                other.write_bytes(b"")
-                os.chmod(other, stat.S_IRUSR | stat.S_IWUSR)
-                os.rename(other, Path(str(self.db) + suffix))
-            calls.append(True)
-            return real_connect(*args, **kwargs)
-
-        with mock.patch.object(store.sqlite3, "connect", swapping_connect):
-            return code_of(store.connect, self.proj), len(calls)
-
-    def test_swapped_wal_or_shm_during_open_is_refused(self):
         for suffix in ("-wal", "-shm"):
-            with self.subTest(sidecar=suffix):
+            sidecar = Path(str(self.db) + suffix)
+            away = Path(str(sidecar) + ".away")
+            real_open = os.open
+
+            def move_then_open(path, flags, *args, suffix=suffix, sidecar=sidecar, away=away,
+                               real_open=real_open, **kwargs):
+                if path == store.DB_NAME + suffix:
+                    os.rename(sidecar, away)
+                return real_open(path, flags, *args, **kwargs)
+
+            with self.subTest(sidecar=suffix, transition="disappears"):
+                with mock.patch.object(store.os, "open", move_then_open):
+                    store._verify_sidecars(self.proj)
+                os.rename(away, sidecar)
+
+            os.rename(sidecar, away)
+
+            def restore_then_open(path, flags, *args, suffix=suffix, sidecar=sidecar, away=away,
+                                  real_open=real_open, **kwargs):
+                if path == store.DB_NAME + suffix:
+                    os.rename(away, sidecar)
+                return real_open(path, flags, *args, **kwargs)
+
+            with self.subTest(sidecar=suffix, transition="appears"):
+                try:
+                    with mock.patch.object(store.os, "open", restore_then_open):
+                        store._verify_sidecars(self.proj)
+                finally:
+                    if away.exists():
+                        os.rename(away, sidecar)
+
+    def test_an_open_sidecar_may_be_unlinked_before_fstat(self):
+        self.init_store()
+        holder = store.connect(self.proj)
+        self.addCleanup(holder.close)
+        suffix = "-wal"
+        sidecar = Path(str(self.db) + suffix)
+        real_open = os.open
+
+        def unlink_after_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            if path == store.DB_NAME + suffix:
+                os.unlink(sidecar)
+            return fd
+
+        with mock.patch.object(store.os, "open", unlink_after_open):
+            store._verify_sidecars(self.proj)
+
+    def test_fifo_sidecar_is_refused_without_blocking(self):
+        self.init_store()
+        os.mkfifo(str(self.db) + "-journal", 0o600)
+        self.assertEqual(code_of(store.connect, self.proj), errors.CONFINEMENT)
+
+    def test_wide_or_hard_linked_sidecar_is_refused(self):
+        for unsafe in ("wide", "hard-link"):
+            with self.subTest(unsafe=unsafe):
                 self.setUp()
                 self.init_store()
-                code, calls = self.swap_sidecar_on_open(suffix, times=10)
-                self.assertEqual(code, errors.CONFINEMENT)
-                self.assertEqual(calls, 2)  # one retry, then a refusal
-
-    def test_a_sidecar_that_disappears_is_not_accepted(self):
-        self.init_store()
-        holder = store.connect(self.proj)
-        self.addCleanup(holder.close)
-        path = str(self.db)
-        for suffix in ("-wal", "-shm"):
-            with self.subTest(sidecar=suffix):
-                snapshot = {s: store._lstat(path + s, required=False) for s in store._SIDECARS}
-                self.assertIsNotNone(snapshot[suffix])
-                os.rename(path + suffix, path + suffix + ".away")
-                try:
-                    self.assertRaises(store._SidecarMoved, store._verify_sidecars, path, snapshot, False)
-                    with self.assertRaises(ShitError) as caught:
-                        store._verify_sidecars(path, snapshot, True)
-                    self.assertEqual(caught.exception.code, errors.CONFINEMENT)
-                finally:
-                    os.rename(path + suffix + ".away", path + suffix)
-        none = dict.fromkeys(store._SIDECARS)
-        os.rename(path + "-wal", path + "-wal.away")
-        try:
-            store._verify_sidecars(path, none, True)  # absent before and after: fine
-        finally:
-            os.rename(path + "-wal.away", path + "-wal")
-
-    def test_a_single_sidecar_replacement_is_retried_once(self):
-        self.init_store()
-        code, calls = self.swap_sidecar_on_open("-wal", times=1)
-        self.assertIsNone(code)
-        self.assertEqual(calls, 2)
+                journal = Path(str(self.db) + "-journal")
+                journal.write_bytes(b"")
+                os.chmod(journal, 0o640 if unsafe == "wide" else 0o600)
+                if unsafe == "hard-link":
+                    os.link(journal, self.base / "second-journal-name")
+                self.assertEqual(code_of(store.connect, self.proj), errors.CONFINEMENT)
 
     def test_refusals_carry_only_fixed_text(self):
         self.init_store()
