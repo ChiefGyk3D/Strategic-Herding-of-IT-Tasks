@@ -124,6 +124,44 @@ def _record(line, tag, expected_seq, previous):
     return parts[3], parts[2].decode("ascii")
 
 
+def _verify_lifecycle_effects(events, entries):
+    """Require queue-implied lifecycle transitions and event transitions to agree in chain order."""
+    first_queue = {}
+    expected = []
+    for entry in entries:
+        if entry["kind"] == "graph_changed":
+            continue
+        task_id = entry["task_id"]
+        first_queue.setdefault(task_id, entry["timestamp"])
+        allowed = queue_records.EFFECTS.get(entry["kind"], {"life": ()})["life"]
+        if entry["kind"] == "expired" and entry["state_after"] != "failed":
+            allowed = ()
+        if allowed:
+            transitions = {
+                (frm, to, entry["actor"] if actor == "entry" else actor)
+                for frm, to, actor in allowed
+            }
+            expected.append((task_id, entry["timestamp"], transitions))
+
+    found = 0
+    for event in events:
+        if event["event"] != "state_transition" or event["task_id"] not in first_queue:
+            continue
+        if event["timestamp"] < first_queue[event["task_id"]]:
+            continue
+        transition = (event["from_state"], event["to_state"], event["actor"])
+        if transition == ("review", "approved", "human"):
+            continue
+        if found >= len(expected):
+            raise _fail()
+        task_id, timestamp, allowed = expected[found]
+        if event["task_id"] != task_id or event["timestamp"] != timestamp or transition not in allowed:
+            raise _fail()
+        found += 1
+    if found != len(expected):
+        raise _fail()
+
+
 def verify_bytes(data):
     """Verify an export from its bytes alone. Returns `Verified`; any failure is exit code 8 (7 when over the limit).
 
@@ -175,6 +213,7 @@ def verify_bytes(data):
             for entry in entries
         ):
             raise _fail()
+        _verify_lifecycle_effects(events, entries)
         found = Footer(Tip(len(event_lines), previous["E"]), Tip(len(queue_lines), previous["Q"]), footer.body_sha256)
         if found != footer:
             raise _fail()

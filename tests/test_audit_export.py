@@ -315,6 +315,52 @@ class VerifierTests(Flow):
 
         self.assert_refused(rechain(self.good, remove_creation))
 
+    def test_queue_completion_requires_its_matching_lifecycle_event(self):
+        def remove_submission(events, entries):
+            submitted = next(entry for entry in entries if entry["kind"] == "submitted")
+            events[:] = [
+                event
+                for event in events
+                if not (
+                    event["event"] == "state_transition"
+                    and event["task_id"] == submitted["task_id"]
+                    and event["timestamp"] == submitted["timestamp"]
+                )
+            ]
+
+        self.assert_refused(rechain(self.good, remove_submission))
+
+    def test_queue_lifecycle_effects_must_follow_event_chain_order(self):
+        self.task("c")
+        self.task("d")
+        c_lease = self.claim("c")
+        store_queue.start(self.proj, self.present(c_lease), now=self.tick())
+        d_lease = self.claim("d")
+        common = self.tick()
+        store_queue.submit(self.proj, self.present(c_lease), now=common)
+        store_queue.start(self.proj, self.present(d_lease), now=common)
+
+        def reverse_effect_order(events, entries):
+            c_submit = next(
+                i
+                for i, event in enumerate(events)
+                if event["task_id"] == "c"
+                and event["event"] == "state_transition"
+                and event["to_state"] == "review"
+            )
+            d_start = next(
+                i
+                for i, event in enumerate(events)
+                if event["task_id"] == "d"
+                and event["event"] == "state_transition"
+                and event["to_state"] == "running"
+            )
+            self.assertEqual(events[c_submit]["timestamp"], events[d_start]["timestamp"])
+            self.assertLess(c_submit, d_start)
+            events[c_submit], events[d_start] = events[d_start], events[c_submit]
+
+        self.assert_refused(rechain(self.export_bytes(), reverse_effect_order))
+
     def test_an_edit_that_replay_accepts_still_verifies(self):
         def later(events, entries):
             entries[-1]["timestamp"] = "2026-11-27T23:00:00Z"

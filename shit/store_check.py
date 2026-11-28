@@ -54,7 +54,7 @@ def diagnose(project, now=None):
         return [(exc.code, "cannot be opened or its audit export cannot be read")], lines, warnings
     try:
         with store.read_snapshot(conn):
-            if file_backend_state.present(project, include_bodies=False):
+            if file_backend_state.present(project):
                 findings.append((FAILED_CLOSED, "file-backend state is present beside the database"))
             for name in store.verify(conn, deep=True) + store.verify_tasks(conn):
                 findings.append((FAILED_CLOSED, f"invariant {name} does not hold"))

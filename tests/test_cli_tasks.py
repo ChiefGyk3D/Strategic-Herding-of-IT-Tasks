@@ -8,7 +8,19 @@ from pathlib import Path
 
 from _bootstrap import make_git_dir
 
-from shit import artifacts, cli_tasks, commands, log, project, queue, task
+from shit import (
+    artifacts,
+    audit_export,
+    cli_tasks,
+    commands,
+    file_backend_state,
+    log,
+    project,
+    queue,
+    store,
+    store_queue,
+    task,
+)
 
 
 class Cli(unittest.TestCase):
@@ -225,9 +237,44 @@ backend = "sqlite"
         )
         self.assertEqual(self.ok("decision", "show", "d1")["status"], "accepted")
         self.assertEqual(self.ok("task", "show", "t1")["state"], "closed")
+        self.ok(
+            "task",
+            "create",
+            "queued",
+            "--title",
+            "Queued",
+            "--summary",
+            "Queue flow",
+            "--owner",
+            "human",
+            "--actor",
+            "human",
+        )
+        proj = project.Project.open(self.repo)
+        try:
+            store_queue.enqueue(proj, "queued", "human")
+            lease = store_queue.claim(
+                proj,
+                {"task_id": "queued", "step": "draft", "worker": "worker", "worker_kind": "human"},
+            )
+            presented = {
+                "task_id": lease["task_id"],
+                "lease_id": lease["lease_id"],
+                "generation": lease["generation"],
+            }
+            store_queue.start(proj, presented)
+            store_queue.submit(proj, presented)
+        finally:
+            proj.close()
         code, out, err = self.run_cli("check")
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("store: queue 0 tasks", out)
+        self.assertIn("store: queue 1 task (review 1)", out)
+        proj = project.Project.open(self.repo)
+        try:
+            self.assertEqual(file_backend_state.present(proj), [])
+        finally:
+            proj.close()
+        self.assertEqual(self.ok("init", "--backend", "sqlite"), {"initialized": True})
         code, out, err = self.run_cli("audit", "verify")
         self.assertEqual((code, err), (0, ""))
         self.assertIn("audit-export: ok", out)
@@ -264,22 +311,38 @@ backend = "sqlite"
         self.assertFalse((self.repo / ".shit" / "store.sqlite3").exists())
 
     def test_file_backend_artifact_catalog_is_derived_from_its_definitions(self):
-        expected = {
-            project.LOCK_NAME,
-            *project.SUBDIRS,
+        file_only = {
             log.LOG_PATH,
             log.CHAIN_PATH,
             task.PENDING,
-            *commands.DIRS.values(),
             queue.QUEUE,
             queue.CHAIN,
             queue.DEPS,
+            queue.LEGACY_GRAPH,
             queue.PENDING,
             queue.ANCHOR,
             queue.VIEW,
             queue.LEASES,
         }
-        self.assertEqual(set(cli_tasks.FILE_BACKEND_ARTIFACTS), expected)
+        shared = {
+            project.LOCK_NAME,
+            *project.SUBDIRS,
+            *commands.DIRS.values(),
+        }
+        sqlite_only = {store.DB_NAME, audit_export.EXPORT_PATH}
+        self.assertEqual(set(file_backend_state.FILE_ONLY_ARTIFACTS), file_only)
+        self.assertEqual(set(file_backend_state.SHARED_ARTIFACTS), shared)
+        self.assertEqual(set(file_backend_state.SQLITE_ONLY_ARTIFACTS), sqlite_only)
+        self.assertEqual(set(cli_tasks.FILE_BACKEND_ARTIFACTS), file_only)
+
+    def test_legacy_dependency_file_alone_is_file_backend_state(self):
+        self.run_cli("init")
+        (self.repo / ".shit" / queue.LEGACY_GRAPH).write_text("{}")
+        proj = project.Project.open(self.repo)
+        try:
+            self.assertEqual(file_backend_state.present(proj), [queue.LEGACY_GRAPH])
+        finally:
+            proj.close()
 
     def test_sqlite_init_refuses_every_state_bearing_file_backend_artifact(self):
         (self.repo / "config.toml").write_text("""schema_version = 1
@@ -299,13 +362,11 @@ context_tokens = 32768
 backend = "sqlite"
 """)
         state = self.repo / ".shit"
-        for name in cli_tasks.FILE_BACKEND_ARTIFACTS:
-            if name in (project.LOCK_NAME, *project.SUBDIRS):
-                continue
+        for name in file_backend_state.FILE_ONLY_ARTIFACTS:
             with self.subTest(name=name):
                 self.run_cli("init", "--backend", "files")
                 path = state / name
-                if name in {*commands.DIRS.values(), queue.DEPS, queue.LEASES}:
+                if name in {queue.DEPS, queue.LEASES}:
                     path.mkdir(exist_ok=True)
                     (path / "state.json").write_text("{}")
                 else:
